@@ -76,3 +76,8 @@ ngrok.yml
 # SYSTEM
 # =========================
 Thumbs.db
+# Local dev noise
+.claude/
+.gradle/
+_deltas/
+local.properties
