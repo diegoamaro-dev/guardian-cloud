@@ -423,6 +423,60 @@ export interface DriveUploadResult {
 }
 
 /**
+ * Download the raw bytes of a Drive file by id.
+ *
+ * Used exclusively by the export-evidence flow: the mobile client cannot
+ * call Drive directly (refresh_token lives on the backend). The route
+ * layer (`GET /sessions/:id/chunks/:index/download`) is the single
+ * caller; it enforces ownership against the `chunks` table BEFORE
+ * invoking this function — this function itself is scope-safe only to
+ * the extent that the access_token's `drive.file` scope is (the app can
+ * only read files it created).
+ *
+ * Uses Drive's `alt=media` endpoint, which returns the binary payload
+ * directly (no metadata wrapper). We cap the response at
+ * DOWNLOAD_MAX_BYTES to defend the backend RAM against a surprise giant
+ * file — in practice chunks are ~16 KB, so the cap is generous headroom.
+ */
+const DOWNLOAD_MAX_BYTES = 25 * 1024 * 1024;
+
+export async function downloadFileBytes(
+  accessToken: string,
+  fileId: string,
+): Promise<Buffer> {
+  const safeId = encodeURIComponent(fileId);
+  const res = await fetchWithTimeout(
+    `${DRIVE_API_BASE}/files/${safeId}?alt=media`,
+    { headers: { Authorization: `Bearer ${accessToken}` } },
+  );
+  if (!res.ok) {
+    const detail = await res.text().catch(() => '<no body>');
+    logger.warn(
+      {
+        op: 'drive.downloadFileBytes',
+        status: res.status,
+        detail: detail.substring(0, 200),
+      },
+      'Drive download failed',
+    );
+    throw new AppError(
+      502,
+      'DRIVE_DOWNLOAD_FAILED',
+      `Drive download failed (${res.status})`,
+    );
+  }
+  const arrayBuffer = await res.arrayBuffer();
+  if (arrayBuffer.byteLength > DOWNLOAD_MAX_BYTES) {
+    throw new AppError(
+      502,
+      'DRIVE_DOWNLOAD_TOO_LARGE',
+      `Drive download exceeded limit (${arrayBuffer.byteLength} bytes)`,
+    );
+  }
+  return Buffer.from(arrayBuffer);
+}
+
+/**
  * Upload `content` to Drive under `folderId` as `fileName` using the
  * simple multipart upload path (Drive's "one shot" upload, suitable for
  * small files — which is exactly what our chunks are at 16 KB).
