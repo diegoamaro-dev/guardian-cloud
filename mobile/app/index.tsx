@@ -147,15 +147,17 @@ const DRIVE_CHUNK_UPLOAD_ENABLED = true;
 // audio pipeline is "fully stable" per the project doc and any change to
 // this constant is out of scope. Video uses a larger chunk because a 3–5
 // MB recording at 16 KB produces ~80–100 chunks → too many requests and a
-// bad "Subiendo evidencia 4/98" UX. The video size is capped at 64 KB:
-// 256 KB caused "Row too big to fit into CursorWindow" on AsyncStorage
-// reads and OOM on FileSystem.readAsStringAsync (base64 expansion blows
-// the heap). 64 KB lands ~50–80 chunks for a typical clip — not ideal but
-// the only safe value until the queue moves off AsyncStorage. Mode-pick
-// happens in the chunker only; queue/worker/retry/recovery shapes are
-// untouched.
+// bad "Subiendo evidencia 4/98" UX. Video is now 256 KB: that size used
+// to break AsyncStorage with "Row too big to fit into CursorWindow" and
+// OOM on `FileSystem.readAsStringAsync`, but both blockers were removed
+// when video switched to the partial-read architecture (chunks persist
+// `byteOffset`/`byteLength` only — `base64Slice` is never written for
+// video, and the chunker reads one chunk's bytes at a time instead of
+// the whole growing file). At 256 KB a 3–5 MB clip is ~12–20 chunks.
+// Mode-pick happens in the chunker only; queue/worker/retry/recovery
+// shapes are untouched.
 const CHUNK_SIZE_AUDIO = 16 * 1024;
-const CHUNK_SIZE_VIDEO = 64 * 1024;
+const CHUNK_SIZE_VIDEO = 256 * 1024;
 const CHUNK_SIZE_BASE64_AUDIO =
   Math.ceil(Math.ceil((CHUNK_SIZE_AUDIO * 4) / 3) / 4) * 4;
 const CHUNK_SIZE_BASE64_VIDEO =
