@@ -143,9 +143,22 @@ const DEBUG_QUEUE = false;
  */
 const DRIVE_CHUNK_UPLOAD_ENABLED = true;
 
-const CHUNK_SIZE_BYTES = 16 * 1024;
-const CHUNK_SIZE_BASE64 =
-  Math.ceil(Math.ceil((CHUNK_SIZE_BYTES * 4) / 3) / 4) * 4;
+// Audio chunk size is unchanged from the pre-video baseline (16 KB) — the
+// audio pipeline is "fully stable" per the project doc and any change to
+// this constant is out of scope. Video uses a much larger chunk because a
+// 3–5 MB recording at 16 KB produces ~80–100 chunks → too many requests
+// and a bad "Subiendo evidencia 4/98" UX. Mode-pick happens in the chunker
+// only; queue/worker/retry/recovery shapes are untouched.
+const CHUNK_SIZE_AUDIO = 16 * 1024;
+const CHUNK_SIZE_VIDEO = 256 * 1024;
+const CHUNK_SIZE_BASE64_AUDIO =
+  Math.ceil(Math.ceil((CHUNK_SIZE_AUDIO * 4) / 3) / 4) * 4;
+const CHUNK_SIZE_BASE64_VIDEO =
+  Math.ceil(Math.ceil((CHUNK_SIZE_VIDEO * 4) / 3) / 4) * 4;
+
+function chunkSizeBase64ForMode(mode: SessionMode): number {
+  return mode === 'video' ? CHUNK_SIZE_BASE64_VIDEO : CHUNK_SIZE_BASE64_AUDIO;
+}
 
 /**
  * Recording options.
@@ -1136,6 +1149,14 @@ interface ChunkerState {
   sessionId: string;
   /** Filesystem URI the chunker reads on each tick. Cache during recording, doc dir after move. */
   fileUri: string;
+  /**
+   * Recording mode captured at start. Drives the slice size on every tick
+   * (and the final pass) via `chunkSizeBase64ForMode`. Stored in-memory
+   * only — the persisted queue entry is intentionally untouched so the
+   * upload worker / retry / recovery flows remain identical for both
+   * modes.
+   */
+  mode: SessionMode;
   active: boolean;
   tickHandle: ReturnType<typeof setTimeout> | null;
   /**
@@ -1156,10 +1177,15 @@ interface ChunkerState {
 
 const chunkerStates = new Map<string, ChunkerState>();
 
-function startChunkerForSession(sessionId: string, cacheUri: string): void {
+function startChunkerForSession(
+  sessionId: string,
+  cacheUri: string,
+  mode: SessionMode,
+): void {
   const state: ChunkerState = {
     sessionId,
     fileUri: cacheUri,
+    mode,
     active: true,
     tickHandle: null,
     inflight: null,
@@ -1177,7 +1203,12 @@ function scheduleNextChunkerTick(state: ChunkerState): void {
     if (!state.active || state.finalizing) return;
     const body = (async () => {
       try {
-        await runChunkerTick(state.sessionId, state.fileUri, /*finalPass*/ false);
+        await runChunkerTick(
+          state.sessionId,
+          state.fileUri,
+          /*finalPass*/ false,
+          state.mode,
+        );
       } catch (err) {
         // HC1: a chunker error MUST NEVER stop the recorder. Swallow and
         // reschedule. The recorder is a separate native object — this code
@@ -1208,6 +1239,13 @@ async function stopChunkerForSession(
   finalUri: string,
 ): Promise<void> {
   const state = chunkerStates.get(sessionId);
+  // Mode is captured here so the final pass slices with the same size the
+  // recording was being chunked with all along. If state is missing (very
+  // unlikely — caller just ran the chunker), fall back to 'audio': that is
+  // the historical default and a safe choice because the only code path
+  // that would reach this without a state has, by definition, never set a
+  // video chunker up.
+  const mode: SessionMode = state?.mode ?? 'audio';
   if (state) {
     // Order is intentional and must not be reordered:
     //   1. finalizing=true   — blocks any setTimeout body that fires next.
@@ -1232,7 +1270,7 @@ async function stopChunkerForSession(
     state.fileUri = finalUri;
   }
   try {
-    await runChunkerTick(sessionId, finalUri, /*finalPass*/ true);
+    await runChunkerTick(sessionId, finalUri, /*finalPass*/ true, mode);
   } catch (err) {
     console.log('GC_QUEUE chunker final pass error', err);
   } finally {
@@ -1244,6 +1282,7 @@ async function runChunkerTick(
   sessionId: string,
   fileUri: string,
   finalPass: boolean,
+  mode: SessionMode,
 ): Promise<void> {
   const base64 = await FileSystem.readAsStringAsync(fileUri, {
     encoding: FileSystem.EncodingType.Base64,
@@ -1258,11 +1297,12 @@ async function runChunkerTick(
 
   let emitted = entry.emitted_base64_length;
   let nextIndex = entry.next_chunk_index;
+  const chunkSizeBase64 = chunkSizeBase64ForMode(mode);
 
-  while (base64.length - emitted >= CHUNK_SIZE_BASE64) {
-    const slice = base64.substring(emitted, emitted + CHUNK_SIZE_BASE64);
-    await emitChunk(sessionId, slice, nextIndex, emitted + CHUNK_SIZE_BASE64);
-    emitted += CHUNK_SIZE_BASE64;
+  while (base64.length - emitted >= chunkSizeBase64) {
+    const slice = base64.substring(emitted, emitted + chunkSizeBase64);
+    await emitChunk(sessionId, slice, nextIndex, emitted + chunkSizeBase64);
+    emitted += chunkSizeBase64;
     nextIndex += 1;
   }
 
@@ -1326,13 +1366,16 @@ async function deriveChunksFromFile(uri: string): Promise<RealChunk[]> {
     encoding: FileSystem.EncodingType.Base64,
   });
 
+  // Legacy/audio-mode rehydration path: this helper currently has no
+  // live caller and is kept as backup for audio-era flows. Video uses
+  // the active chunker (`runChunkerTick`) which picks size by mode.
   const chunks: RealChunk[] = [];
   for (
     let index = 0, offset = 0;
     offset < base64.length;
-    index++, offset += CHUNK_SIZE_BASE64
+    index++, offset += CHUNK_SIZE_BASE64_AUDIO
   ) {
-    const slice = base64.substring(offset, offset + CHUNK_SIZE_BASE64);
+    const slice = base64.substring(offset, offset + CHUNK_SIZE_BASE64_AUDIO);
 
     // SINGLE SOURCE OF HASH TRUTH (see module header on hashes):
     // hash the DECODED bytes, not the base64 text. This is the same
@@ -1385,8 +1428,14 @@ async function readRecordingBase64(uri: string): Promise<string> {
  * `readRecordingBase64` and slices per chunk from memory.
  */
 function base64SliceAt(base64: string, chunkIndex: number): string {
-  const offset = chunkIndex * CHUNK_SIZE_BASE64;
-  return base64.substring(offset, offset + CHUNK_SIZE_BASE64);
+  // Rehydration only triggers for legacy entries that lack a persisted
+  // base64Slice. Pre-Phase-2 entries were all audio (video did not exist
+  // at the time), and any post-Phase-2 entry — audio or video — keeps
+  // its base64Slice in the queue until upload succeeds. Using the audio
+  // base64 size here therefore matches every rehydration we can actually
+  // hit; video chunks never need this path.
+  const offset = chunkIndex * CHUNK_SIZE_BASE64_AUDIO;
+  return base64.substring(offset, offset + CHUNK_SIZE_BASE64_AUDIO);
 }
 
 /**
@@ -1987,7 +2036,7 @@ export default function Index() {
       // on the JS event loop, never on the recorder thread — HC1
       // (recorder must NEVER stop because of upload failure) and HC2
       // (upload must be asynchronous) are enforced by isolation.
-      startChunkerForSession(sessionId, cacheUri);
+      startChunkerForSession(sessionId, cacheUri, recordingMode);
       uploadDrainLoop().catch(err => {
         if (DEBUG_QUEUE) {
           console.log('GC_DEBUG drain rejected (from startRecording)', {
