@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { View, Text, Pressable } from 'react-native';
 import { Audio } from 'expo-av';
+import { CameraView, useCameraPermissions } from 'expo-camera';
 import * as FileSystem from 'expo-file-system';
 import * as Crypto from 'expo-crypto';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -14,7 +15,7 @@ import {
 } from '@/api/destinations';
 import { ApiError } from '@/api/client';
 import { useAuthStore, getFreshAccessToken } from '@/auth/store';
-import { appendHistoryEntry } from '@/api/history';
+import { appendHistoryEntry, type SessionMode } from '@/api/history';
 
 /**
  * Real-audio + real-network-failure recovery test.
@@ -183,6 +184,85 @@ const RECORDING_OPTIONS = {
     bitRate: 64000,
   },
 } as Audio.RecordingOptions;
+
+/**
+ * Video recording bounds. The camera writes a single growing .mp4 file
+ * to FileSystem.cacheDirectory while recordAsync() is in flight; the
+ * existing chunker reads slices from that file every 1.5s exactly the
+ * way it does for audio. We cap maxDuration to keep a runaway recording
+ * from filling the device, but the value is generous (1h) so a normal
+ * session is bounded only by the user pressing PARAR.
+ */
+const VIDEO_MAX_DURATION_S = 60 * 60;
+
+/**
+ * How long startRecording polls FileSystem.cacheDirectory after invoking
+ * recordAsync() before giving up on URI discovery. The pre-flight
+ * diagnostic (app/debug-camera-probe/index.tsx) validated that the file
+ * appears within ~1s on this device; 2s is a comfortable safety margin.
+ * If discovery times out, the video session is aborted hard — silently
+ * falling back to chunk-after-stop has a different reliability profile
+ * than the audio path and was explicitly rejected.
+ */
+const VIDEO_URI_DISCOVERY_TIMEOUT_MS = 2000;
+
+interface CachedVideoFile {
+  path: string;
+  size: number;
+  modificationTime: number;
+}
+
+/**
+ * List candidate video files (.mp4, .mov) under FileSystem.cacheDirectory,
+ * including the conventional `Camera/` subdirectory expo-camera writes to.
+ *
+ * URI-acquisition method validated by the pre-flight diagnostic: snapshot
+ * the cache before recordAsync(), then diff after — the new file is the
+ * one the recorder is writing to. expo-camera (16.x) does not surface the
+ * in-flight URI on its public API; this listing diff is the documented
+ * workaround.
+ */
+async function listCachedVideoFiles(): Promise<CachedVideoFile[]> {
+  const dir = FileSystem.cacheDirectory;
+  if (!dir) return [];
+  const out: CachedVideoFile[] = [];
+
+  async function scan(prefix: string) {
+    let names: string[];
+    try {
+      names = await FileSystem.readDirectoryAsync(prefix);
+    } catch {
+      return;
+    }
+    for (const n of names) {
+      const full = prefix + n;
+      let info;
+      try {
+        info = await FileSystem.getInfoAsync(full);
+      } catch {
+        continue;
+      }
+      if (!info.exists) continue;
+      if (info.isDirectory) {
+        // Recurse one level into known camera dirs only — keeps this cheap.
+        if (n === 'Camera' || n.startsWith('ExpoCamera') || n === 'CameraView') {
+          await scan(full + '/');
+        }
+        continue;
+      }
+      const lower = n.toLowerCase();
+      if (!lower.endsWith('.mp4') && !lower.endsWith('.mov')) continue;
+      out.push({
+        path: full,
+        size: info.size ?? 0,
+        modificationTime: info.modificationTime ?? 0,
+      });
+    }
+  }
+
+  await scan(dir);
+  return out;
+}
 
 /**
  * Decode a base64 slice into its raw bytes.
@@ -1446,10 +1526,13 @@ async function completeSession(
  * is orphaned in `active`; the worker's completeSession path will
  * eventually reap it (chunks list is empty → all-settled → complete).
  */
-async function createSessionRequest(token: string): Promise<string> {
+async function createSessionRequest(
+  token: string,
+  mode: SessionMode = 'audio',
+): Promise<string> {
   const sessionBody = JSON.stringify({
     user_id: 'test_user',
-    mode: 'audio',
+    mode,
     destination_type: 'drive',
   });
   const controller = new AbortController();
@@ -1488,6 +1571,20 @@ export default function Index() {
   const [testStatus, setTestStatus] = useState<string | null>(null);
   const [isRecording, setIsRecording] = useState(false);
   const recordingRef = useRef<Audio.Recording | null>(null);
+  // Video-mode counterparts of recordingRef. The CameraView is mounted
+  // only during a video session (see render); cameraRef is wired through
+  // its ref callback. videoRecordPromiseRef holds the recordAsync()
+  // promise — it resolves only when stopRecording() is called and gives
+  // the authoritative final URI. videoRecordingUriRef remembers the URI
+  // we discovered via cacheDirectory listing at start, used at stop to
+  // verify it matches the camera's authoritative URI.
+  const cameraRef = useRef<CameraView | null>(null);
+  const videoRecordPromiseRef = useRef<Promise<{ uri: string } | undefined> | null>(null);
+  const videoRecordingUriRef = useRef<string | null>(null);
+  // Camera permission hook. Permission is requested at GRABAR-time when
+  // mode === 'video', not on screen mount, so audio sessions never
+  // surface a camera prompt.
+  const [, requestCameraPermission] = useCameraPermissions();
   const tokenRef = useRef<string | null>(null);
   /**
    * Session id of the currently-active recording. Set when GRABAR fires
@@ -1511,6 +1608,12 @@ export default function Index() {
   const [isStarting, setIsStarting] = useState(false);
   const [isStopping, setIsStopping] = useState(false);
   const [isRecovering, setIsRecovering] = useState(false);
+
+  // Recording mode selected via the Audio/Video toggle on the home screen.
+  // Step 2 wires only the state + UI; the recording branches still always
+  // produce audio. The toggle is locked while a session is in flight so
+  // mode cannot flip mid-recording.
+  const [mode, setMode] = useState<SessionMode>('audio');
 
   /**
    * Destination gate state.
@@ -1719,20 +1822,38 @@ export default function Index() {
   }, []);
 
   async function startRecording() {
-    if (isStartingRef.current || recordingRef.current) {
+    if (
+      isStartingRef.current ||
+      recordingRef.current ||
+      videoRecordPromiseRef.current
+    ) {
       console.log('REC START ignored — already starting or recording');
       return;
     }
     isStartingRef.current = true;
     setIsStarting(true);
     resetProgress();
+
+    // Capture mode synchronously so it cannot change mid-flight if the
+    // user somehow flips the toggle (the UI locks it, but defense in
+    // depth keeps createSessionRequest, appendHistoryEntry, and the
+    // recorder branch all using the same value).
+    const recordingMode: SessionMode = mode;
+
     try {
       setTestStatus('REC START');
       await new Promise(r => setTimeout(r, 50));
-      console.log('REC START — manual trigger');
+      console.log('REC START — manual trigger', { mode: recordingMode });
 
       const perm = await Audio.requestPermissionsAsync();
       if (!perm.granted) throw new Error('RECORD_AUDIO permission denied');
+
+      if (recordingMode === 'video') {
+        // Camera permission is requested at GRABAR-time, not on screen
+        // mount, so audio sessions never trigger this prompt.
+        const cam = await requestCameraPermission();
+        if (!cam.granted) throw new Error('CAMERA permission denied');
+      }
       setTestStatus('REC PERMISSION OK');
       await new Promise(r => setTimeout(r, 50));
 
@@ -1753,7 +1874,7 @@ export default function Index() {
       // path will reap it (chunks=[] → all-settled → completeSession).
       setTestStatus('REC SESSION CREATING');
       await new Promise(r => setTimeout(r, 50));
-      const sessionId = await createSessionRequest(token);
+      const sessionId = await createSessionRequest(token, recordingMode);
       sessionIdRef.current = sessionId;
       AsyncStorage.setItem(LAST_SESSION_ID_KEY, sessionId).catch(() => {});
       // Append to local history index (best-effort, never blocks the
@@ -1763,22 +1884,93 @@ export default function Index() {
       appendHistoryEntry({
         session_id: sessionId,
         created_at: new Date().toISOString(),
-        mode: 'audio',
+        mode: recordingMode,
       });
       console.log('GC_VALIDATION: SESSION_CREATED', {
         session_id: sessionId,
         phase: 1,
+        mode: recordingMode,
       });
       setTestStatus('REC SESSION CREATED');
       await new Promise(r => setTimeout(r, 50));
 
-      const recording = new Audio.Recording();
-      await recording.prepareToRecordAsync(RECORDING_OPTIONS);
-      await recording.startAsync();
-      recordingRef.current = recording;
+      let cacheUri: string;
+      if (recordingMode === 'audio') {
+        const recording = new Audio.Recording();
+        await recording.prepareToRecordAsync(RECORDING_OPTIONS);
+        await recording.startAsync();
+        recordingRef.current = recording;
 
-      const cacheUri = recording.getURI();
-      if (!cacheUri) throw new Error('Recording URI is null after startAsync');
+        const audioUri = recording.getURI();
+        if (!audioUri) throw new Error('Recording URI is null after startAsync');
+        cacheUri = audioUri;
+      } else {
+        // === Video branch ===
+        // The CameraView is mounted by the JSX condition `mode==='video'
+        // && (isStarting||isRecording)`; setIsStarting(true) above has
+        // already triggered the commit, and the `await` points between
+        // here and the start of startRecording have given React time to
+        // run the ref callback. Poll defensively in case the mount is
+        // slow (low-end devices, cold camera init).
+        const tMount = Date.now();
+        while (!cameraRef.current && Date.now() - tMount < 5000) {
+          await new Promise(r => setTimeout(r, 50));
+        }
+        if (!cameraRef.current) {
+          throw new Error('CAMERA_REF_NOT_READY');
+        }
+        // Camera hardware needs a beat to initialize before recordAsync
+        // will succeed. Without this delay expo-camera silently resolves
+        // recordAsync to undefined. 800ms matches the pre-flight probe.
+        await new Promise(r => setTimeout(r, 800));
+
+        // Snapshot baseline candidate files BEFORE recordAsync so the
+        // diff after start uniquely identifies the in-flight file.
+        const baseline = await listCachedVideoFiles();
+
+        // Kick off recording. DO NOT await — the promise resolves only
+        // when stopRecording() is called (returns the authoritative URI).
+        const recordPromise = cameraRef.current.recordAsync({
+          maxDuration: VIDEO_MAX_DURATION_S,
+        }) as Promise<{ uri: string } | undefined>;
+        videoRecordPromiseRef.current = recordPromise;
+
+        // Discover the in-flight URI by listing-diff (probe-validated).
+        let inFlightUri: string | null = null;
+        const tCallStart = Date.now();
+        const deadline = tCallStart + VIDEO_URI_DISCOVERY_TIMEOUT_MS;
+        while (Date.now() < deadline) {
+          await new Promise(r => setTimeout(r, 200));
+          const after = await listCachedVideoFiles();
+          const novel = after.filter(
+            a => !baseline.some(b => b.path === a.path),
+          );
+          if (novel.length > 0) {
+            novel.sort((a, b) => b.modificationTime - a.modificationTime);
+            inFlightUri = novel[0]!.path;
+            break;
+          }
+        }
+        if (!inFlightUri) {
+          // The diagnostic passed on this device; if discovery fails
+          // here something is materially different. Tear down hard
+          // rather than fall back to chunk-after-stop.
+          try {
+            cameraRef.current.stopRecording();
+          } catch {
+            /* ignore — about to throw anyway */
+          }
+          await recordPromise.catch(() => {});
+          videoRecordPromiseRef.current = null;
+          throw new Error('VIDEO_URI_NOT_DISCOVERED');
+        }
+        videoRecordingUriRef.current = inFlightUri;
+        cacheUri = inFlightUri;
+        console.log('GC_DIAG: VIDEO_URI_DISCOVERED', {
+          uri: inFlightUri,
+          discovered_at_ms: Date.now() - tCallStart,
+        });
+      }
 
       await queueAppendNewSession({
         session_id: sessionId,
@@ -1812,6 +2004,20 @@ export default function Index() {
       setTestStatus(`ERROR REC: ${message}`);
       console.log('ERROR REC:', error);
       sessionIdRef.current = null;
+      // Make sure no half-started video state leaks if we threw after
+      // recordAsync was invoked. Audio's recordingRef is cleared
+      // separately in the recorder block on success; on failure either
+      // it never got set or the throw happens before assignment.
+      if (videoRecordPromiseRef.current) {
+        try {
+          cameraRef.current?.stopRecording();
+        } catch {
+          /* ignore */
+        }
+        await videoRecordPromiseRef.current.catch(() => {});
+        videoRecordPromiseRef.current = null;
+      }
+      videoRecordingUriRef.current = null;
     } finally {
       isStartingRef.current = false;
       setIsStarting(false);
@@ -1819,10 +2025,11 @@ export default function Index() {
   }
 
   async function stopRecording() {
-    const recording = recordingRef.current;
-    if (!recording) {
+    const audioRecording = recordingRef.current;
+    const videoPromise = videoRecordPromiseRef.current;
+    if (!audioRecording && !videoPromise) {
       setTestStatus('ERROR REC: no active recording');
-      console.log('ERROR REC: recordingRef is null on stop');
+      console.log('ERROR REC: no active recording on stop');
       return;
     }
     const sessionId = sessionIdRef.current;
@@ -1833,10 +2040,52 @@ export default function Index() {
     try {
       setTestStatus('REC STOPPING');
       await new Promise(r => setTimeout(r, 50));
-      await recording.stopAndUnloadAsync();
-      console.log('GC_DIAG: STOP_AND_UNLOAD_RETURNED');
-      const maybeUri = recording.getURI();
-      recordingRef.current = null;
+
+      let maybeUri: string | null;
+      if (audioRecording) {
+        await audioRecording.stopAndUnloadAsync();
+        console.log('GC_DIAG: STOP_AND_UNLOAD_RETURNED');
+        maybeUri = audioRecording.getURI();
+        recordingRef.current = null;
+      } else {
+        // === Video stop ===
+        // 1. Tell camera to stop. recordAsync resolves with the final URI.
+        try {
+          cameraRef.current?.stopRecording();
+        } catch (e) {
+          console.log('VIDEO STOP_RECORDING THREW', e);
+        }
+        console.log('GC_DIAG: VIDEO_STOP_RECORDING_CALLED');
+
+        // 2. Await the in-flight promise to capture the authoritative URI.
+        let videoFinalUri: string | null = null;
+        try {
+          const result = await videoPromise!;
+          videoFinalUri = result?.uri ?? null;
+        } catch (e) {
+          console.log('VIDEO RECORDASYNC REJECTED', e);
+        }
+        videoRecordPromiseRef.current = null;
+
+        // 3. Cross-check against the URI the chunker has been reading.
+        // The pre-flight diagnostic verified these are the same file on
+        // this device. A mismatch means the chunker has been pointing at
+        // a different file than the camera was writing to — surface as
+        // a hard error rather than ship a corrupted session silently.
+        const chunkedUri = videoRecordingUriRef.current;
+        videoRecordingUriRef.current = null;
+        if (videoFinalUri && chunkedUri && videoFinalUri !== chunkedUri) {
+          console.log('VIDEO URI MISMATCH', { chunkedUri, videoFinalUri });
+          throw new Error(
+            `VIDEO_URI_MISMATCH chunker=${chunkedUri} cam=${videoFinalUri}`,
+          );
+        }
+        // Prefer the camera's authoritative URI; fall back to the chunked
+        // URI if recordAsync rejected (file is still on disk, chunker has
+        // been reading partial data — better than losing the session).
+        maybeUri = videoFinalUri ?? chunkedUri;
+      }
+
       setIsRecording(false);
       if (!maybeUri) throw new Error('Recording URI is null');
       finalUri = maybeUri;
@@ -1892,6 +2141,8 @@ export default function Index() {
       });
     } catch (error) {
       recordingRef.current = null;
+      videoRecordPromiseRef.current = null;
+      videoRecordingUriRef.current = null;
       setIsRecording(false);
       setIsStopping(false);
       const message = (error as Error).message ?? String(error);
@@ -2052,6 +2303,28 @@ export default function Index() {
           documented Expo Router pattern. */}
       <Stack.Screen options={{ headerShown: false }} />
 
+      {/* Hidden CameraView — mounted ONLY during a video session so
+          audio recordings never spin up the camera. Positioned offscreen
+          (1×1 px, opacity 0). The recordAsync() call in startRecording
+          writes to a growing .mp4 in cacheDirectory; the chunker reads
+          slices from it the same way it reads the audio cache file. */}
+      {mode === 'video' && (isStarting || isRecording) ? (
+        <CameraView
+          ref={(r) => {
+            cameraRef.current = r;
+          }}
+          mode="video"
+          style={{
+            position: 'absolute',
+            top: 0,
+            left: 0,
+            width: 1,
+            height: 1,
+            opacity: 0,
+          }}
+        />
+      ) : null}
+
       {/* Top shortcuts — Configuración (right) and Historial (left).
           Always available, never block any recording / recovery logic.
           Same visual weight as each other; both deliberately small so
@@ -2130,6 +2403,16 @@ export default function Index() {
           and offers a shortcut to the Settings screen. */}
       <DestinationIndicator drive={drive} loading={driveCheckLoading} />
 
+      {/* Audio / Video mode toggle. Cosmetic in step 2 — flipping the
+          state has no effect on what gets recorded yet. Locked while a
+          session is starting, recording, or stopping so the chosen mode
+          cannot change mid-flight. */}
+      <ModeToggle
+        mode={mode}
+        onChange={setMode}
+        disabled={isRecording || isStarting || isStopping}
+      />
+
       <Pressable
         onPress={showStop ? stopRecording : startRecording}
         disabled={buttonDisabled}
@@ -2172,6 +2455,27 @@ export default function Index() {
           conectar tu Google Drive.
         </Text>
       )}
+
+      {/* TEMPORARY — gating diagnostic for video support (step 0 only).
+          Remove this Pressable and the /debug-camera-probe route file
+          once the diagnostic passes and the real video branch is wired. */}
+      <Pressable
+        onPress={() => router.push('/debug-camera-probe')}
+        hitSlop={8}
+        style={{
+          marginTop: 8,
+          paddingHorizontal: 10,
+          paddingVertical: 6,
+          borderWidth: 1,
+          borderColor: '#30363d',
+          borderRadius: 6,
+          backgroundColor: '#161b22',
+        }}
+      >
+        <Text style={{ color: '#8b949e', fontSize: 11 }}>
+          [debug] camera probe
+        </Text>
+      </Pressable>
 
     </View>
   );
@@ -2217,6 +2521,71 @@ function DestinationIndicator({
       <Text style={{ color: '#c9d1d9', fontSize: 12 }} numberOfLines={1}>
         {label}
       </Text>
+    </View>
+  );
+}
+
+/**
+ * Audio / Video mode toggle. Two segmented Pressables; the active mode
+ * is highlighted. Disabled while a session is starting, recording, or
+ * stopping so the user can't flip mode mid-flight.
+ *
+ * Step 2 wires only the state + UI — `mode` is not yet read by the
+ * recording branches, so flipping this toggle has no effect on what
+ * gets captured. The video branch lands in step 3.
+ */
+function ModeToggle({
+  mode,
+  onChange,
+  disabled,
+}: {
+  mode: SessionMode;
+  onChange: (next: SessionMode) => void;
+  disabled: boolean;
+}) {
+  const segment = (value: SessionMode, label: string) => {
+    const active = mode === value;
+    return (
+      <Pressable
+        key={value}
+        onPress={() => onChange(value)}
+        disabled={disabled}
+        hitSlop={4}
+        style={{
+          paddingHorizontal: 18,
+          paddingVertical: 8,
+          backgroundColor: active ? '#1f6feb' : '#161b22',
+          opacity: disabled ? 0.5 : 1,
+        }}
+      >
+        <Text
+          style={{
+            color: active ? '#fff' : '#8b949e',
+            fontSize: 12,
+            fontWeight: '600',
+            letterSpacing: 0.5,
+          }}
+        >
+          {label}
+        </Text>
+      </Pressable>
+    );
+  };
+
+  return (
+    <View
+      style={{
+        flexDirection: 'row',
+        marginTop: 12,
+        marginBottom: 8,
+        borderWidth: 1,
+        borderColor: '#30363d',
+        borderRadius: 6,
+        overflow: 'hidden',
+      }}
+    >
+      {segment('audio', 'Audio')}
+      {segment('video', 'Video')}
     </View>
   );
 }

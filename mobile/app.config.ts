@@ -40,6 +40,16 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
           'Allow Guardian Cloud to access the microphone to record evidence.',
       },
     ],
+    [
+      'expo-camera',
+      {
+        cameraPermission:
+          'Allow Guardian Cloud to access the camera to record video evidence.',
+        microphonePermission:
+          'Allow Guardian Cloud to access the microphone to record video evidence.',
+        recordAudioAndroid: true,
+      },
+    ],
   ],
   experiments: {
     typedRoutes: true,
