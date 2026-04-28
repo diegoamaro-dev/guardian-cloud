@@ -383,6 +383,33 @@ interface QueueChunk {
    * field, not just omit it.
    */
   base64Slice?: string | undefined;
+  /**
+   * VIDEO path only. Byte offset of this chunk's bytes inside the source
+   * recording at `entry.uri`. Set once at emit; NEVER pruned (eight-byte
+   * integer — orders of magnitude smaller than a base64Slice and required
+   * for retry/recovery to re-read the bytes from disk).
+   *
+   * Mutually exclusive with `base64Slice`: an audio chunk has only
+   * `base64Slice` (until pruned), a video chunk has only `byteOffset` +
+   * `byteLength`. The worker branches on field presence — see
+   * `rehydrateChunkSlice`.
+   *
+   * Why bytes and not base64 chars: `FileSystem.readAsStringAsync` accepts
+   * `{ encoding: Base64, position, length }` where both are byte counts
+   * and returns base64 of just that range. Storing byte offsets lets the
+   * worker do an O(chunk_size) read at upload time instead of an O(file)
+   * whole-file read — the latter is exactly the OOM that drove this change.
+   */
+  byteOffset?: number | undefined;
+  /**
+   * VIDEO path only. Byte length of this chunk's bytes inside `entry.uri`.
+   * Always equals `CHUNK_SIZE_VIDEO` for non-tail chunks; the final-pass
+   * tail chunk carries the remainder.
+   *
+   * Same lifecycle as `byteOffset` (set once, never pruned). Same field
+   * presence rule (audio chunks do not set this).
+   */
+  byteLength?: number | undefined;
   /** Set when the upload to Drive returned a file_id we should use as remote_reference on /chunks. */
   remote_reference?: string | null | undefined;
   last_error?: { status: number; code?: string; message: string } | undefined;
@@ -467,7 +494,14 @@ async function queueAppendNewSession(
 async function queueAppendChunk(
   sessionId: string,
   chunk: QueueChunk,
-  emittedBase64Length: number,
+  /**
+   * AUDIO: number of base64 chars chunked so far — what the audio chunker
+   *        reads back on the next tick to know where to resume.
+   * VIDEO: pass `null`. Video doesn't use this field; its chunker derives
+   *        the resume offset from `sum(chunks[*].byteLength)` so the bookkeeping
+   *        stays accurate even if a tail chunk shortened a previous run.
+   */
+  emittedBase64Length: number | null,
   nextChunkIndex: number,
 ): Promise<void> {
   await queueMutate(q => {
@@ -488,7 +522,9 @@ async function queueAppendChunk(
       return;
     }
     e.chunks.push(chunk);
-    e.emitted_base64_length = emittedBase64Length;
+    if (emittedBase64Length !== null) {
+      e.emitted_base64_length = emittedBase64Length;
+    }
     e.next_chunk_index = nextChunkIndex;
   });
 }
@@ -910,8 +946,40 @@ async function rehydrateChunkSlice(
   entry: PendingQueueEntry,
   chunk: QueueChunk,
 ): Promise<string | null> {
+  // Audio path: in-memory base64 attached at emit, pruned on 200 OK.
+  // Always preferred when present — short-circuits before any disk I/O.
   if (chunk.base64Slice) return chunk.base64Slice;
   if (!entry.uri) return null;
+
+  // Video path: do an O(chunk_size) partial read against the recording
+  // file. The whole-file read used by the audio legacy fallback below
+  // would re-introduce the OutOfMemoryError that motivated this design,
+  // so this arm MUST run for any chunk carrying `byteOffset`/`byteLength`
+  // even if the file would also be cacheable.
+  if (chunk.byteOffset !== undefined && chunk.byteLength !== undefined) {
+    try {
+      return await FileSystem.readAsStringAsync(entry.uri, {
+        encoding: FileSystem.EncodingType.Base64,
+        position: chunk.byteOffset,
+        length: chunk.byteLength,
+      });
+    } catch (err) {
+      console.log('GC_QUEUE video rehydrate read failed', {
+        uri: entry.uri,
+        byteOffset: chunk.byteOffset,
+        byteLength: chunk.byteLength,
+        err,
+      });
+      return null;
+    }
+  }
+
+  // Audio legacy fallback: pre-Phase-2 entries (and post-200-OK entries
+  // for which we deliberately keep the legacy chunkSize math) read the
+  // whole file once and slice the resulting base64 string. Audio is
+  // small enough that the whole-file read is safe; only legacy/audio
+  // entries reach this branch because new video chunks always carry
+  // byteOffset/byteLength.
   let base64 = rehydrationCache.get(entry.uri);
   if (base64 === undefined) {
     try {
@@ -1283,11 +1351,39 @@ async function stopChunkerForSession(
   }
 }
 
+/**
+ * Top-level chunker tick. Routes to the audio or video implementation
+ * based on the recording mode captured at start. The two paths differ in
+ * how they READ the file (audio: whole file as base64; video: partial
+ * byte-range reads) and what they PERSIST (audio: `base64Slice`; video:
+ * `byteOffset`/`byteLength`). Everything downstream of `emitChunk` —
+ * dedup, drain wakeup, hash semantics — is identical.
+ */
 async function runChunkerTick(
   sessionId: string,
   fileUri: string,
   finalPass: boolean,
   mode: SessionMode,
+): Promise<void> {
+  if (mode === 'video') {
+    await runVideoChunkerTick(sessionId, fileUri, finalPass);
+    return;
+  }
+  await runAudioChunkerTick(sessionId, fileUri, finalPass);
+}
+
+/**
+ * Audio chunker tick — UNCHANGED behavior from the pre-video baseline.
+ * Reads the whole file as base64 (small enough — audio ADTS at 64 kbps is
+ * ~8 KB/s) and slices the resulting string in 16 KB-equivalent steps. The
+ * `base64Slice` is persisted into the queue at emit and pruned on 200 OK.
+ * Keeping this body verbatim is a hard constraint: the audio pipeline is
+ * "fully stable" per the project doc.
+ */
+async function runAudioChunkerTick(
+  sessionId: string,
+  fileUri: string,
+  finalPass: boolean,
 ): Promise<void> {
   const base64 = await FileSystem.readAsStringAsync(fileUri, {
     encoding: FileSystem.EncodingType.Base64,
@@ -1302,7 +1398,7 @@ async function runChunkerTick(
 
   let emitted = entry.emitted_base64_length;
   let nextIndex = entry.next_chunk_index;
-  const chunkSizeBase64 = chunkSizeBase64ForMode(mode);
+  const chunkSizeBase64 = chunkSizeBase64ForMode('audio');
 
   while (base64.length - emitted >= chunkSizeBase64) {
     const slice = base64.substring(emitted, emitted + chunkSizeBase64);
@@ -1315,6 +1411,77 @@ async function runChunkerTick(
     const tail = base64.substring(emitted);
     await emitChunk(sessionId, tail, nextIndex, base64.length);
     emitted = base64.length;
+    nextIndex += 1;
+  }
+}
+
+/**
+ * Video chunker tick — partial-read architecture.
+ *
+ * Differences vs. audio:
+ *   1. Never reads the whole file. `getInfoAsync` returns the current
+ *      byte size of the growing recording; we partial-read just one
+ *      chunk's bytes per emit. This avoids the OOM in
+ *      `FileSystem.readAsStringAsync` that a multi-MB whole-file base64
+ *      read produces.
+ *   2. Resume offset is derived from `sum(chunks[*].byteLength)`, NOT
+ *      from `entry.emitted_base64_length`. The latter is irrelevant for
+ *      the video path; we leave it at its initial 0 to avoid a queue-
+ *      shape change. Summing is robust against a tail chunk shortening
+ *      a previous run (post-kill resume).
+ *   3. Persists `byteOffset`/`byteLength` per chunk; does NOT persist
+ *      `base64Slice`. The worker re-reads the bytes on demand at upload
+ *      time via the same partial-read API.
+ *
+ * Hash is computed at emit time against the same bytes the worker will
+ * read at upload time (same uri, same byteOffset, same byteLength), so
+ * the wire-side hash check never sees a mismatch as long as the file is
+ * untouched after the chunk is emitted (which it is — recordings only
+ * grow during recording, and stay frozen post-STOP in documentDirectory).
+ */
+async function runVideoChunkerTick(
+  sessionId: string,
+  fileUri: string,
+  finalPass: boolean,
+): Promise<void> {
+  const info = await FileSystem.getInfoAsync(fileUri);
+  if (!info.exists) return;
+  const fileBytes = info.size ?? 0;
+
+  const queue = await queueRead();
+  const entry = queue.find(e => e.session_id === sessionId);
+  if (!entry) return;
+
+  // Derive resume offset from already-emitted chunks. See the function
+  // header for why we do not use `entry.emitted_base64_length` here.
+  let emittedBytes = 0;
+  for (const c of entry.chunks) {
+    if (typeof c.byteLength === 'number') emittedBytes += c.byteLength;
+  }
+  let nextIndex = entry.next_chunk_index;
+
+  while (fileBytes - emittedBytes >= CHUNK_SIZE_VIDEO) {
+    await emitVideoChunk(
+      sessionId,
+      fileUri,
+      emittedBytes,
+      CHUNK_SIZE_VIDEO,
+      nextIndex,
+    );
+    emittedBytes += CHUNK_SIZE_VIDEO;
+    nextIndex += 1;
+  }
+
+  if (finalPass && emittedBytes < fileBytes) {
+    const tailLength = fileBytes - emittedBytes;
+    await emitVideoChunk(
+      sessionId,
+      fileUri,
+      emittedBytes,
+      tailLength,
+      nextIndex,
+    );
+    emittedBytes += tailLength;
     nextIndex += 1;
   }
 }
@@ -1358,6 +1525,79 @@ async function emitChunk(
   uploadDrainLoop().catch(err => {
     if (DEBUG_QUEUE) {
       console.log('GC_DEBUG drain rejected (from emit)', {
+        sessionId,
+        chunk_index,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+  });
+}
+
+/**
+ * Video-mode chunk emit. Reads JUST the chunk's bytes from the recording
+ * file via a base64 partial read, hashes them, and persists ONLY the
+ * metadata (no `base64Slice`). The worker re-reads the same byte range
+ * at upload time via the symmetrical partial read in
+ * `rehydrateChunkSlice`.
+ *
+ * Why this shape:
+ *   - `base64Slice` for video would put hundreds of KB per chunk into
+ *     AsyncStorage, blowing CursorWindow at queue read time.
+ *   - The hash MUST be computed against the same bytes the upload sends.
+ *     We hash the partial-read result here; the worker re-reads the same
+ *     `(uri, byteOffset, byteLength)` later. The recording file is
+ *     append-only during recording and immutable after STOP, so the two
+ *     reads produce identical bytes by construction.
+ */
+async function emitVideoChunk(
+  sessionId: string,
+  fileUri: string,
+  byteOffset: number,
+  byteLength: number,
+  chunk_index: number,
+): Promise<void> {
+  const base64Slice = await FileSystem.readAsStringAsync(fileUri, {
+    encoding: FileSystem.EncodingType.Base64,
+    position: byteOffset,
+    length: byteLength,
+  });
+  const bytes = sliceToBytes(base64Slice);
+  const hash = bytesDigestToHex(
+    await Crypto.digest(Crypto.CryptoDigestAlgorithm.SHA256, bytes),
+  );
+  const chunk: QueueChunk = {
+    chunk_index,
+    hash,
+    size: bytes.length,
+    status: 'pending',
+    attempts: 0,
+    byteOffset,
+    byteLength,
+  };
+  // Pass `null` for emittedBase64Length: the video path tracks bookkeeping
+  // via `sum(chunks[*].byteLength)` instead, so the audio-only field
+  // stays untouched on this entry.
+  await queueAppendChunk(sessionId, chunk, /*emittedBase64Length*/ null, chunk_index + 1);
+  if (DEBUG_QUEUE) {
+    console.log('GC_DEBUG queueAppendChunk saved (video)', {
+      sessionId,
+      chunk_index,
+      status: chunk.status,
+      byteOffset,
+      byteLength,
+    });
+  }
+  console.log('GC_QUEUE chunk emitted (video)', {
+    sessionId,
+    chunk_index,
+    size: bytes.length,
+    byteOffset,
+    byteLength,
+    hash_short: hash.substring(0, 12),
+  });
+  uploadDrainLoop().catch(err => {
+    if (DEBUG_QUEUE) {
+      console.log('GC_DEBUG drain rejected (from emitVideoChunk)', {
         sessionId,
         chunk_index,
         err: err instanceof Error ? err.message : String(err),
