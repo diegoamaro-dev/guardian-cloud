@@ -226,6 +226,31 @@ const VIDEO_MAX_DURATION_S = 60 * 60;
  */
 const VIDEO_URI_DISCOVERY_TIMEOUT_MS = 2000;
 
+/**
+ * Stabilization delay for the VIDEO chunker only. After `recordAsync`
+ * starts, the underlying MediaRecorder spends a brief window writing the
+ * MP4 prologue (`ftyp`, the `mdat` box header with placeholder size,
+ * codec config) before steady-state mdat data begins flowing. Reads that
+ * land inside that window can return bytes that are still being patched
+ * — the chunker hashes them, the worker re-reads later, and the two
+ * differ → HASH_MISMATCH on chunk 0.
+ *
+ * Holding the regular tick for `VIDEO_CHUNK_START_DELAY_MS` lets the
+ * encoder pass that initialization phase before any chunk is emitted.
+ * The first tick fires at +CHUNK_TICK_MS (1500ms); 2000ms here makes
+ * that first tick a no-op and lets the second tick (at +3000ms) be the
+ * first one that actually emits.
+ *
+ * This delay is bypassed on the FINAL pass at STOP — a recording shorter
+ * than the delay window must still produce its chunks. By that point the
+ * file lives in documentDirectory, the recorder has finalized, and the
+ * bytes are stable.
+ *
+ * Audio is unaffected: the AAC ADTS pipeline is "fully stable" per the
+ * project doc and has no analogous initialization race.
+ */
+const VIDEO_CHUNK_START_DELAY_MS = 2000;
+
 interface CachedVideoFile {
   path: string;
   size: number;
@@ -1232,6 +1257,13 @@ interface ChunkerState {
    * modes.
    */
   mode: SessionMode;
+  /**
+   * Wall-clock timestamp (Date.now()) of when the chunker was started.
+   * Read ONLY by the video tick to gate emits during the
+   * VIDEO_CHUNK_START_DELAY_MS stabilization window. Audio ignores this
+   * field. In-memory only.
+   */
+  startedAt: number;
   active: boolean;
   tickHandle: ReturnType<typeof setTimeout> | null;
   /**
@@ -1261,6 +1293,7 @@ function startChunkerForSession(
     sessionId,
     fileUri: cacheUri,
     mode,
+    startedAt: Date.now(),
     active: true,
     tickHandle: null,
     inflight: null,
@@ -1446,6 +1479,31 @@ async function runVideoChunkerTick(
   fileUri: string,
   finalPass: boolean,
 ): Promise<void> {
+  // Stabilization gate (regular ticks only). Skip emits until the
+  // encoder has had `VIDEO_CHUNK_START_DELAY_MS` to write the MP4
+  // prologue and start producing stable mdat bytes. Without this gate,
+  // chunk 0 occasionally hashes against bytes the recorder is still
+  // patching (placeholder mdat size, codec config) — the worker re-reads
+  // later, the bytes have changed, and HASH_MISMATCH fires at the proxy.
+  //
+  // Final pass bypasses the gate: by STOP the file is finalized in
+  // documentDirectory, every byte is stable, and a recording shorter
+  // than the delay window must still produce its chunks.
+  if (!finalPass) {
+    const state = chunkerStates.get(sessionId);
+    if (state) {
+      const elapsed = Date.now() - state.startedAt;
+      if (elapsed < VIDEO_CHUNK_START_DELAY_MS) {
+        console.log('GC_QUEUE video chunker stabilization wait', {
+          sessionId,
+          elapsed_ms: elapsed,
+          required_ms: VIDEO_CHUNK_START_DELAY_MS,
+        });
+        return;
+      }
+    }
+  }
+
   const info = await FileSystem.getInfoAsync(fileUri);
   if (!info.exists) return;
   const fileBytes = info.size ?? 0;
