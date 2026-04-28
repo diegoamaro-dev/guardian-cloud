@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { View, Text, Pressable } from 'react-native';
+import { Alert, View, Text, Pressable } from 'react-native';
 import { Audio } from 'expo-av';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import * as FileSystem from 'expo-file-system';
@@ -16,6 +16,7 @@ import {
 import { ApiError } from '@/api/client';
 import { useAuthStore, getFreshAccessToken } from '@/auth/store';
 import { appendHistoryEntry, type SessionMode } from '@/api/history';
+import { hardResetAppState } from '@/dev/reset';
 
 /**
  * Real-audio + real-network-failure recovery test.
@@ -2830,6 +2831,38 @@ export default function Index() {
           [debug] camera probe
         </Text>
       </Pressable>
+
+      {/* DEV-only hard reset. Long-press, gated on __DEV__. */}
+      {__DEV__ ? (
+        <Pressable
+          onLongPress={async () => {
+            if (isRecording || isStarting || isStopping) {
+              Alert.alert('Reset bloqueado', 'Stop recording before reset.');
+              return;
+            }
+            try {
+              await hardResetAppState();
+              Alert.alert('Reset hecho', 'App state cleared.');
+            } catch (err) {
+              Alert.alert(
+                'Reset error',
+                err instanceof Error ? err.message : String(err),
+              );
+            }
+          }}
+          delayLongPress={800}
+          hitSlop={20}
+          style={{
+            position: 'absolute',
+            bottom: 16,
+            right: 16,
+            padding: 6,
+            opacity: 0.15,
+          }}
+        >
+          <Text style={{ color: '#8b949e', fontSize: 10 }}>reset</Text>
+        </Pressable>
+      ) : null}
 
     </View>
   );
