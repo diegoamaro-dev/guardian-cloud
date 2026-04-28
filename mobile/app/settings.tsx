@@ -9,6 +9,7 @@ import {
   View,
 } from 'react-native';
 import * as ExpoLinking from 'expo-linking';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { router } from 'expo-router';
 
 import { supabase } from '@/auth/supabase';
@@ -20,6 +21,14 @@ import {
   startDriveConnect,
   type PublicDestination,
 } from '@/api/destinations';
+// DEV-only queue wipe — surfaced as a button at the bottom of this screen.
+// Does NOT touch auth/Drive/anything else; only Guardian Cloud queue keys.
+import { clearGuardianQueueDev } from '.';
+
+// Mirror of the key written by the home screen after a session is created
+// or recovered. See index.tsx LAST_SESSION_ID_KEY. Kept as a literal on
+// purpose — introducing a shared module just for this would be premature.
+const LAST_SESSION_ID_KEY = 'export.last_session_id';
 
 /**
  * Settings screen — destination management.
@@ -80,6 +89,7 @@ export default function SettingsScreen() {
   );
   const [lastUploadRef, setLastUploadRef] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [lastSessionId, setLastSessionId] = useState<string | null>(null);
 
   // Guard against double-exchange: if a deep link fires twice or we pick
   // up the same URL via both `getInitialURL` and the `url` listener, the
@@ -110,6 +120,18 @@ export default function SettingsScreen() {
 
   useEffect(() => {
     refreshState();
+  }, []);
+
+  // Read-only lookup of the last session_id persisted by the home screen.
+  // Feeds the temporary "Exportar última sesión" shortcut below.
+  useEffect(() => {
+    AsyncStorage.getItem(LAST_SESSION_ID_KEY)
+      .then((value) => {
+        if (value) setLastSessionId(value);
+      })
+      .catch(() => {
+        /* ignore — shortcut simply stays hidden */
+      });
   }, []);
 
   // --- Deep-link handling for the OAuth redirect.
@@ -345,6 +367,42 @@ export default function SettingsScreen() {
         </View>
       )}
 
+      {/* TODO(export-history): sustituir esta opción temporal por Historial real */}
+      {lastSessionId && (
+        <View style={{ marginTop: 28 }}>
+          <Text
+            style={{
+              color: '#8b949e',
+              fontSize: 12,
+              letterSpacing: 1,
+              marginBottom: 8,
+            }}
+          >
+            EVIDENCIA
+          </Text>
+          <Pressable
+            onPress={() => router.push(`/session/${lastSessionId}`)}
+            style={{
+              backgroundColor: '#161b22',
+              borderWidth: 1,
+              borderColor: '#30363d',
+              borderRadius: 6,
+              padding: 14,
+            }}
+          >
+            <Text style={{ color: '#c9d1d9', fontWeight: '600' }}>
+              Exportar última sesión
+            </Text>
+            <Text
+              selectable
+              style={{ color: '#6e7681', fontSize: 11, marginTop: 4 }}
+            >
+              {lastSessionId}
+            </Text>
+          </Pressable>
+        </View>
+      )}
+
       <Text
         style={{
           color: '#6e7681',
@@ -359,7 +417,105 @@ export default function SettingsScreen() {
         revocar el permiso en cualquier momento desde la configuración de tu
         cuenta de Google.
       </Text>
+
+      {/* DEV-only block. __DEV__ is true on Expo dev/Metro builds and false
+          on release. Wipes Guardian Cloud queue + last-session pointer in
+          AsyncStorage; auth tokens / Drive connection remain intact. */}
+      {__DEV__ && <DevQueueWipeBlock />}
     </ScrollView>
+  );
+}
+
+function DevQueueWipeBlock() {
+  const [busy, setBusy] = useState(false);
+  const [resultMsg, setResultMsg] = useState<string | null>(null);
+
+  async function handleWipe() {
+    Alert.alert(
+      'Limpiar cola (DEV)',
+      'Borra la cola persistida y el puntero de última sesión. ' +
+        'NO toca tu sesión de Google ni el Drive conectado. ' +
+        '¿Continuar?',
+      [
+        { text: 'Cancelar', style: 'cancel' },
+        {
+          text: 'Borrar',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              setBusy(true);
+              setResultMsg(null);
+              const { removed } = await clearGuardianQueueDev();
+              setResultMsg(`OK · borradas ${removed.length} claves`);
+            } catch (err) {
+              setResultMsg(
+                err instanceof Error ? err.message : String(err),
+              );
+            } finally {
+              setBusy(false);
+            }
+          },
+        },
+      ],
+    );
+  }
+
+  return (
+    <View
+      style={{
+        marginTop: 28,
+        paddingTop: 20,
+        borderTopWidth: 1,
+        borderTopColor: '#30363d',
+      }}
+    >
+      <Text
+        style={{
+          color: '#8b949e',
+          fontSize: 12,
+          letterSpacing: 1,
+          marginBottom: 8,
+        }}
+      >
+        DEV
+      </Text>
+      <Pressable
+        onPress={handleWipe}
+        disabled={busy}
+        style={{
+          backgroundColor: '#3d1518',
+          borderWidth: 1,
+          borderColor: '#f85149',
+          borderRadius: 6,
+          padding: 14,
+          opacity: busy ? 0.6 : 1,
+          alignItems: 'center',
+        }}
+      >
+        <Text style={{ color: '#f85149', fontWeight: '700' }}>
+          Limpiar cola (DEV)
+        </Text>
+      </Pressable>
+      {resultMsg && (
+        <Text
+          style={{ color: '#c9d1d9', fontSize: 12, marginTop: 8 }}
+          selectable
+        >
+          {resultMsg}
+        </Text>
+      )}
+      <Text
+        style={{
+          color: '#6e7681',
+          fontSize: 11,
+          marginTop: 8,
+          lineHeight: 16,
+        }}
+      >
+        Borra solo las claves de Guardian Cloud en AsyncStorage
+        (cola persistida + puntero de última sesión). Auth y Drive intactos.
+      </Text>
+    </View>
   );
 }
 

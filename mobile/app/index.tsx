@@ -4,7 +4,7 @@ import { Audio } from 'expo-av';
 import * as FileSystem from 'expo-file-system';
 import * as Crypto from 'expo-crypto';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { router } from 'expo-router';
+import { router, Stack } from 'expo-router';
 import { supabase } from '@/auth/supabase';
 import { env } from '@/config/env';
 import {
@@ -12,7 +12,9 @@ import {
   uploadChunkBytes,
   type PublicDestination,
 } from '@/api/destinations';
-import { useAuthStore } from '@/auth/store';
+import { ApiError } from '@/api/client';
+import { useAuthStore, getFreshAccessToken } from '@/auth/store';
+import { appendHistoryEntry } from '@/api/history';
 
 /**
  * Real-audio + real-network-failure recovery test.
@@ -41,6 +43,17 @@ import { useAuthStore } from '@/auth/store';
  */
 
 const PENDING_RETRY_KEY = 'test.pending_retry';
+
+/**
+ * Last known session_id on this device. Persisted as a side observation
+ * (never read by the upload pipeline, never gates recovery) purely so the
+ * Settings screen can offer a "Exportar última sesión" shortcut without
+ * maintaining a full session history yet.
+ *
+ * Unlike PENDING_RETRY_KEY, this key is NEVER cleared on completion — it
+ * always points to the most recent session_id the app was aware of.
+ */
+const LAST_SESSION_ID_KEY = 'export.last_session_id';
 /**
  * DEBUG-only toggle for the multi-chunk recovery test.
  *
@@ -90,6 +103,24 @@ const DEBUG_DUPLICATE_SUBMISSION = false;
 const DEBUG_DELAY_BEFORE_COMPLETE_MS = 0;
 
 /**
+ * Verbose queue/worker tracing for diagnostics.
+ *
+ *   true  → Emit GC_DEBUG lines covering every drain-loop iteration,
+ *           queueAppendChunk save, pickNext result, before/after
+ *           uploadChunkBytes, sleep cycles, and any silent rejection
+ *           caught by the fire-and-forget `.catch()` blocks. Use this
+ *           when re-debugging "why isn't the worker draining" symptoms.
+ *
+ *   false → Production noise floor. Only the user-visible GC_QUEUE
+ *           lifecycle logs (chunk emitted / uploading / uploaded /
+ *           failed / recording closed / session completed) are emitted.
+ *
+ * The `.catch()` blocks themselves remain regardless of this flag so a
+ * silent unhandled rejection cannot reappear undetected.
+ */
+const DEBUG_QUEUE = false;
+
+/**
  * Kill switch for the chunk-bytes → Drive proxy path.
  *
  *   true  → Before each POST /chunks, the client sends the chunk's raw
@@ -114,6 +145,44 @@ const DRIVE_CHUNK_UPLOAD_ENABLED = true;
 const CHUNK_SIZE_BYTES = 16 * 1024;
 const CHUNK_SIZE_BASE64 =
   Math.ceil(Math.ceil((CHUNK_SIZE_BYTES * 4) / 3) / 4) * 4;
+
+/**
+ * Recording options.
+ *
+ * Android is forced to AAC ADTS (raw AAC frames with self-framing sync
+ * words) instead of the HIGH_QUALITY preset's MPEG_4 / M4A container.
+ * The reason is partial-loss survival: MP4 stores its `moov` atom at the
+ * END of the file, so if the last chunk never uploaded the concatenated
+ * export is unplayable. AAC ADTS has no global header; every frame is
+ * independently decodable, so a truncated concat still plays up to the
+ * last frame we have. This trades a few percent of quality for the
+ * "subir evidencia > grabar perfecto" priority of Guardian Cloud.
+ *
+ * iOS keeps the HIGH_QUALITY preset's ios branch — the MVP is validating
+ * on Android only and we are not changing the iOS container until we
+ * have a device to test it on.
+ *
+ * TODO(recording-format): guardar formato/extensión por sesión en el
+ * backend para que el export no tenga que recurrir a sniff de firma
+ * binaria. Sin esa columna, sesiones antiguas (.m4a) se distinguen de
+ * sesiones nuevas (.aac) por los bytes del concat.
+ */
+// `as` cast is deliberate: the HIGH_QUALITY preset's TypeScript type in
+// expo-av marks `ios`/`web` as optional while `RecordingOptions` requires
+// them, which the project's `exactOptionalPropertyTypes: true` rejects
+// on a plain spread. The runtime object is complete (preset ships with
+// both branches); this is a pure type-level concession.
+const RECORDING_OPTIONS = {
+  ...Audio.RecordingOptionsPresets.HIGH_QUALITY,
+  android: {
+    extension: '.aac',
+    outputFormat: Audio.AndroidOutputFormat.AAC_ADTS,
+    audioEncoder: Audio.AndroidAudioEncoder.AAC,
+    sampleRate: 44100,
+    numberOfChannels: 1,
+    bitRate: 64000,
+  },
+} as Audio.RecordingOptions;
 
 /**
  * Decode a base64 slice into its raw bytes.
@@ -168,6 +237,1008 @@ interface PendingState {
    * metadata-only flow (remote_reference stays null on /chunks).
    */
   uri?: string;
+}
+
+// =============================================================================
+// CHUNKS-DURING-RECORDING (concurrent upload pipeline)
+// -----------------------------------------------------------------------------
+// Goal: emit and upload each chunk while the recorder is still writing,
+// instead of doing all the slicing+uploading after STOP. The recorder must
+// never block on the network; the upload worker runs as a fire-and-forget
+// JS-event-loop task. Ports the existing PENDING_RETRY_KEY shape from a
+// single-session object to an array so multiple sessions can be drained at
+// app open. Backend, endpoints, and the export pipeline are untouched.
+//
+// Files referenced by this block:
+//   - mobile/src/api/destinations.ts → uploadChunkBytes, base64ToBytes
+//   - mobile/src/api/client.ts       → ApiError
+//   - This file's own postChunk / completeSession / readRecordingBase64 /
+//     base64SliceAt / sliceToBytes / bytesDigestToHex helpers.
+//
+// TODO(chunk-encryption): cipher each base64Slice client-side (Argon2 KDF +
+//   AES-GCM, key sealed in keystore). Out of scope for this brick — chunks
+//   are uploaded in clear today, same as before.
+// TODO(queue-sqlite): migrate this AsyncStorage-backed array to expo-sqlite
+//   before Play Store. AsyncStorage is single-key JSON and ~6 MB on Android;
+//   long sessions with persisted base64Slices will hit it. Each chunk write
+//   today is O(N) re-serialization of the whole queue. Mandatory cleanup.
+// =============================================================================
+
+type ChunkStatus = 'pending' | 'uploading' | 'uploaded' | 'failed';
+
+interface QueueChunk {
+  chunk_index: number;
+  hash: string;
+  size: number;
+  status: ChunkStatus;
+  attempts: number;
+  /**
+   * Base64 of the decoded chunk bytes. Populated when the chunker emits
+   * the slice; PRUNED (set to undefined) on 200 OK to keep AsyncStorage
+   * small. Pre-Phase-2 entries (legacy migration) are inserted with
+   * `base64Slice` undefined and rehydrated on the fly by reading the
+   * full recording from `uri` and slicing with `base64SliceAt`.
+   *
+   * Declared as `string | undefined` (rather than `?: string`) so that
+   * Object.assign'd patches can explicitly null this back out under
+   * exactOptionalPropertyTypes — the poda step needs to clear the
+   * field, not just omit it.
+   */
+  base64Slice?: string | undefined;
+  /** Set when the upload to Drive returned a file_id we should use as remote_reference on /chunks. */
+  remote_reference?: string | null | undefined;
+  last_error?: { status: number; code?: string; message: string } | undefined;
+}
+
+interface PendingQueueEntry {
+  session_id: string;
+  /**
+   * Absolute filesystem URI of the recording. During recording this
+   * still points at the cacheDirectory copy; after STOP it is updated
+   * to the documentDirectory copy. Used by the rehydration path for
+   * legacy chunks lacking a persisted `base64Slice`.
+   */
+  uri: string;
+  /** false while recorder is active; true after STOP + final pass have completed. */
+  recording_closed: boolean;
+  /** Server-side completion state. Drives whether to call POST /sessions/:id/complete. */
+  session_completed: boolean;
+  complete_attempts: number;
+  /** Bookkeeping for the chunker so it can resume on app re-open mid-recording. */
+  emitted_base64_length: number;
+  next_chunk_index: number;
+  chunks: QueueChunk[];
+}
+
+const CHUNK_TICK_MS = 1500;
+/** Cap retries for completeSession so a permanently-broken session does not hold a queue entry forever. */
+const MAX_COMPLETE_ATTEMPTS = 5;
+
+// ----- queue state (module-scope so it survives re-renders) -----
+
+let writeChain: Promise<void> = Promise.resolve();
+
+async function queueMutate<T>(
+  fn: (queue: PendingQueueEntry[]) => T | Promise<T>,
+): Promise<T> {
+  let result!: T;
+  writeChain = writeChain
+    .catch(() => undefined)
+    .then(async () => {
+      const raw = await AsyncStorage.getItem(PENDING_RETRY_KEY);
+      let queue: PendingQueueEntry[];
+      if (!raw) {
+        queue = [];
+      } else {
+        try {
+          const parsed: unknown = JSON.parse(raw);
+          if (Array.isArray(parsed)) {
+            queue = parsed as PendingQueueEntry[];
+          } else {
+            // Legacy single-session shape — migrate inline so callers always
+            // see an array. The deeper migration (filling chunk fields) runs
+            // separately in `migrateLegacyPendingState` so this hot path
+            // stays a one-liner.
+            queue = [parsed as unknown as PendingQueueEntry];
+          }
+        } catch {
+          queue = [];
+        }
+      }
+      result = await fn(queue);
+      await AsyncStorage.setItem(PENDING_RETRY_KEY, JSON.stringify(queue));
+    });
+  await writeChain;
+  return result;
+}
+
+async function queueRead(): Promise<PendingQueueEntry[]> {
+  return queueMutate(q => q.map(entry => ({ ...entry })));
+}
+
+async function queueAppendNewSession(
+  entry: PendingQueueEntry,
+): Promise<void> {
+  await queueMutate(q => {
+    const existing = q.findIndex(e => e.session_id === entry.session_id);
+    if (existing >= 0) q[existing] = entry;
+    else q.push(entry);
+  });
+}
+
+async function queueAppendChunk(
+  sessionId: string,
+  chunk: QueueChunk,
+  emittedBase64Length: number,
+  nextChunkIndex: number,
+): Promise<void> {
+  await queueMutate(q => {
+    const e = q.find(x => x.session_id === sessionId);
+    if (!e) return;
+    // Idempotent guard: if a chunk with this index already exists in the
+    // queue, do NOT push a second one. This is the last-line defence
+    // against a race window we just patched (in-flight regular tick + final
+    // pass both emitting the same chunk_index). Whichever queueAppendChunk
+    // commits first wins; the loser bails here, leaving emitted/next
+    // unchanged so the offsets stay consistent with the winning chunk.
+    if (e.chunks.some(c => c.chunk_index === chunk.chunk_index)) {
+      console.log('GC_QUEUE chunk dedup skipped', {
+        sessionId,
+        chunk_index: chunk.chunk_index,
+        hash_short: chunk.hash.substring(0, 12),
+      });
+      return;
+    }
+    e.chunks.push(chunk);
+    e.emitted_base64_length = emittedBase64Length;
+    e.next_chunk_index = nextChunkIndex;
+  });
+}
+
+async function queueUpdateChunk(
+  sessionId: string,
+  chunk_index: number,
+  patch: Partial<QueueChunk>,
+): Promise<void> {
+  await queueMutate(q => {
+    const e = q.find(x => x.session_id === sessionId);
+    if (!e) return;
+    const c = e.chunks.find(x => x.chunk_index === chunk_index);
+    if (!c) return;
+    Object.assign(c, patch);
+    // Defensive: when a chunk is marked uploaded, collapse any residual
+    // duplicates of the same chunk_index. Both queueAppendChunk's
+    // idempotent guard and the recovery normalization should already
+    // prevent duplicates; this is the last guard for any straggler from
+    // legacy contaminated state. We keep the chunk we just patched and
+    // drop the others (regardless of their hash — the patched one is the
+    // authoritative record once it has reached `uploaded`).
+    if (patch.status === 'uploaded') {
+      const collisions = e.chunks.filter(
+        x => x.chunk_index === chunk_index && x !== c,
+      );
+      if (collisions.length > 0) {
+        const divergentHash = collisions.some(x => x.hash !== c.hash);
+        console.log('GC_QUEUE chunk update dedup', {
+          sessionId,
+          chunk_index,
+          kept_hash_short: c.hash.substring(0, 12),
+          dropped: collisions.length,
+          hash_divergent: divergentHash,
+        });
+        e.chunks = e.chunks.filter(
+          x => x === c || x.chunk_index !== chunk_index,
+        );
+      }
+    }
+  });
+}
+
+async function queueMarkRecordingClosed(
+  sessionId: string,
+  finalUri: string,
+  emittedBase64Length: number,
+  nextChunkIndex: number,
+): Promise<void> {
+  await queueMutate(q => {
+    const e = q.find(x => x.session_id === sessionId);
+    if (!e) return;
+    e.recording_closed = true;
+    e.uri = finalUri;
+    e.emitted_base64_length = emittedBase64Length;
+    e.next_chunk_index = nextChunkIndex;
+  });
+}
+
+async function queueMarkSessionCompleted(sessionId: string): Promise<void> {
+  await queueMutate(q => {
+    const e = q.find(x => x.session_id === sessionId);
+    if (!e) return;
+    e.session_completed = true;
+  });
+}
+
+async function queueBumpCompleteAttempts(sessionId: string): Promise<number> {
+  return queueMutate(q => {
+    const e = q.find(x => x.session_id === sessionId);
+    if (!e) return 0;
+    e.complete_attempts += 1;
+    return e.complete_attempts;
+  });
+}
+
+async function queueDropEntry(sessionId: string): Promise<void> {
+  await queueMutate(q => {
+    const i = q.findIndex(x => x.session_id === sessionId);
+    if (i >= 0) q.splice(i, 1);
+  });
+}
+
+// ----- legacy migration (one-shot at app open) -----
+
+/**
+ * Convert any pre-array `PENDING_RETRY_KEY` value (single PendingState
+ * object) into the new array shape. Idempotent: if already an array,
+ * does nothing. Legacy chunks have no `base64Slice` — they are inserted
+ * with `recording_closed: true` (legacy state was always written after
+ * STOP) and the worker rehydrates the slice from `uri` on first need.
+ */
+async function migrateLegacyPendingState(): Promise<void> {
+  await queueMutate(q => {
+    // queueMutate already lifted a legacy object into [obj]. Detect that
+    // case by the presence of the legacy `remaining` field on entries.
+    for (let i = 0; i < q.length; i++) {
+      const e = q[i] as unknown as PendingState & Partial<PendingQueueEntry>;
+      if (Array.isArray(e.chunks)) continue; // already migrated
+      const remaining = (e as { remaining?: RealChunk[] }).remaining ?? [];
+      const sessionId = e.session_id;
+      const uri = e.uri ?? '';
+      const migrated: PendingQueueEntry = {
+        session_id: sessionId,
+        uri,
+        recording_closed: true,
+        session_completed: false,
+        complete_attempts: 0,
+        emitted_base64_length: 0,
+        next_chunk_index:
+          remaining.length > 0
+            ? Math.max(...remaining.map(c => c.chunk_index)) + 1
+            : 0,
+        chunks: remaining.map(c => ({
+          chunk_index: c.chunk_index,
+          hash: c.hash,
+          size: c.size,
+          status: 'pending' as const,
+          attempts: 0,
+        })),
+      };
+      q[i] = migrated;
+    }
+  });
+}
+
+interface NormalizationReport {
+  /** Multiple queue entries sharing one session_id were merged into one. */
+  entries_collapsed: number;
+  /** Exact (same chunk_index AND same hash) duplicate chunks dropped. */
+  exact_duplicates_dropped: number;
+  /** Sessions where same chunk_index appeared with different hashes. */
+  sessions_marked_corrupt: number;
+  /** Total chunks across corrupt sessions that were forced to status=failed. */
+  chunks_marked_failed: number;
+}
+
+/**
+ * One-shot post-migration pass that normalises the persisted queue:
+ *
+ *   1. Multiple entries with the same session_id → merged into the first
+ *      (chunks concatenated, then deduped in step 2; offsets / closed /
+ *      completed flags merged with max/OR).
+ *   2. Within each entry, chunks with the same chunk_index AND the same
+ *      hash → keep ONE (prefer status='uploaded', else first); drop the
+ *      rest.
+ *   3. Within each entry, chunks with the same chunk_index but DIFFERENT
+ *      hash → the recorded bytes diverged. We cannot guess which is
+ *      right, so we mark EVERY chunk in that entry as `failed` with code
+ *      `CORRUPT_HASH_DIVERGENCE` and let the worker finalise the session
+ *      via the existing all-settled path. Nothing is uploaded blindly.
+ *
+ * Idempotent: running it again on a clean queue is a no-op.
+ *
+ * The report is logged once at boot so the operator can see whether the
+ * queue arrived in a healthy state or was patched up.
+ */
+async function normalizeQueueOnRecovery(): Promise<NormalizationReport> {
+  return queueMutate(q => {
+    const report: NormalizationReport = {
+      entries_collapsed: 0,
+      exact_duplicates_dropped: 0,
+      sessions_marked_corrupt: 0,
+      chunks_marked_failed: 0,
+    };
+
+    // Step 1: collapse duplicate session_id entries.
+    const firstIdxBySession = new Map<string, number>();
+    for (let i = 0; i < q.length; i++) {
+      const sid = q[i]!.session_id;
+      const firstIdx = firstIdxBySession.get(sid);
+      if (firstIdx === undefined) {
+        firstIdxBySession.set(sid, i);
+        continue;
+      }
+      const target = q[firstIdx]!;
+      const dup = q[i]!;
+      target.chunks.push(...dup.chunks);
+      target.emitted_base64_length = Math.max(
+        target.emitted_base64_length,
+        dup.emitted_base64_length,
+      );
+      target.next_chunk_index = Math.max(
+        target.next_chunk_index,
+        dup.next_chunk_index,
+      );
+      target.recording_closed =
+        target.recording_closed || dup.recording_closed;
+      target.session_completed =
+        target.session_completed || dup.session_completed;
+      target.complete_attempts = Math.max(
+        target.complete_attempts,
+        dup.complete_attempts,
+      );
+      // Mark for removal — splice after the loop to keep indices stable.
+      (q[i] as PendingQueueEntry & { __collapse?: true }).__collapse = true;
+      report.entries_collapsed++;
+    }
+    for (let i = q.length - 1; i >= 0; i--) {
+      if ((q[i] as PendingQueueEntry & { __collapse?: true }).__collapse) {
+        q.splice(i, 1);
+      }
+    }
+
+    // Step 2 + 3: per-entry chunk dedup / corruption check.
+    for (const entry of q) {
+      const groups = new Map<number, QueueChunk[]>();
+      for (const c of entry.chunks) {
+        const arr = groups.get(c.chunk_index) ?? [];
+        arr.push(c);
+        groups.set(c.chunk_index, arr);
+      }
+
+      // Detect hash divergence at any chunk_index → corrupt the whole entry.
+      let entryCorrupt = false;
+      for (const group of groups.values()) {
+        if (group.length < 2) continue;
+        const hashes = new Set(group.map(c => c.hash));
+        if (hashes.size > 1) {
+          entryCorrupt = true;
+          break;
+        }
+      }
+
+      if (entryCorrupt) {
+        // Mark every chunk failed with CORRUPT_HASH_DIVERGENCE. The
+        // worker's all-settled finaliser will then complete the session
+        // (with failed chunks) via the existing path. We do NOT delete
+        // the entry — chunks already uploaded remain server-side.
+        const failedChunks: QueueChunk[] = [];
+        for (const group of groups.values()) {
+          // Within a corrupt entry, still collapse exact-hash duplicates
+          // so we don't double-count failed chunks. Keep the canonical
+          // (first) hash per group; mark it failed.
+          const seenHashes = new Set<string>();
+          for (const c of group) {
+            if (seenHashes.has(c.hash)) continue;
+            seenHashes.add(c.hash);
+            failedChunks.push({
+              ...c,
+              status: 'failed',
+              base64Slice: undefined,
+              last_error: {
+                status: 0,
+                code: 'CORRUPT_HASH_DIVERGENCE',
+                message:
+                  `chunk_index ${c.chunk_index} appeared with multiple hashes ` +
+                  `in persisted queue; entire session marked corrupt`,
+              },
+            });
+          }
+        }
+        failedChunks.sort((a, b) => a.chunk_index - b.chunk_index);
+        const droppedNow =
+          entry.chunks.length - failedChunks.length;
+        if (droppedNow > 0) report.exact_duplicates_dropped += droppedNow;
+        entry.chunks = failedChunks;
+        report.sessions_marked_corrupt++;
+        report.chunks_marked_failed += failedChunks.length;
+        continue;
+      }
+
+      // No divergence — just dedup exact duplicates per chunk_index.
+      let entryChanged = false;
+      const cleaned: QueueChunk[] = [];
+      for (const group of groups.values()) {
+        if (group.length === 1) {
+          cleaned.push(group[0]!);
+          continue;
+        }
+        // Same chunk_index, same hash (already established above).
+        // Prefer an 'uploaded' chunk so we keep the remote_reference;
+        // otherwise the first occurrence wins.
+        const kept = group.find(c => c.status === 'uploaded') ?? group[0]!;
+        cleaned.push(kept);
+        report.exact_duplicates_dropped += group.length - 1;
+        entryChanged = true;
+      }
+      if (entryChanged) {
+        cleaned.sort((a, b) => a.chunk_index - b.chunk_index);
+        entry.chunks = cleaned;
+      }
+    }
+
+    return report;
+  });
+}
+
+/**
+ * DEV-only helper: wipes Guardian Cloud's persisted queue + last-session
+ * pointer from AsyncStorage. Auth tokens (sb-*), Drive connection state
+ * and any other unrelated keys are NOT touched.
+ *
+ * Exposed via the Settings screen "DEV — limpiar cola" button. Also
+ * attached to globalThis for one-off invocation from the React Native
+ * debugger console:  `await clearGuardianQueueDev()`.
+ *
+ * Intentionally module-level (not behind __DEV__) so a release-mode build
+ * can still surface it if we ever ship a recovery tool. The Settings UI
+ * gate is what enforces "DEV-only" today.
+ */
+export async function clearGuardianQueueDev(): Promise<{
+  removed: string[];
+}> {
+  const keys = [PENDING_RETRY_KEY, LAST_SESSION_ID_KEY];
+  const removed: string[] = [];
+  for (const k of keys) {
+    try {
+      await AsyncStorage.removeItem(k);
+      removed.push(k);
+    } catch (err) {
+      console.log('GC_QUEUE clearGuardianQueueDev failed', { key: k, err });
+    }
+  }
+  // Reset module-level rehydration cache too — otherwise a stale base64
+  // copy could outlive the queue wipe.
+  rehydrationCache.clear();
+  console.log('GC_QUEUE clearGuardianQueueDev done', { removed });
+  return { removed };
+}
+
+/**
+ * Pre-recovery reap. The worker's `tryFinalizeReadySessions` already
+ * drops any entry whose `session_completed` flag is true, but it only
+ * runs once the drain loop spins up. That timing makes the recovery
+ * banner show "entries=1 pending_chunks=0" for a fully-finished session
+ * just because the worker had not had a chance to reap it yet.
+ *
+ * This helper runs the same drop synchronously at boot, BEFORE the
+ * `recovery start` log, so the banner only mentions entries with real
+ * outstanding work. Entries that still need a network call (uploads
+ * pending OR `session_completed=false`) are left untouched — the worker
+ * is still the sole owner of those.
+ */
+async function reapAlreadyDoneEntries(): Promise<{ reaped: number }> {
+  const queue = await queueRead();
+  let reaped = 0;
+  for (const entry of queue) {
+    const pending = entry.chunks.filter(c => c.status === 'pending').length;
+    // Strictly: server-side session is done AND nothing left to upload.
+    // Both conditions are required — a session_completed=true with a
+    // straggling pending chunk would be an invariant violation we'd
+    // rather see in logs than silently sweep away.
+    if (entry.session_completed && pending === 0) {
+      await reapEntry(entry.session_id, entry.uri);
+      reaped++;
+    }
+  }
+  return { reaped };
+}
+
+// ----- error classification (HC: never retry 4xx forever) -----
+
+function classifyError(err: unknown): 'transient' | 'permanent' {
+  if (err instanceof ApiError) {
+    // Network / timeout / abort
+    if (err.status === 0 || err.code === 'NETWORK_ERROR') return 'transient';
+    // Auth refresh covers 401 — getFreshAccessToken will refresh inline
+    if (err.status === 401 || err.code === 'NO_TOKEN') return 'transient';
+    // Rate limit / overload
+    if (err.status === 408 || err.status === 429) return 'transient';
+    // 5xx server
+    if (err.status >= 500 && err.status < 600) return 'transient';
+    // 4xx client (incl. HASH_MISMATCH, 400, 403, 404, 409, 422) — permanent
+    if (err.status >= 400 && err.status < 500) return 'permanent';
+    return 'transient';
+  }
+  // Non-ApiError throws (postChunk uses raw fetch and throws plain Error
+  // on non-2xx). Treat HTTP-status-bearing messages from postChunk as 4xx
+  // permanent if we can parse them; otherwise default to transient.
+  if (err instanceof Error) {
+    const m = err.message.match(/HTTP (\d{3})/);
+    if (m) {
+      const status = Number(m[1]);
+      if (status === 401 || status === 408 || status === 429) return 'transient';
+      if (status >= 500 && status < 600) return 'transient';
+      if (status >= 400 && status < 500) return 'permanent';
+    }
+  }
+  return 'transient';
+}
+
+function shapeError(
+  err: unknown,
+): { status: number; code?: string; message: string } {
+  if (err instanceof ApiError) {
+    const out: { status: number; code?: string; message: string } = {
+      status: err.status,
+      message: err.message,
+    };
+    if (err.code) out.code = err.code;
+    return out;
+  }
+  if (err instanceof Error) {
+    const m = err.message.match(/HTTP (\d{3})/);
+    return {
+      status: m ? Number(m[1]) : 0,
+      message: err.message,
+    };
+  }
+  return { status: 0, message: String(err) };
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+// ----- upload worker (single-flight, multi-session) -----
+
+let isDraining = false;
+/**
+ * Cache of base64 contents per `uri` for the rehydration path. Keyed by
+ * uri; cleared when the corresponding queue entry is reaped. Avoids
+ * re-reading a multi-MB file once per chunk during legacy recovery.
+ */
+const rehydrationCache = new Map<string, string>();
+
+async function rehydrateChunkSlice(
+  entry: PendingQueueEntry,
+  chunk: QueueChunk,
+): Promise<string | null> {
+  if (chunk.base64Slice) return chunk.base64Slice;
+  if (!entry.uri) return null;
+  let base64 = rehydrationCache.get(entry.uri);
+  if (base64 === undefined) {
+    try {
+      base64 = await readRecordingBase64(entry.uri);
+      rehydrationCache.set(entry.uri, base64);
+    } catch (err) {
+      console.log('GC_QUEUE rehydrate read failed', { uri: entry.uri, err });
+      return null;
+    }
+  }
+  return base64SliceAt(base64, chunk.chunk_index);
+}
+
+interface NextPick {
+  sessionId: string;
+  chunk: QueueChunk;
+  rehydratedSlice: string;
+}
+
+async function pickNext(queue: PendingQueueEntry[]): Promise<NextPick | null> {
+  for (const entry of queue) {
+    const candidate = entry.chunks
+      .filter(c => c.status === 'pending')
+      .sort((a, b) => a.chunk_index - b.chunk_index)[0];
+    if (!candidate) continue;
+    const slice =
+      candidate.base64Slice ?? (await rehydrateChunkSlice(entry, candidate));
+    if (!slice) {
+      // Cannot rehydrate (file gone). Mark failed permanent so we don't
+      // loop forever on the same chunk.
+      await queueUpdateChunk(entry.session_id, candidate.chunk_index, {
+        status: 'failed',
+        last_error: {
+          status: 0,
+          code: 'REHYDRATE_FAILED',
+          message: 'Recording file missing — cannot recover chunk bytes',
+        },
+      });
+      continue;
+    }
+    return {
+      sessionId: entry.session_id,
+      chunk: candidate,
+      rehydratedSlice: slice,
+    };
+  }
+  return null;
+}
+
+async function uploadDrainLoop(): Promise<void> {
+  if (DEBUG_QUEUE) console.log('GC_DEBUG drain called', { isDraining });
+  if (isDraining) {
+    if (DEBUG_QUEUE) console.log('GC_DEBUG drain skipped — isDraining=true');
+    return;
+  }
+  isDraining = true;
+  if (DEBUG_QUEUE) console.log('GC_DEBUG drain entered loop');
+  try {
+    while (true) {
+      const queue = await queueRead();
+      const pick = await pickNext(queue);
+      if (!pick) {
+        // Nothing pending. Try to finalize any closed session whose chunks
+        // are all done, then check if any session is still recording.
+        const finalized = await tryFinalizeReadySessions();
+        const remaining = await queueRead();
+        const anyOpen = remaining.some(e => !e.recording_closed);
+        const anyResidual = remaining.length > 0 && !finalized;
+        if (!anyOpen && !anyResidual) {
+          if (DEBUG_QUEUE) console.log('GC_DEBUG drain exit — nothing open, nothing residual');
+          return;
+        }
+        if (DEBUG_QUEUE) {
+          console.log('GC_DEBUG drain sleeping — queue empty but session(s) open', {
+            anyOpen,
+            anyResidual,
+            queueSize: remaining.length,
+            openSessions: remaining
+              .filter(e => !e.recording_closed)
+              .map(e => ({
+                sid: e.session_id,
+                chunks: e.chunks.length,
+                statuses: e.chunks.map(c => c.status),
+              })),
+          });
+        }
+        await sleep(500);
+        continue;
+      }
+
+      const { sessionId, chunk, rehydratedSlice } = pick;
+      if (DEBUG_QUEUE) {
+        console.log('GC_DEBUG drain pending found', {
+          sessionId,
+          chunk_index: chunk.chunk_index,
+          slice_len: rehydratedSlice.length,
+        });
+      }
+      await queueUpdateChunk(sessionId, chunk.chunk_index, { status: 'uploading' });
+      console.log('GC_QUEUE chunk uploading', {
+        sessionId,
+        chunk_index: chunk.chunk_index,
+      });
+      try {
+        if (DEBUG_QUEUE) {
+          console.log('GC_DEBUG before uploadChunkBytes', {
+            sessionId,
+            chunk_index: chunk.chunk_index,
+          });
+        }
+        const drive = await uploadChunkBytes(
+          sessionId,
+          chunk.chunk_index,
+          chunk.hash,
+          rehydratedSlice,
+        );
+        if (DEBUG_QUEUE) {
+          console.log('GC_DEBUG after uploadChunkBytes', {
+            sessionId,
+            chunk_index: chunk.chunk_index,
+            remote_reference: drive.remote_reference,
+          });
+        }
+        const token = await getFreshAccessToken();
+        if (!token) throw new ApiError(401, 'NO_TOKEN', 'No access token in store', null);
+        await postChunk(
+          token,
+          sessionId,
+          { chunk_index: chunk.chunk_index, hash: chunk.hash, size: chunk.size },
+          'uploaded',
+          drive.remote_reference,
+        );
+        await queueUpdateChunk(sessionId, chunk.chunk_index, {
+          status: 'uploaded',
+          base64Slice: undefined,           // poda
+          remote_reference: drive.remote_reference,
+          last_error: undefined,
+        });
+        console.log('GC_QUEUE chunk uploaded', {
+          sessionId,
+          chunk_index: chunk.chunk_index,
+          remote_reference: drive.remote_reference,
+        });
+      } catch (err) {
+        const decision = classifyError(err);
+        if (decision === 'permanent') {
+          await queueUpdateChunk(sessionId, chunk.chunk_index, {
+            status: 'failed',
+            base64Slice: undefined,         // poda — no sirve reintentar
+            last_error: shapeError(err),
+          });
+          console.log('GC_QUEUE chunk failed (permanent)', {
+            sessionId,
+            chunk_index: chunk.chunk_index,
+            err: shapeError(err),
+          });
+        } else {
+          const attempts = chunk.attempts + 1;
+          await queueUpdateChunk(sessionId, chunk.chunk_index, {
+            status: 'pending',
+            attempts,
+            last_error: shapeError(err),
+          });
+          const backoff = Math.min(2 ** attempts * 1000, 30_000);
+          console.log('GC_QUEUE chunk transient — backoff', {
+            sessionId,
+            chunk_index: chunk.chunk_index,
+            attempts,
+            backoff,
+          });
+          await sleep(backoff);
+        }
+      }
+    }
+  } finally {
+    isDraining = false;
+  }
+}
+
+/**
+ * For each entry whose recording is closed and whose chunks are all
+ * resolved (uploaded or failed), call POST /sessions/:id/complete and
+ * then drop the entry. Returns true if any entry was finalized in this
+ * pass (used to decide whether the drain loop should keep spinning).
+ */
+async function tryFinalizeReadySessions(): Promise<boolean> {
+  const queue = await queueRead();
+  let anyFinalized = false;
+  for (const entry of queue) {
+    if (!entry.recording_closed) continue;
+    const allSettled = entry.chunks.every(
+      c => c.status === 'uploaded' || c.status === 'failed',
+    );
+    if (!allSettled) continue;
+    if (entry.session_completed) {
+      await reapEntry(entry.session_id, entry.uri);
+      anyFinalized = true;
+      continue;
+    }
+    if (entry.complete_attempts >= MAX_COMPLETE_ATTEMPTS) {
+      // Give up on completion. Chunks are server-safe; the session row
+      // is left as `active` for manual reconciliation.
+      console.log('GC_QUEUE session complete give-up', {
+        sessionId: entry.session_id,
+        attempts: entry.complete_attempts,
+      });
+      await reapEntry(entry.session_id, entry.uri);
+      anyFinalized = true;
+      continue;
+    }
+    try {
+      const token = await getFreshAccessToken();
+      if (!token) throw new ApiError(401, 'NO_TOKEN', 'No access token in store', null);
+      await completeSession(token, entry.session_id);
+      await queueMarkSessionCompleted(entry.session_id);
+      await reapEntry(entry.session_id, entry.uri);
+      anyFinalized = true;
+      console.log('GC_QUEUE session completed', { sessionId: entry.session_id });
+    } catch (err) {
+      const attempts = await queueBumpCompleteAttempts(entry.session_id);
+      console.log('GC_QUEUE session complete failed', {
+        sessionId: entry.session_id,
+        attempts,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  return anyFinalized;
+}
+
+async function reapEntry(sessionId: string, uri: string): Promise<void> {
+  await queueDropEntry(sessionId);
+  rehydrationCache.delete(uri);
+  await deleteRecordingBestEffort(uri);
+}
+
+// ----- chunker (incremental slicer driven by setTimeout) -----
+
+interface ChunkerState {
+  sessionId: string;
+  /** Filesystem URI the chunker reads on each tick. Cache during recording, doc dir after move. */
+  fileUri: string;
+  active: boolean;
+  tickHandle: ReturnType<typeof setTimeout> | null;
+  /**
+   * Promise of the currently-executing tick body, if any. Awaited by
+   * stopChunkerForSession before the final pass runs so a tick that
+   * fired just before STOP cannot race the final pass and emit the same
+   * chunk_index from a stale queue snapshot.
+   */
+  inflight: Promise<void> | null;
+  /**
+   * True from the moment stopChunkerForSession is invoked until it
+   * returns. Belt-and-suspenders alongside `active=false`: a setTimeout
+   * callback that won the race against clearTimeout still early-returns
+   * if it sees finalizing=true.
+   */
+  finalizing: boolean;
+}
+
+const chunkerStates = new Map<string, ChunkerState>();
+
+function startChunkerForSession(sessionId: string, cacheUri: string): void {
+  const state: ChunkerState = {
+    sessionId,
+    fileUri: cacheUri,
+    active: true,
+    tickHandle: null,
+    inflight: null,
+    finalizing: false,
+  };
+  chunkerStates.set(sessionId, state);
+  scheduleNextChunkerTick(state);
+}
+
+function scheduleNextChunkerTick(state: ChunkerState): void {
+  state.tickHandle = setTimeout(() => {
+    // Re-check both flags: state may have flipped between the setTimeout
+    // arming and now. `finalizing` is the strict gate — if STOP started
+    // between schedule and fire, we must not enter emitChunk.
+    if (!state.active || state.finalizing) return;
+    const body = (async () => {
+      try {
+        await runChunkerTick(state.sessionId, state.fileUri, /*finalPass*/ false);
+      } catch (err) {
+        // HC1: a chunker error MUST NEVER stop the recorder. Swallow and
+        // reschedule. The recorder is a separate native object — this code
+        // path only consumes the file it writes.
+        console.log('GC_QUEUE chunker tick error', err);
+      } finally {
+        // Clear the inflight handle BEFORE rescheduling so the next tick
+        // starts with a clean slate. stopChunkerForSession may be awaiting
+        // this promise; once it resolves, finalizing flips and the if
+        // below blocks the next schedule.
+        state.inflight = null;
+        if (state.active && !state.finalizing) scheduleNextChunkerTick(state);
+      }
+    })();
+    state.inflight = body;
+  }, CHUNK_TICK_MS);
+}
+
+/**
+ * Cancels the running chunker for a session and runs ONE final pass on
+ * `finalUri` (which after STOP is the documentDirectory copy, not the
+ * cache uri). Per the user's correction, we read explicitly from
+ * `finalUri` because `recording.getURI()` after stopAndUnload+move does
+ * not necessarily point at the live file.
+ */
+async function stopChunkerForSession(
+  sessionId: string,
+  finalUri: string,
+): Promise<void> {
+  const state = chunkerStates.get(sessionId);
+  if (state) {
+    // Order is intentional and must not be reordered:
+    //   1. finalizing=true   — blocks any setTimeout body that fires next.
+    //   2. active=false      — also blocks the same body via the older guard.
+    //   3. clearTimeout      — cancels any pending (not-yet-fired) timer.
+    //   4. await inflight    — wait for a body that already started.
+    //   5. fileUri = finalUri — only safe to swap after the running tick is
+    //                           done (it captured the old uri at call time).
+    // After this block, no regular tick body can run concurrently with
+    // the final pass below — so the queue read inside the final pass is
+    // guaranteed fresh and the chunk_index it emits cannot collide.
+    state.finalizing = true;
+    state.active = false;
+    if (state.tickHandle) clearTimeout(state.tickHandle);
+    if (state.inflight) {
+      try {
+        await state.inflight;
+      } catch {
+        // Errors inside the tick are already logged by its own try/catch.
+      }
+    }
+    state.fileUri = finalUri;
+  }
+  try {
+    await runChunkerTick(sessionId, finalUri, /*finalPass*/ true);
+  } catch (err) {
+    console.log('GC_QUEUE chunker final pass error', err);
+  } finally {
+    chunkerStates.delete(sessionId);
+  }
+}
+
+async function runChunkerTick(
+  sessionId: string,
+  fileUri: string,
+  finalPass: boolean,
+): Promise<void> {
+  const base64 = await FileSystem.readAsStringAsync(fileUri, {
+    encoding: FileSystem.EncodingType.Base64,
+  });
+
+  // Read the entry to know how far we already emitted. The chunker's
+  // local refs would be faster but persistence is the source of truth
+  // (survives app kill mid-recording).
+  const queue = await queueRead();
+  const entry = queue.find(e => e.session_id === sessionId);
+  if (!entry) return;
+
+  let emitted = entry.emitted_base64_length;
+  let nextIndex = entry.next_chunk_index;
+
+  while (base64.length - emitted >= CHUNK_SIZE_BASE64) {
+    const slice = base64.substring(emitted, emitted + CHUNK_SIZE_BASE64);
+    await emitChunk(sessionId, slice, nextIndex, emitted + CHUNK_SIZE_BASE64);
+    emitted += CHUNK_SIZE_BASE64;
+    nextIndex += 1;
+  }
+
+  if (finalPass && emitted < base64.length) {
+    const tail = base64.substring(emitted);
+    await emitChunk(sessionId, tail, nextIndex, base64.length);
+    emitted = base64.length;
+    nextIndex += 1;
+  }
+}
+
+async function emitChunk(
+  sessionId: string,
+  base64Slice: string,
+  chunk_index: number,
+  emittedAfter: number,
+): Promise<void> {
+  const bytes = sliceToBytes(base64Slice);
+  const hash = bytesDigestToHex(
+    await Crypto.digest(Crypto.CryptoDigestAlgorithm.SHA256, bytes),
+  );
+  const chunk: QueueChunk = {
+    chunk_index,
+    hash,
+    size: bytes.length,
+    status: 'pending',
+    attempts: 0,
+    base64Slice,
+  };
+  await queueAppendChunk(sessionId, chunk, emittedAfter, chunk_index + 1);
+  if (DEBUG_QUEUE) {
+    console.log('GC_DEBUG queueAppendChunk saved', {
+      sessionId,
+      chunk_index,
+      status: chunk.status,
+    });
+  }
+  console.log('GC_QUEUE chunk emitted', {
+    sessionId,
+    chunk_index,
+    size: bytes.length,
+    hash_short: hash.substring(0, 12),
+  });
+  // Wake the worker (single-flight; no-op if already draining).
+  // The .catch keeps unhandled rejections from being silently swallowed
+  // — that pattern was exactly the failure mode we just debugged. Log is
+  // gated by DEBUG_QUEUE; the catch itself runs unconditionally.
+  uploadDrainLoop().catch(err => {
+    if (DEBUG_QUEUE) {
+      console.log('GC_DEBUG drain rejected (from emit)', {
+        sessionId,
+        chunk_index,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+  });
 }
 
 async function deriveChunksFromFile(uri: string): Promise<RealChunk[]> {
@@ -364,11 +1435,69 @@ async function completeSession(
   return body;
 }
 
+/**
+ * POST /sessions — create a new active session and return its id.
+ *
+ * Called at GRABAR time (not at PARAR like the legacy flow) so the
+ * concurrent chunker can start emitting chunks against a known
+ * session_id from the very first tick.
+ *
+ * If the recorder fails to start AFTER this returns, the session row
+ * is orphaned in `active`; the worker's completeSession path will
+ * eventually reap it (chunks list is empty → all-settled → complete).
+ */
+async function createSessionRequest(token: string): Promise<string> {
+  const sessionBody = JSON.stringify({
+    user_id: 'test_user',
+    mode: 'audio',
+    destination_type: 'drive',
+  });
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 5000);
+  let res: Response;
+  try {
+    res = await fetch(`${env.apiUrl}/sessions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: sessionBody,
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeoutId);
+  }
+  if (!res.ok) {
+    const text = await res.text().catch(() => '<no body>');
+    throw new Error(`POST /sessions HTTP ${res.status} ${text}`);
+  }
+  let data: { session_id?: string };
+  try {
+    data = (await res.json()) as { session_id?: string };
+  } catch (err) {
+    throw new Error(
+      `POST /sessions bad JSON: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  if (!data.session_id) throw new Error('POST /sessions returned no session_id');
+  return data.session_id;
+}
+
 export default function Index() {
-  const [testStatus, setTestStatus] = useState<string>('BOOT');
+  const [testStatus, setTestStatus] = useState<string | null>(null);
   const [isRecording, setIsRecording] = useState(false);
   const recordingRef = useRef<Audio.Recording | null>(null);
   const tokenRef = useRef<string | null>(null);
+  /**
+   * Session id of the currently-active recording. Set when GRABAR fires
+   * `createSessionRequest`, cleared when stopRecording finishes (or on
+   * an early start failure). Read by stopRecording to drive the final
+   * chunker pass + queue close. Module-scope `chunkerStates` keys off
+   * the same id, so this is the single client-side identity for the
+   * recording in flight.
+   */
+  const sessionIdRef = useRef<string | null>(null);
   // Synchronous re-entrancy lock for startRecording. Closes the gap
   // between the user tap and setIsRecording(true) during which GRABAR is
   // still visible and re-tappable. Refs are read/written atomically on
@@ -494,291 +1623,87 @@ export default function Index() {
         // 2 recovery. Recovery is the priority when pending state exists.
         refreshDestination();
 
-        const persistedRaw = await AsyncStorage.getItem(PENDING_RETRY_KEY);
+        // Recovery on app open. The legacy single-session PENDING_RETRY_KEY
+        // (PendingState shape) is migrated in place to the new array shape
+        // (PendingQueueEntry[]). Then the worker drains every entry —
+        // legacy entries (no `base64Slice`) rehydrate from `uri` via
+        // `rehydrateChunkSlice`. The worker also calls completeSession
+        // when an entry's recording_closed flag is true and all chunks
+        // have settled (uploaded or failed-permanent), then reaps it.
+        //
+        // Worker is fire-and-forget: we await for UI feedback only when
+        // there is actually pending work; a short await with the worker
+        // running in the background is acceptable so the screen renders
+        // "RECOVERING N chunks" while it drains the obvious cases.
+        try {
+          await migrateLegacyPendingState();
+        } catch (err) {
+          console.log('GC_QUEUE migrate legacy failed', err);
+        }
 
-        if (persistedRaw) {
-          // ---------- PHASE 2: resumed after relaunch ----------
+        // Post-migration normalisation: collapse duplicate session_id
+        // entries, drop exact-duplicate chunks, mark hash-divergent
+        // sessions as corrupt-and-failed. Idempotent — a clean queue
+        // produces an all-zero report. Runs AFTER legacy migration so
+        // both legacy-shape and new-shape entries are normalised.
+        try {
+          const report = await normalizeQueueOnRecovery();
+          const anyChange =
+            report.entries_collapsed > 0 ||
+            report.exact_duplicates_dropped > 0 ||
+            report.sessions_marked_corrupt > 0;
+          if (anyChange) {
+            console.log('GC_QUEUE normalize report', report);
+          }
+        } catch (err) {
+          console.log('GC_QUEUE normalize failed', err);
+        }
+
+        // Reap entries that already finished (session_completed=true,
+        // no pending chunks) so the recovery banner does not advertise
+        // work that does not exist. Worker would do this anyway on its
+        // first drain — running it now keeps boot UX honest.
+        try {
+          const { reaped } = await reapAlreadyDoneEntries();
+          if (reaped > 0) {
+            console.log('GC_QUEUE recovery reaped done entries', { reaped });
+          }
+        } catch (err) {
+          console.log('GC_QUEUE recovery reap failed', err);
+        }
+
+        const queueAtBoot = await queueRead();
+        if (queueAtBoot.length > 0) {
           setIsRecovering(true);
-          const pending = JSON.parse(persistedRaw) as PendingState;
-          setTestStatus('RECOVERED STATE');
-          await new Promise(r => setTimeout(r, 50));
-          console.log('RECOVERED STATE:', pending);
-          console.log('GC_VALIDATION: PHASE2_ENTER', {
-            session_id: pending.session_id,
-            remaining_indexes: pending.remaining.map(c => c.chunk_index),
-            has_uri: Boolean(pending.uri),
+          const pendingChunks = queueAtBoot.reduce(
+            (sum, e) =>
+              sum + e.chunks.filter(c => c.status === 'pending').length,
+            0,
+          );
+          console.log('GC_QUEUE recovery start', {
+            entries: queueAtBoot.length,
+            pending_chunks: pendingChunks,
           });
-
-          // X / N progress mirror for the remaining batch. Total is what
-          // we need to re-send; we don't reconstruct "already uploaded"
-          // from a remote lookup because recovery MUST work offline-first
-          // for the metadata flow. The counter resets on entry so a
-          // second Phase 2 run (rare) doesn't carry over stale numbers.
-          setTotalCount(pending.remaining.length);
-          setUploadedCount(0);
-
-          // If the persisted state carries a `uri` AND the kill switch
-          // is on AND the file still exists, read the base64 once so
-          // every remaining chunk can be re-sliced and re-uploaded to
-          // Drive. Failure to obtain bytes is NOT fatal — recovery
-          // degrades to metadata-only (remote_reference=null on
-          // /chunks), which still tracks the chunk in the DB but loses
-          // the Drive linkage for any chunk that Phase 1 had not
-          // already written to Drive.
-          //
-          // Legacy PENDING_RETRY_KEY entries from pre-Phase-4 builds
-          // have no `uri` field — they fall into the degraded path.
-          let recoveryBase64: string | null = null;
-          let phase2ModeReason = 'kill_switch_off';
-          if (DRIVE_CHUNK_UPLOAD_ENABLED && pending.uri) {
-            try {
-              const fileInfo = await FileSystem.getInfoAsync(pending.uri);
-              if (fileInfo.exists) {
-                recoveryBase64 = await readRecordingBase64(pending.uri);
-                console.log('RECOVERY BASE64 READ OK:', {
-                  length: recoveryBase64.length,
-                });
-                phase2ModeReason = 'uri_present_and_file_exists';
-              } else {
-                console.log(
-                  'RECOVERY BASE64 SKIPPED: file not found at persisted uri — falling back to metadata-only',
-                  { uri: pending.uri },
-                );
-                phase2ModeReason = 'file_missing';
-              }
-            } catch (error) {
-              console.log(
-                'RECOVERY BASE64 SKIPPED: read failed — falling back to metadata-only',
-                error,
-              );
-              recoveryBase64 = null;
-              phase2ModeReason = 'read_failed';
-            }
-          } else if (!DRIVE_CHUNK_UPLOAD_ENABLED) {
-            phase2ModeReason = 'kill_switch_off';
-          } else {
-            phase2ModeReason = 'no_uri_in_pending';
+          if (queueAtBoot[0]?.session_id) {
+            AsyncStorage.setItem(
+              LAST_SESSION_ID_KEY,
+              queueAtBoot[0].session_id,
+            ).catch(() => {});
           }
-          console.log('GC_VALIDATION: PHASE2_MODE', {
-            session_id: pending.session_id,
-            mode: recoveryBase64 !== null ? 'drive-upload' : 'metadata-only',
-            reason: phase2ModeReason,
-          });
-
-          let failed = false;
-          for (const chunk of pending.remaining) {
-            try {
-              // If we have the bytes, re-slice, re-hash (guardrail) and
-              // re-upload to Drive before registering. Hash MUST match
-              // the value already in the pending plan — if it doesn't,
-              // something has corrupted the recording or changed the
-              // slicing rule since Phase 1, and silently proceeding
-              // would let us upload the WRONG bytes under this chunk's
-              // row. Break out of the loop and leave the pending state
-              // intact so the next launch can retry or surface to the
-              // user; do NOT advance.
-              let recoveryRemoteRef: string | null = null;
-              if (recoveryBase64 !== null) {
-                const recoverySlice = base64SliceAt(
-                  recoveryBase64,
-                  chunk.chunk_index,
-                );
-                // Guardrail: re-hash MUST match the chunk.hash stored
-                // in PENDING_RETRY_KEY. Both sides use the unified rule
-                // — sha256 over the DECODED bytes (see sliceToBytes /
-                // deriveChunksFromFile) — so any mismatch here means
-                // the recording on disk has been corrupted or the
-                // slicing rule drifted. Either way, abort and keep
-                // pending state intact for the next launch.
-                const recoveryBytes = sliceToBytes(recoverySlice);
-                const recoveredHash = bytesDigestToHex(
-                  await Crypto.digest(
-                    Crypto.CryptoDigestAlgorithm.SHA256,
-                    recoveryBytes,
-                  ),
-                );
-                if (recoveredHash !== chunk.hash) {
-                  setTestStatus(
-                    `ERROR HASH MISMATCH index=${chunk.chunk_index}`,
-                  );
-                  console.log(
-                    `ERROR HASH MISMATCH index=${chunk.chunk_index}: expected=${chunk.hash} got=${recoveredHash} — aborting Phase 2 with pending state intact`,
-                  );
-                  failed = true;
-                  break;
-                }
-                setTestStatus(
-                  `CHUNK RESUME UPLOAD BYTES index=${chunk.chunk_index}`,
-                );
-                await new Promise(r => setTimeout(r, 50));
-                const upR = await uploadChunkBytes(
-                  pending.session_id,
-                  chunk.chunk_index,
-                  chunk.hash,
-                  recoverySlice,
-                );
-                recoveryRemoteRef = upR.remote_reference;
-                console.log(
-                  `CHUNK RESUME DRIVE OK index=${chunk.chunk_index}:`,
-                  upR,
-                );
-                console.log('GC_VALIDATION: CHUNK_DRIVE_OK', {
-                  phase: 2,
-                  chunk_index: chunk.chunk_index,
-                  hash_short: chunk.hash.substring(0, 12),
-                  remote_reference: recoveryRemoteRef,
-                  dedup: upR.dedup,
-                });
-              }
-
-              const r = await postChunk(
-                token,
-                pending.session_id,
-                chunk,
-                'uploaded',
-                recoveryRemoteRef,
-              );
-              setUploadedCount(u => u + 1);
-              setTestStatus(`CHUNK RESUME index=${chunk.chunk_index}`);
-              await new Promise(r => setTimeout(r, 50));
-              console.log(
-                `CHUNK RESUME index=${chunk.chunk_index}:`,
-                r,
-              );
-              console.log('GC_VALIDATION: CHUNK_POSTED', {
-                phase: 2,
-                chunk_index: chunk.chunk_index,
-                hash_short: chunk.hash.substring(0, 12),
-                remote_reference: recoveryRemoteRef,
-                idempotent_replay:
-                  (r as { idempotent_replay?: boolean } | null)?.idempotent_replay ?? false,
+          setTestStatus(
+            pendingChunks > 0
+              ? `RECOVERING ${pendingChunks} chunks`
+              : 'FINALIZING SESSIONS',
+          );
+          // Fire the worker. It self-terminates when all entries are
+          // either reaped (closed + completed) or are still recording.
+          uploadDrainLoop().catch(err => {
+            if (DEBUG_QUEUE) {
+              console.log('GC_DEBUG drain rejected (from recovery)', {
+                err: err instanceof Error ? err.message : String(err),
               });
-
-              // DEBUG-only idempotency probe, recovery variant. Fire
-              // once for chunk_index=1 only — the chunk that the
-              // failure-injection flow left pending on first launch.
-              // The second POST must come back with
-              // idempotent_replay: true; otherwise recovery would be
-              // able to create duplicate rows under real retries.
-              if (DEBUG_DUPLICATE_SUBMISSION && chunk.chunk_index === 1) {
-                setTestStatus(
-                  `CHUNK DUPLICATE DETECTED index=${chunk.chunk_index}`,
-                );
-                await new Promise(r => setTimeout(r, 50));
-                console.log(
-                  `CHUNK DUPLICATE DETECTED index=${chunk.chunk_index}: resending during recovery`,
-                );
-                try {
-                  // Same pattern as the Phase 1 probe: reuse the
-                  // remote_reference from the first recovery POST so
-                  // we are testing backend metadata idempotency, not
-                  // Drive dedupe. A null recoveryRemoteRef means the
-                  // degraded path was active; the probe still works
-                  // against metadata idempotency regardless.
-                  const dup = (await postChunk(
-                    token,
-                    pending.session_id,
-                    chunk,
-                    'uploaded',
-                    recoveryRemoteRef,
-                  )) as { idempotent_replay?: boolean };
-                  if (dup.idempotent_replay === true) {
-                    setTestStatus(
-                      `CHUNK IDEMPOTENT OK index=${chunk.chunk_index}`,
-                    );
-                    await new Promise(r => setTimeout(r, 50));
-                    console.log(
-                      `CHUNK IDEMPOTENT OK index=${chunk.chunk_index}:`,
-                      dup,
-                    );
-                  } else {
-                    setTestStatus(
-                      `CHUNK IDEMPOTENT UNEXPECTED index=${chunk.chunk_index} replay=${dup.idempotent_replay}`,
-                    );
-                    await new Promise(r => setTimeout(r, 50));
-                    console.log(
-                      `CHUNK IDEMPOTENT UNEXPECTED index=${chunk.chunk_index}:`,
-                      dup,
-                    );
-                  }
-                } catch (error) {
-                  setTestStatus(
-                    `ERROR CHUNK DUPLICATE index=${chunk.chunk_index}`,
-                  );
-                  console.log(
-                    `ERROR CHUNK DUPLICATE index=${chunk.chunk_index}:`,
-                    error,
-                  );
-                }
-              }
-            } catch (error) {
-              setTestStatus(
-                `ERROR CHUNK RESUME index=${chunk.chunk_index}`,
-              );
-              console.log(
-                `ERROR CHUNK RESUME index=${chunk.chunk_index}:`,
-                error,
-              );
-              failed = true;
-              break; // keep pending state; let user reload to try again
             }
-          }
-
-          if (failed) return;
-
-          try {
-            const listed = await getChunks(token, pending.session_id);
-            setTestStatus('CHUNKS FETCHED');
-            await new Promise(r => setTimeout(r, 50));
-            console.log('CHUNKS FETCHED:', listed);
-          } catch (error) {
-            setTestStatus('ERROR CHUNKS FETCH');
-            console.log('ERROR CHUNKS FETCH:', error);
-          }
-
-          // All remaining chunks have been uploaded — transition the
-          // session to `completed`. Wrapped in its own try/catch so a
-          // completion failure does NOT regress the already-working
-          // recovery path: the chunks are safe on the server regardless.
-          try {
-            setTestStatus('SESSION COMPLETE START');
-            await new Promise(r => setTimeout(r, 50));
-            console.log('SESSION COMPLETE START:', pending.session_id);
-            const completed = await completeSession(token, pending.session_id);
-            setTestStatus('SESSION COMPLETE OK');
-            await new Promise(r => setTimeout(r, 50));
-            console.log('SESSION COMPLETE OK:', completed);
-            console.log('GC_VALIDATION: SESSION_COMPLETED', {
-              mode: 'phase2',
-              session_id: pending.session_id,
-            });
-            // Only clear pending on confirmed completion. If the POST
-            // /sessions/:id/complete call threw, leave PENDING_RETRY_KEY
-            // intact so the next launch retries: Phase 2 re-enters with
-            // remaining=[], the chunk loop is a no-op, and it retries
-            // completeSession alone. Chunks are server-safe regardless.
-            await AsyncStorage.removeItem(PENDING_RETRY_KEY);
-            console.log('GC_VALIDATION: PENDING_CLEARED', {
-              session_id: pending.session_id,
-              mode: 'phase2',
-            });
-            // Best-effort cleanup of the moved recording file. Only
-            // acts on docDir uris, so legacy cacheDir pending states
-            // from pre-Phase-4 builds are untouched.
-            await deleteRecordingBestEffort(pending.uri);
-            setTestStatus('PHASE 2 DONE');
-            console.log('PHASE 2 DONE — pending cleared');
-          } catch (error) {
-            setTestStatus('SESSION COMPLETE ERROR');
-            await new Promise(r => setTimeout(r, 50));
-            console.log('SESSION COMPLETE ERROR:', error);
-          }
-
-          // Clear the progress counter on Phase 2 completion so a fresh
-          // Phase 1 start doesn't inherit 'N/N uploaded' from recovery.
-          resetProgress();
-          setIsRecovering(false);
-          return;
+          });
         }
 
         // No pending state — ready for a manual Phase 1 trigger.
@@ -800,6 +1725,7 @@ export default function Index() {
     }
     isStartingRef.current = true;
     setIsStarting(true);
+    resetProgress();
     try {
       setTestStatus('REC START');
       await new Promise(r => setTimeout(r, 50));
@@ -817,12 +1743,67 @@ export default function Index() {
       setTestStatus('REC MODE SET');
       await new Promise(r => setTimeout(r, 50));
 
+      const token = tokenRef.current;
+      if (!token) throw new Error('TOKEN_MISSING_AT_START');
+
+      // Create the session BEFORE the recorder so the concurrent chunker
+      // can attribute its first tick to a known session_id. If the POST
+      // succeeds but recorder.startAsync fails below, the session is
+      // orphan in `active` — the worker's tryFinalizeReadySessions
+      // path will reap it (chunks=[] → all-settled → completeSession).
+      setTestStatus('REC SESSION CREATING');
+      await new Promise(r => setTimeout(r, 50));
+      const sessionId = await createSessionRequest(token);
+      sessionIdRef.current = sessionId;
+      AsyncStorage.setItem(LAST_SESSION_ID_KEY, sessionId).catch(() => {});
+      // Append to local history index (best-effort, never blocks the
+      // recording flow). The index is the only source the History
+      // screen has to enumerate past sessions; per-row real status is
+      // still fetched live from GET /sessions/:id/chunks.
+      appendHistoryEntry({
+        session_id: sessionId,
+        created_at: new Date().toISOString(),
+        mode: 'audio',
+      });
+      console.log('GC_VALIDATION: SESSION_CREATED', {
+        session_id: sessionId,
+        phase: 1,
+      });
+      setTestStatus('REC SESSION CREATED');
+      await new Promise(r => setTimeout(r, 50));
+
       const recording = new Audio.Recording();
-      await recording.prepareToRecordAsync(
-        Audio.RecordingOptionsPresets.HIGH_QUALITY,
-      );
+      await recording.prepareToRecordAsync(RECORDING_OPTIONS);
       await recording.startAsync();
       recordingRef.current = recording;
+
+      const cacheUri = recording.getURI();
+      if (!cacheUri) throw new Error('Recording URI is null after startAsync');
+
+      await queueAppendNewSession({
+        session_id: sessionId,
+        uri: cacheUri,
+        recording_closed: false,
+        session_completed: false,
+        complete_attempts: 0,
+        emitted_base64_length: 0,
+        next_chunk_index: 0,
+        chunks: [],
+      });
+
+      // Kick off the incremental chunker and wake the worker. Both run
+      // on the JS event loop, never on the recorder thread — HC1
+      // (recorder must NEVER stop because of upload failure) and HC2
+      // (upload must be asynchronous) are enforced by isolation.
+      startChunkerForSession(sessionId, cacheUri);
+      uploadDrainLoop().catch(err => {
+        if (DEBUG_QUEUE) {
+          console.log('GC_DEBUG drain rejected (from startRecording)', {
+            err: err instanceof Error ? err.message : String(err),
+          });
+        }
+      });
+
       setIsRecording(true);
       setTestStatus('REC STARTED');
       await new Promise(r => setTimeout(r, 50));
@@ -830,6 +1811,7 @@ export default function Index() {
       const message = (error as Error).message ?? String(error);
       setTestStatus(`ERROR REC: ${message}`);
       console.log('ERROR REC:', error);
+      sessionIdRef.current = null;
     } finally {
       isStartingRef.current = false;
       setIsStarting(false);
@@ -843,53 +1825,71 @@ export default function Index() {
       console.log('ERROR REC: recordingRef is null on stop');
       return;
     }
+    const sessionId = sessionIdRef.current;
 
     setIsStopping(true);
-    let uri: string;
+    let preMoveSize: number | null = null;
+    let finalUri: string | null = null;
     try {
       setTestStatus('REC STOPPING');
       await new Promise(r => setTimeout(r, 50));
       await recording.stopAndUnloadAsync();
+      console.log('GC_DIAG: STOP_AND_UNLOAD_RETURNED');
       const maybeUri = recording.getURI();
       recordingRef.current = null;
       setIsRecording(false);
       if (!maybeUri) throw new Error('Recording URI is null');
-      uri = maybeUri;
-      setTestStatus('REC DONE');
-      await new Promise(r => setTimeout(r, 50));
-      console.log('REC DONE — uri:', uri);
+      finalUri = maybeUri;
 
-      // Move the recording out of cacheDirectory (where expo-av drops
-      // it) into documentDirectory, so that a kill/reboot in the
-      // middle of the upload loop cannot have the OS evict the file
-      // before Phase 2 relaunches.
-      //
-      // documentDirectory is the expo-file-system location for data
-      // the app explicitly wants to persist; it survives app kills,
-      // device reboots, and low-storage reclaim events that
-      // cacheDirectory is subject to.
-      //
-      // Best-effort: if the move fails (readonly partition, unusual
-      // source URI, etc.) we log and fall through with the original
-      // uri. Phase 1 then still works (the file is still readable
-      // right now); recovery on next launch will degrade to metadata-
-      // only for any chunk we can't re-read. Evidence that already
-      // landed in Drive is unaffected.
+      try {
+        const preInfo = await FileSystem.getInfoAsync(maybeUri);
+        preMoveSize = preInfo.exists
+          ? (preInfo as { size?: number }).size ?? null
+          : null;
+      } catch (err) {
+        console.log('GC_DIAG: PRE_MOVE_INFO_FAILED', err);
+      }
+      console.log('GC_DIAG: REC_FILE_BEFORE_MOVE', {
+        uri: maybeUri,
+        exists: preMoveSize !== null,
+        size: preMoveSize,
+      });
+
+      // Move the recording from cacheDirectory (volatile) to
+      // documentDirectory (durable) so a kill/reboot does not let the
+      // OS purge it while the worker is still draining. Best-effort:
+      // any move failure leaves us reading from cache uri instead.
       if (FileSystem.documentDirectory) {
-        const extMatch = uri.match(/\.[A-Za-z0-9]{1,8}$/);
+        const extMatch = maybeUri.match(/\.[A-Za-z0-9]{1,8}$/);
         const ext = extMatch ? extMatch[0] : '.m4a';
         const movedUri = `${FileSystem.documentDirectory}guardian_recording_${Date.now()}${ext}`;
         try {
-          await FileSystem.moveAsync({ from: uri, to: movedUri });
-          uri = movedUri;
-          console.log('REC MOVED TO DOCDIR:', uri);
+          await FileSystem.moveAsync({ from: maybeUri, to: movedUri });
+          finalUri = movedUri;
+          console.log('REC MOVED TO DOCDIR:', finalUri);
         } catch (moveError) {
           console.log(
-            'REC MOVE WARN — keeping original cacheDir uri; recovery may degrade to metadata-only if the OS purges it:',
+            'REC MOVE WARN — keeping original cacheDir uri; recovery may not survive OS purge:',
             moveError,
           );
         }
       }
+
+      let postMoveSize: number | null = null;
+      try {
+        const postInfo = await FileSystem.getInfoAsync(finalUri);
+        postMoveSize = postInfo.exists
+          ? (postInfo as { size?: number }).size ?? null
+          : null;
+      } catch (err) {
+        console.log('GC_DIAG: POST_MOVE_INFO_FAILED', err);
+      }
+      console.log('GC_DIAG: REC_FILE_READY_FOR_CHUNKING', {
+        uri: finalUri,
+        size: postMoveSize,
+        pre_move_size: preMoveSize,
+        size_matches_pre_move: postMoveSize === preMoveSize,
+      });
     } catch (error) {
       recordingRef.current = null;
       setIsRecording(false);
@@ -900,634 +1900,127 @@ export default function Index() {
       return;
     }
 
-    const token = tokenRef.current;
-    if (!token) {
+    if (!sessionId) {
+      setTestStatus('REC DONE — no session');
       setIsStopping(false);
-      setTestStatus('TOKEN MISSING');
-      console.log('ERROR: tokenRef empty at stopRecording');
       return;
     }
 
     try {
-      await runPhase1Upload(token, uri);
+      // Cancel chunker tick and run the final pass against finalUri
+      // explicitly. Per the user's correction, do NOT trust
+      // recording.getURI() at this point — after stopAndUnload + move
+      // the cache uri may be gone. We pass the local finalUri (cache
+      // when move failed, doc dir otherwise).
+      await stopChunkerForSession(sessionId, finalUri!);
+
+      // Read the latest offsets the final pass produced and persist
+      // recording_closed=true. The worker uses recording_closed +
+      // chunks-all-settled to decide when to call completeSession.
+      const queue = await queueRead();
+      const entry = queue.find(e => e.session_id === sessionId);
+      const emitted = entry?.emitted_base64_length ?? 0;
+      const next = entry?.next_chunk_index ?? 0;
+      await queueMarkRecordingClosed(sessionId, finalUri!, emitted, next);
+
+      uploadDrainLoop().catch(err => {
+        if (DEBUG_QUEUE) {
+          console.log('GC_DEBUG drain rejected (from stopRecording)', {
+            err: err instanceof Error ? err.message : String(err),
+          });
+        }
+      });
+
+      setTestStatus(null);
+      console.log('GC_QUEUE recording closed', {
+        sessionId,
+        emitted,
+        next,
+        finalUri,
+      });
+    } catch (error) {
+      const message = (error as Error).message ?? String(error);
+      setTestStatus(`ERROR REC STOP: ${message}`);
+      console.log('ERROR REC STOP:', error);
     } finally {
+      sessionIdRef.current = null;
       setIsStopping(false);
     }
   }
 
-  async function runPhase1Upload(token: string, uri: string) {
-    try {
-      // ---------- PHASE 1: fresh run ----------
-      setTestStatus('PHASE 1 START');
-      await new Promise(r => setTimeout(r, 50));
-      console.log('PHASE 1 START — no pending retry in storage');
-
-      const info = await FileSystem.getInfoAsync(uri);
-      console.log('FILE INFO:', {
-        exists: info.exists,
-        size: info.exists ? (info as { size?: number }).size : null,
-      });
-
-      let chunks: RealChunk[];
+  // UI-only mirror of the upload queue progress. Polls every 500ms while
+  // the user-perceived flow is active (recording, recovering, or stopping
+  // — the worker may still be draining after STOP). The worker itself is
+  // module-scope and never touches React state, so polling is the cheapest
+  // way to keep "N / M chunks uploaded" honest without adding an event bus.
+  //
+  // Runs continuously while the screen is mounted — NOT gated on
+  // isRecording/isStopping/isRecovering. Previously the gate caused a
+  // real bug: when stopRecording's `finally` flipped isStopping=false,
+  // the effect cleanup killed polling while the worker was still
+  // draining in background, so the counter froze mid-progress (e.g.
+  // "5/10" while the queue was already at 10/10 and reaped). Always-on
+  // polling makes the UI strictly derived from the persisted queue, so
+  // recovery, app restart, network loss and post-stop background drain
+  // are all reflected without extra coordination.
+  //
+  // Cost: one AsyncStorage.getItem every 500 ms — sub-millisecond on
+  // the native side, no measurable impact when truly idle.
+  useEffect(() => {
+    let cancelled = false;
+    const tick = async () => {
+      if (cancelled) return;
       try {
-        chunks = await deriveChunksFromFile(uri);
-        // Seed the X / N counter from the derived chunk set. uploaded
-        // stays at 0 until the first POST /chunks succeeds. This is
-        // purely additive UI; it never affects the upload path.
-        setTotalCount(chunks.length);
-        setUploadedCount(0);
-        setTestStatus(`CHUNKS DERIVED: ${chunks.length}`);
-        await new Promise(r => setTimeout(r, 50));
-        console.log('CHUNKS DERIVED:', chunks.length);
-        for (const c of chunks) {
-          console.log(
-            `  index=${c.chunk_index} size=${c.size} hash=${c.hash}`,
-          );
+        const q = await queueRead();
+        let total = 0;
+        let uploaded = 0;
+        for (const e of q) {
+          total += e.chunks.length;
+          uploaded += e.chunks.filter(c => c.status === 'uploaded').length;
         }
-      } catch (error) {
-        setTestStatus('ERROR DERIVE');
-        console.log('ERROR DERIVE:', error);
-        return;
-      }
-
-      // MVP rule (CLAUDE.md priority 1 — "subida fiable de chunks"):
-      // accept any non-empty, well-formed chunk set. The only truly
-      // invalid recording is one that produced zero chunks (no usable
-      // evidence). Rejecting a valid single-chunk recording would throw
-      // away evidence the system was built to preserve.
-      setTestStatus('ZZ_BEFORE_CHUNK_COUNT_VALIDATION');
-      await new Promise(r => setTimeout(r, 50));
-
-      const totalBytes = chunks.reduce((sum, c) => sum + c.size, 0);
-      console.log('CHUNK COUNT VALIDATION:', {
-        chunk_count: chunks.length,
-        total_bytes: totalBytes,
-      });
-
-      if (chunks.length < 1) {
-        setTestStatus('ZZ_CHUNK_COUNT_VALIDATION_FAILED: no usable evidence');
-        console.log(
-          'ZZ_CHUNK_COUNT_VALIDATION_FAILED: 0 chunks derived — reason: recording produced no bytes. Nothing to upload.',
-        );
-        return;
-      }
-
-      console.log(
-        `CHUNK COUNT VALIDATION ACCEPTED: ${chunks.length} chunk(s), ${totalBytes} bytes total — proceeding with upload`,
-      );
-
-      // Read the recording as base64 ONCE for the whole Phase 1 flow.
-      // `deriveChunksFromFile` already read+hashed the file; we re-read
-      // here (rather than reuse) because the user requires
-      // `deriveChunksFromFile`'s signature to stay intact. The cost is
-      // one extra FileSystem read per recording — acceptable for the
-      // MVP, and the pre-chunk validation has already cleared "empty /
-      // unreadable" outcomes.
-      //
-      // Only reached when the kill switch is on. When off, we skip the
-      // read entirely and every chunk POSTs with remote_reference=null.
-      // Failure here returns early BEFORE creating a session — the
-      // recording is useless without bytes we can send to Drive, so
-      // there's no point occupying a session_id.
-      let base64Full: string | null = null;
-      if (DRIVE_CHUNK_UPLOAD_ENABLED) {
-        try {
-          base64Full = await readRecordingBase64(uri);
-          console.log(
-            'BASE64 READ OK:',
-            { length: base64Full.length },
-          );
-        } catch (error) {
-          setTestStatus('ERROR BASE64 READ');
-          console.log('ERROR BASE64 READ:', error);
-          return;
-        }
-      }
-
-      setTestStatus('ZZ_BEFORE_SESSION_REQUEST');
-      await new Promise(r => setTimeout(r, 50));
-
-      const sessionBody = JSON.stringify({
-        user_id: 'test_user',
-        mode: 'audio',
-        destination_type: 'drive',
-      });
-
-      setTestStatus('ZZ_SESSION_REQUEST_BODY_READY');
-      await new Promise(r => setTimeout(r, 50));
-
-      // DEBUG: print the exact URL baked into the bundle at the moment of
-      // fetch. If this does not match http://10.0.2.2:3000/sessions on the
-      // emulator, Metro is serving a stale bundle built against a different
-      // .env (e.g. .env.device). Removing this after diagnosis is fine.
-      const sessionsUrl = `${env.apiUrl}/sessions`;
-      setTestStatus(`ZZ_FETCH_URL: ${sessionsUrl}`);
-      await new Promise(r => setTimeout(r, 50));
-      console.log('ZZ_FETCH_URL:', sessionsUrl);
-
-      // DEBUG: dump the full request shape so we can see whether POST
-      // construction itself is malformed. Only headers KEYS are logged
-      // (no secret values). Body preview capped at 200 chars. Remove once
-      // POST /sessions succeeds end-to-end.
-      console.log('ZZ_REQUEST_SHAPE:', {
-        url: sessionsUrl,
-        method: 'POST',
-        headersKeys: ['Content-Type', 'Authorization'],
-        authorizationPresent: Boolean(token),
-        bodyLength: sessionBody.length,
-        bodyPreview: sessionBody.substring(0, 200),
-      });
-
-      // DEBUG: sanity probe — hit /health with the SAME fetch API the POST
-      // uses, from the SAME code path, moments before POST. If this GET
-      // succeeds and the POST still produces no REQ_INCOMING on the
-      // backend, the problem is in the POST request shape or fetch options
-      // (not in base connectivity / bind / firewall / cleartext). Remove
-      // once POST /sessions is confirmed working.
-      const healthUrl = `${env.apiUrl}/health`;
-      setTestStatus('ZZ_HEALTH_PROBE_START');
-      await new Promise(r => setTimeout(r, 50));
-      try {
-        const healthRes = await fetch(healthUrl);
-        setTestStatus(`ZZ_HEALTH_PROBE_OK status=${healthRes.status}`);
-        await new Promise(r => setTimeout(r, 50));
-        console.log('ZZ_HEALTH_PROBE_OK:', { status: healthRes.status });
-      } catch (error) {
-        const name = error instanceof Error ? error.name : 'unknown';
-        const message = error instanceof Error ? error.message : String(error);
-        setTestStatus(`ZZ_HEALTH_PROBE_FAIL name=${name} msg=${message}`);
-        await new Promise(r => setTimeout(r, 50));
-        console.log('ZZ_HEALTH_PROBE_FAIL:', { name, message, error });
-      }
-
-      setTestStatus('ZZ_FETCH_POST_START');
-      await new Promise(r => setTimeout(r, 50));
-
-      // Production-shape client timeout for POST /sessions. Sits above
-      // the backend's own 4000ms auth race and 8000ms DB race only for
-      // auth; a request that legitimately needs the full 8s DB budget on
-      // cold Supabase will abort here and be retried on next launch —
-      // acceptable for the MVP since /sessions is idempotent from the
-      // client's perspective (no chunks have been uploaded yet).
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 5000);
-
-      let res!: Response;
-      try {
-        res = await fetch(`${env.apiUrl}/sessions`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${token}`,
-          },
-          body: sessionBody,
-          signal: controller.signal,
-        });
-      } catch (error) {
-        // DEBUG: log error.name, error.message, String(error), and the
-        // AbortController state SEPARATELY so we can tell a pre-dispatch
-        // TypeError ("Network request failed" before any I/O) from a
-        // client-side timeout abort from a server-side disconnect.
-        const isAbort = controller.signal.aborted;
-        const name = error instanceof Error ? error.name : 'unknown';
-        const message = error instanceof Error ? error.message : String(error);
-        const stringified = String(error);
-        setTestStatus(
-          `ZZ_ERROR_SESSION: name=${name} msg=${message} aborted=${isAbort}`,
-        );
-        await new Promise(r => setTimeout(r, 50));
-        console.log('ZZ_ERROR_SESSION DETAILS:', {
-          name,
-          message,
-          stringified,
-          aborted: isAbort,
-          errorObject: error,
-        });
-        return;
-      } finally {
-        clearTimeout(timeoutId);
-      }
-
-      setTestStatus(`ZZ_SESSION_RESPONSE_RECEIVED (status ${res.status})`);
-      await new Promise(r => setTimeout(r, 50));
-
-      if (!res.ok) {
-        const text = await res.text().catch(() => '<no body>');
-        setTestStatus(`ZZ_ERROR_SESSION: HTTP ${res.status} ${text}`);
-        console.log('ZZ_ERROR_SESSION: HTTP', res.status, text);
-        return;
-      }
-
-      let data!: { session_id?: string };
-      try {
-        data = await res.json();
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        setTestStatus(`ZZ_ERROR_SESSION: bad JSON (${message})`);
-        console.log('ZZ_ERROR_SESSION: bad JSON:', error);
-        return;
-      }
-
-      setTestStatus('ZZ_SESSION_RESPONSE_OK');
-      await new Promise(r => setTimeout(r, 50));
-      console.log('SESSION CREATED:', data);
-      console.log('GC_VALIDATION: SESSION_CREATED', {
-        session_id: data.session_id,
-        phase: 1,
-      });
-
-      const sessionId = data.session_id;
-      if (!sessionId) {
-        setTestStatus('ZZ_ERROR_SESSION: no session_id in response');
-        console.log('ZZ_ERROR_SESSION: no session_id in response');
-        return;
-      }
-      setTestStatus('SESSION CREATED');
-      await new Promise(r => setTimeout(r, 50));
-
-      // Persist the full upload plan BEFORE any chunk POST so that a
-      // force-close or device reboot between chunks still triggers
-      // Phase 2 recovery on next launch. Without this, the existing
-      // catch-only write only covers the narrow case of a caught
-      // fetch exception — it misses real kill scenarios (TEST_SCENARIOS
-      // #3 and #4). Same { session_id, remaining } schema Phase 2
-      // already consumes.
-      await AsyncStorage.setItem(
-        PENDING_RETRY_KEY,
-        JSON.stringify({ session_id: sessionId, remaining: chunks, uri }),
-      );
-      console.log('GC_VALIDATION: PENDING_PERSISTED', {
-        event: 'initial',
-        session_id: sessionId,
-        remaining_indexes: chunks.map(c => c.chunk_index),
-        has_uri: Boolean(uri),
-      });
-
-      // chunks[0] → bytes to Drive (proxy) → metadata to our backend.
-      //
-      // Order matters: Drive first, then /chunks with the returned
-      // remote_reference. If Drive throws, we never register the chunk
-      // — Phase 2 will retry both steps on next launch, and Drive
-      // dedupe (filename lookup) collapses a re-upload onto the same
-      // file_id so we never create duplicates in the user's Drive.
-      //
-      // The whole pair sits inside the same try/catch as before: any
-      // failure (Drive OR /chunks) ends Phase 1, leaves the full
-      // PENDING_RETRY_KEY plan in place, and lets Phase 2 take over.
-      let remoteRef0: string | null = null;
-      try {
-        if (DRIVE_CHUNK_UPLOAD_ENABLED && base64Full !== null) {
-          const chunk0 = chunks[0] as RealChunk;
-          const slice0 = base64SliceAt(base64Full, chunk0.chunk_index);
-          setTestStatus('CHUNK 0 UPLOAD BYTES');
-          await new Promise(r => setTimeout(r, 50));
-          const up0 = await uploadChunkBytes(
-            sessionId,
-            chunk0.chunk_index,
-            chunk0.hash,
-            slice0,
-          );
-          remoteRef0 = up0.remote_reference;
-          console.log('CHUNK 0 DRIVE OK:', up0);
-          console.log('GC_VALIDATION: CHUNK_DRIVE_OK', {
-            phase: 1,
-            chunk_index: (chunks[0] as RealChunk).chunk_index,
-            hash_short: (chunks[0] as RealChunk).hash.substring(0, 12),
-            remote_reference: remoteRef0,
-            dedup: up0.dedup,
-          });
-        }
-        const r0 = await postChunk(
-          token,
-          sessionId,
-          chunks[0] as RealChunk,
-          'uploaded',
-          remoteRef0,
-        );
-        setUploadedCount(u => u + 1);
-        setTestStatus('CHUNK 0 OK');
-        await new Promise(r => setTimeout(r, 50));
-        console.log('CHUNK POST index=0 status=uploaded:', r0);
-        console.log('GC_VALIDATION: CHUNK_POSTED', {
-          phase: 1,
-          chunk_index: (chunks[0] as RealChunk).chunk_index,
-          hash_short: (chunks[0] as RealChunk).hash.substring(0, 12),
-          remote_reference: remoteRef0,
-          idempotent_replay:
-            (r0 as { idempotent_replay?: boolean } | null)?.idempotent_replay ?? false,
-        });
-        // Shrink the pending plan so a kill between here and chunks[1]
-        // resumes from index 1, not from 0. Chunk 0 is server-safe; a
-        // re-POST would still be idempotent but we avoid the wasted trip.
-        await AsyncStorage.setItem(
-          PENDING_RETRY_KEY,
-          JSON.stringify({
-            session_id: sessionId,
-            remaining: chunks.slice(1),
-            uri,
-          }),
-        );
-        console.log('GC_VALIDATION: PENDING_PERSISTED', {
-          event: 'shrink_after_index_0',
-          session_id: sessionId,
-          remaining_indexes: chunks.slice(1).map(c => c.chunk_index),
-          has_uri: Boolean(uri),
-        });
-      } catch (error) {
-        setTestStatus('ERROR CHUNK 0');
-        console.log('ERROR CHUNK 0:', error);
-        return;
-      }
-
-      // DEBUG-only idempotency probe for chunk 0. Session is still
-      // `active` at this point (Phase 1 has not run completeSession
-      // yet for multi-chunk recordings), so the backend must accept
-      // the duplicate and return idempotent_replay: true. If a 409
-      // SESSION_NOT_ACTIVE comes back, something completed the
-      // session out from under us.
-      if (DEBUG_DUPLICATE_SUBMISSION) {
-        setTestStatus('CHUNK DUPLICATE DETECTED index=0');
-        await new Promise(r => setTimeout(r, 50));
-        console.log('CHUNK DUPLICATE DETECTED index=0: resending same hash/status');
-        try {
-          // Re-use the remote_reference captured from the first chunks[0]
-          // upload. This probe is strictly for BACKEND metadata
-          // idempotency — we are NOT exercising Drive dedupe here, so
-          // no second uploadChunkBytes call. Sending the same
-          // remote_reference keeps the POST shape bit-for-bit identical
-          // between the original and the replay.
-          const dup = (await postChunk(
-            token,
-            sessionId,
-            chunks[0] as RealChunk,
-            'uploaded',
-            remoteRef0,
-          )) as { idempotent_replay?: boolean; chunk_index?: number };
-          if (dup.idempotent_replay === true) {
-            setTestStatus('CHUNK IDEMPOTENT OK index=0');
-            await new Promise(r => setTimeout(r, 50));
-            console.log('CHUNK IDEMPOTENT OK index=0:', dup);
-          } else {
-            setTestStatus(
-              `CHUNK IDEMPOTENT UNEXPECTED index=0 replay=${dup.idempotent_replay}`,
+        if (!cancelled) {
+          setTotalCount(total);
+          setUploadedCount(uploaded);
+          if (total > 0 && uploaded === total) {
+            setTestStatus(prev =>
+              prev !== null &&
+              (prev.startsWith('PHASE 1 DONE') || prev.startsWith('READY'))
+                ? prev
+                : `UPLOADED ${uploaded} / ${total}`,
             );
-            await new Promise(r => setTimeout(r, 50));
-            console.log('CHUNK IDEMPOTENT UNEXPECTED index=0:', dup);
           }
-        } catch (error) {
-          setTestStatus('ERROR CHUNK DUPLICATE index=0');
-          console.log('ERROR CHUNK DUPLICATE index=0:', error);
         }
+      } catch (err) {
+        console.log('GC_QUEUE poll error', err);
       }
-
-      // Single-chunk recording: chunks[0] is already uploaded, there is
-      // no chunks[1] to exercise the network-failure path with, and there
-      // is nothing pending to persist or recover. The session is already
-      // in a consistent, complete state. Report Phase 1 done and exit —
-      // MVP priority is evidence survival, not running every test branch.
-      if (chunks.length < 2) {
-        // Single-chunk session is fully uploaded — mark it completed
-        // so it never lingers in `active`. Same try/catch contract as
-        // Phase 2: completion failure is surfaced but does not void the
-        // uploaded chunk.
-        try {
-          setTestStatus('SESSION COMPLETE START');
-          await new Promise(r => setTimeout(r, 50));
-          console.log('SESSION COMPLETE START:', sessionId);
-          const completed = await completeSession(token, sessionId);
-          setTestStatus('SESSION COMPLETE OK');
-          await new Promise(r => setTimeout(r, 50));
-          console.log('SESSION COMPLETE OK:', completed);
-          console.log('GC_VALIDATION: SESSION_COMPLETED', {
-            mode: 'single-chunk',
-            session_id: sessionId,
-          });
-          // Only clear pending on confirmed completion. If completeSession
-          // throws, leave PENDING_RETRY_KEY so the next launch retries via
-          // Phase 2 (remaining=[] → chunk loop is a no-op → completeSession
-          // retry only). Chunks are server-safe regardless.
-          await AsyncStorage.removeItem(PENDING_RETRY_KEY);
-          console.log('GC_VALIDATION: PENDING_CLEARED', {
-            session_id: sessionId,
-            mode: 'single-chunk',
-          });
-          // Best-effort cleanup of the moved recording. Docdir-only
-          // guard inside the helper protects cache/legacy uris.
-          await deleteRecordingBestEffort(uri);
-        } catch (error) {
-          setTestStatus('SESSION COMPLETE ERROR');
-          await new Promise(r => setTimeout(r, 50));
-          console.log('SESSION COMPLETE ERROR:', error);
-        }
-
-        setTestStatus(
-          'PHASE 1 DONE — single-chunk recording (no recovery needed)',
-        );
-        console.log(
-          'PHASE 1 DONE — single-chunk recording: chunks[0] already uploaded, no pending state persisted, no recovery needed',
-        );
-        // UI-only counter reset. The backend/session state is already
-        // safe — clearing this just stops the UI from showing a stale
-        // "1 / 1" the next time the user opens the screen.
-        resetProgress();
-        return;
-      }
-
-      // Real multi-chunk upload. Sequential POST of chunks[1..N-1].
-      // On any fetch throw (radio drop, DNS fail, socket close, 5xx
-      // parsed into a throw, etc.) we persist { session_id,
-      // remaining: chunks[i..N-1] } and return; Phase 2 on the next
-      // launch picks up from exactly that index. Server-side
-      // idempotency (UNIQUE(session_id, chunk_index) + hash
-      // reconciliation) makes resending any already-registered chunk
-      // safe if the client believes a chunk failed that the server
-      // actually stored.
-      //
-      // DEBUG_INJECT_CHUNK1_FAILURE, when true, short-circuits the
-      // i=1 iteration so Phase 2 recovery can be exercised without
-      // toggling the emulator radio. No effect when false — this is
-      // the real production-shape loop.
-      for (let i = 1; i < chunks.length; i++) {
-        try {
-          if (DEBUG_INJECT_CHUNK1_FAILURE && i === 1) {
-            setTestStatus('DEBUG_CHUNK1_INJECTED_FAILURE');
-            await new Promise(r => setTimeout(r, 50));
-            console.log(
-              'DEBUG_CHUNK1_INJECTED_FAILURE — simulated failure on chunk 1; no real POST. Remainder will be persisted for Phase 2.',
-            );
-            throw new Error('DEBUG_INJECT_CHUNK1_FAILURE');
-          }
-
-          // Same order as chunks[0]: Drive first, /chunks second.
-          // Any throw here lands in the catch below, which persists
-          // { remaining: chunks[i..N-1] } and returns. Phase 2 picks
-          // up from exactly index i; Drive dedupe guarantees no
-          // duplicate files if bytes landed before the crash.
-          const chunkI = chunks[i] as RealChunk;
-          let remoteRef: string | null = null;
-          if (DRIVE_CHUNK_UPLOAD_ENABLED && base64Full !== null) {
-            const sliceI = base64SliceAt(base64Full, chunkI.chunk_index);
-            setTestStatus(`CHUNK ${i} UPLOAD BYTES`);
-            await new Promise(r => setTimeout(r, 50));
-            const upI = await uploadChunkBytes(
-              sessionId,
-              chunkI.chunk_index,
-              chunkI.hash,
-              sliceI,
-            );
-            remoteRef = upI.remote_reference;
-            console.log(`CHUNK ${i} DRIVE OK:`, upI);
-            console.log('GC_VALIDATION: CHUNK_DRIVE_OK', {
-              phase: 1,
-              chunk_index: chunkI.chunk_index,
-              hash_short: chunkI.hash.substring(0, 12),
-              remote_reference: remoteRef,
-              dedup: upI.dedup,
-            });
-          }
-
-          const r = await postChunk(
-            token,
-            sessionId,
-            chunkI,
-            'uploaded',
-            remoteRef,
-          );
-          setUploadedCount(u => u + 1);
-          setTestStatus(`CHUNK ${i} OK`);
-          await new Promise(r => setTimeout(r, 50));
-          console.log(
-            `CHUNK POST index=${i} status=uploaded:`,
-            r,
-          );
-          console.log('GC_VALIDATION: CHUNK_POSTED', {
-            phase: 1,
-            chunk_index: chunkI.chunk_index,
-            hash_short: chunkI.hash.substring(0, 12),
-            remote_reference: remoteRef,
-            idempotent_replay:
-              (r as { idempotent_replay?: boolean } | null)?.idempotent_replay ?? false,
-          });
-          // Shrink the pending plan so a kill between here and
-          // chunks[i+1] resumes from i+1. If the app dies mid-write,
-          // Phase 2 re-POSTs chunks[i] and server idempotency absorbs it.
-          await AsyncStorage.setItem(
-            PENDING_RETRY_KEY,
-            JSON.stringify({
-              session_id: sessionId,
-              remaining: chunks.slice(i + 1),
-              uri,
-            }),
-          );
-          console.log('GC_VALIDATION: PENDING_PERSISTED', {
-            event: `shrink_after_index_${i}`,
-            session_id: sessionId,
-            remaining_indexes: chunks.slice(i + 1).map(c => c.chunk_index),
-            has_uri: Boolean(uri),
-          });
-        } catch (error) {
-          const remaining = chunks.slice(i);
-          await AsyncStorage.setItem(
-            PENDING_RETRY_KEY,
-            JSON.stringify({
-              session_id: sessionId,
-              remaining,
-              uri,
-            }),
-          );
-          console.log('GC_VALIDATION: PENDING_PERSISTED', {
-            event: 'pause_on_error',
-            session_id: sessionId,
-            remaining_indexes: remaining.map(c => c.chunk_index),
-            has_uri: Boolean(uri),
-          });
-          console.log('GC_VALIDATION: PHASE1_PAUSED', {
-            session_id: sessionId,
-            pending_count: remaining.length,
-          });
-          setTestStatus(
-            `PHASE 1 PAUSED — pending=${remaining.length} chunk(s). Reload to retry.`,
-          );
-          await new Promise(r => setTimeout(r, 50));
-          console.log(
-            `PHASE 1 PAUSED — network failure on chunk ${i}, persisted ${remaining.length} remaining. Reload the app to trigger Phase 2.`,
-            error,
-          );
-          return;
-        }
-      }
-
-      // DEBUG-only pause to make TEST_SCENARIOS #D reproducible.
-      // All chunks are server-safe at this point; the delay just
-      // keeps the session in `active` long enough for a manual
-      // force-stop to land between the last chunk and the completion
-      // request. Leave at 0 for production runs.
-      if (DEBUG_DELAY_BEFORE_COMPLETE_MS > 0) {
-        setTestStatus(
-          `DEBUG BEFORE COMPLETE ${DEBUG_DELAY_BEFORE_COMPLETE_MS}ms`,
-        );
-        console.log(
-          `DEBUG BEFORE COMPLETE — sleeping ${DEBUG_DELAY_BEFORE_COMPLETE_MS}ms before completeSession to widen the kill window for TEST_SCENARIOS #D`,
-        );
-        await new Promise(r =>
-          setTimeout(r, DEBUG_DELAY_BEFORE_COMPLETE_MS),
-        );
-      }
-
-      // All chunks uploaded — complete the session. Same try/catch
-      // contract as Phase 2: completion failure surfaces but does
-      // not void the evidence (chunks are already server-side).
-      try {
-        setTestStatus('SESSION COMPLETE START');
-        await new Promise(r => setTimeout(r, 50));
-        console.log('SESSION COMPLETE START:', sessionId);
-        const completed = await completeSession(token, sessionId);
-        setTestStatus('SESSION COMPLETE OK');
-        await new Promise(r => setTimeout(r, 50));
-        console.log('SESSION COMPLETE OK:', completed);
-        console.log('GC_VALIDATION: SESSION_COMPLETED', {
-          mode: 'multi-chunk',
-          session_id: sessionId,
-        });
-        // Only clear pending on confirmed completion. If completeSession
-        // throws, leave PENDING_RETRY_KEY so the next launch retries via
-        // Phase 2 (remaining=[] → chunk loop is a no-op → completeSession
-        // retry only). Chunks are server-safe regardless.
-        await AsyncStorage.removeItem(PENDING_RETRY_KEY);
-        console.log('GC_VALIDATION: PENDING_CLEARED', {
-          session_id: sessionId,
-          mode: 'multi-chunk',
-        });
-        // Best-effort cleanup of the moved recording. Docdir-only
-        // guard inside the helper protects cache/legacy uris.
-        await deleteRecordingBestEffort(uri);
-      } catch (error) {
-        setTestStatus('SESSION COMPLETE ERROR');
-        await new Promise(r => setTimeout(r, 50));
-        console.log('SESSION COMPLETE ERROR:', error);
-      }
-
-      setTestStatus('PHASE 1 DONE — all chunks uploaded');
-      console.log(
-        'PHASE 1 DONE — all chunks uploaded, session completed',
-      );
-      // UI-only counter reset. Chunks are server-safe; this just clears
-      // the stale "N / N" from the HOME card now that the work is done.
-      resetProgress();
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      setTestStatus(`ZZ_ERROR_CATCHALL: ${message || '<no message>'}`);
-      console.log('ZZ_ERROR_CATCHALL:', error);
-    }
-  }
+    };
+    tick();
+    const id = setInterval(tick, 500);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, []);
 
   const isBusy = isStarting || isStopping || isRecovering;
-  const phaseLabel = isBusy
-    ? 'Procesando / subiendo'
-    : isRecording
-      ? 'Grabando'
-      : 'Listo';
-  const phaseColor = isBusy ? '#f0b400' : isRecording ? '#ff4d4d' : '#3ddc84';
+  // Mutually-exclusive phase, derived strictly from queue + recorder
+  // state. Order matters: a live recording dominates everything; pending
+  // upload work dominates "Listo"; only with an empty/settled queue do
+  // we show "Listo". This guarantees "Listo" can never coexist with a
+  // visible "Subiendo evidencia (X/Y)" — the contradiction the user saw.
+  const hasPendingUploads = totalCount > 0 && uploadedCount < totalCount;
+  const phaseLabel = isRecording
+    ? 'Grabando'
+    : hasPendingUploads
+      ? `Subiendo evidencia (${uploadedCount} / ${totalCount})`
+      : isBusy
+        ? 'Procesando…'
+        : 'Listo';
+  const phaseColor = isRecording
+    ? '#ff4d4d'
+    : hasPendingUploads || isBusy
+      ? '#f0b400'
+      : '#3ddc84';
 
   // Destination gate. We never block a STOP — even with no destination,
   // a running recording must always be stoppable. The block only applies
@@ -1543,13 +2036,6 @@ export default function Index() {
   const buttonLabel = showStop ? 'PARAR' : 'GRABAR';
   const buttonBg = showStop ? '#d73a49' : '#1f6feb';
 
-  // X / N progress. Shown only while work is actually in flight (total
-  // > 0). Guarantees we never render "0 / 0" per the brief.
-  const showProgress = totalCount > 0;
-  const progressLabel = showProgress
-    ? `Subiendo ${uploadedCount} / ${totalCount}`
-    : null;
-
   return (
     <View
       style={{
@@ -1560,8 +2046,34 @@ export default function Index() {
         backgroundColor: '#0d1117',
       }}
     >
-      {/* Settings shortcut — top-right of the screen. Always available,
-          never blocks any recording / recovery logic. */}
+      {/* Hide Expo Router's default header for the home route. Other
+          routes (settings, session/[id]) keep their default header so
+          the back button continues to work. Per-screen override is the
+          documented Expo Router pattern. */}
+      <Stack.Screen options={{ headerShown: false }} />
+
+      {/* Top shortcuts — Configuración (right) and Historial (left).
+          Always available, never block any recording / recovery logic.
+          Same visual weight as each other; both deliberately small so
+          they never compete with the central GRABAR/PARAR button. */}
+      <Pressable
+        onPress={() => router.push('/history')}
+        hitSlop={16}
+        style={{
+          position: 'absolute',
+          top: 48,
+          left: 20,
+          paddingHorizontal: 10,
+          paddingVertical: 6,
+          borderWidth: 1,
+          borderColor: '#30363d',
+          borderRadius: 6,
+          backgroundColor: '#161b22',
+        }}
+      >
+        <Text style={{ color: '#c9d1d9', fontSize: 12 }}>Historial</Text>
+      </Pressable>
+
       <Pressable
         onPress={() => router.push('/settings')}
         hitSlop={16}
@@ -1646,22 +2158,6 @@ export default function Index() {
         </Text>
       </Pressable>
 
-      {/* X / N progress counter — visible only while work is in flight.
-          Drives off the same state as the upload loops, never duplicates
-          logic. Covers Phase 1 and Phase 2 identically. */}
-      {progressLabel && (
-        <Text
-          style={{
-            color: '#f0b400',
-            fontSize: 14,
-            fontWeight: '600',
-            marginBottom: 16,
-          }}
-        >
-          {progressLabel}
-        </Text>
-      )}
-
       {!hasDrive && !driveCheckLoading && !showStop && (
         <Text
           style={{
@@ -1677,21 +2173,6 @@ export default function Index() {
         </Text>
       )}
 
-      <Text
-        style={{
-          fontSize: 12,
-          color: '#c9d1d9',
-          textAlign: 'center',
-          padding: 12,
-          borderWidth: 1,
-          borderColor: '#30363d',
-          borderRadius: 6,
-          minWidth: '90%',
-          backgroundColor: '#161b22',
-        }}
-      >
-        {testStatus}
-      </Text>
     </View>
   );
 }

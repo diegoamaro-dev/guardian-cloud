@@ -79,14 +79,21 @@ export async function apiFetch<T = unknown>(
   const timer = setTimeout(() => timeoutController.abort(), timeoutMs);
   const composedSignal = composeSignals(timeoutController.signal, signal);
 
+  // Build RequestInit step-by-step so `body` is only set when defined —
+  // exactOptionalPropertyTypes forbids assigning `undefined` to an
+  // optional `body` field, which the previous inline object literal did.
+  const requestInit: RequestInit = {
+    method,
+    headers,
+    signal: composedSignal,
+  };
+  if (body !== undefined) {
+    requestInit.body = JSON.stringify(body);
+  }
+
   let response: Response;
   try {
-    response = await fetch(`${env.apiUrl}${path}`, {
-      method,
-      headers,
-      body: body === undefined ? undefined : JSON.stringify(body),
-      signal: composedSignal,
-    });
+    response = await fetch(`${env.apiUrl}${path}`, requestInit);
   } catch (e) {
     throw new ApiError(
       0,

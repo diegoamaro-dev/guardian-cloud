@@ -19,12 +19,17 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
   orientation: 'portrait',
   userInterfaceStyle: 'automatic',
   newArchEnabled: true,
+  icon: './assets/foreground.png',
   ios: {
     supportsTablet: false,
     bundleIdentifier: 'com.guardiancloud.app',
   },
   android: {
     package: 'com.guardiancloud.app',
+    adaptiveIcon: {
+      foregroundImage: './assets/foreground.png',
+      backgroundColor: '#000000',
+    },
   },
   plugins: [
     'expo-router',

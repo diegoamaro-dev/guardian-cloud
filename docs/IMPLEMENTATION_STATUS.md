@@ -16,7 +16,8 @@ The MVP currently supports:
 - Recovery after device reboot
 - Session completion
 - Local cleanup after success
+- Evidence export from a given session (download chunks via backend proxy, verify sha256, concatenate in order, write .m4a to documentDirectory, produce partial result when some chunks are missing/corrupt)
 
 ## Current validated criterion
 
-The system can record, generate chunks, upload them to Drive, recover pending chunks after failure, complete the session and clean local state.
+The system can record, generate chunks, upload them to Drive, recover pending chunks after failure, complete the session, clean local state, and export the session's evidence back as a single .m4a file from the recorded chunks.

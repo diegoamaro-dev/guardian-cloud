@@ -509,3 +509,66 @@ export async function uploadFile(
     web_view_link: json.webViewLink,
   };
 }
+
+/**
+ * Download the bytes of a Drive file by file_id.
+ *
+ * Inverse of `uploadFile`. Used by the export pipeline
+ * (GET /sessions/:id/chunks/:index/download) to stream a chunk's bytes
+ * back to the client. The returned Buffer is the exact body that was
+ * uploaded — no re-encoding, no transformation.
+ *
+ * Endpoint: GET /drive/v3/files/{fileId}?alt=media — Drive's documented
+ * "media download" path for non-Google-Doc files. `drive.file` scope is
+ * sufficient because the proxy only ever uploads (and now downloads)
+ * files THIS app created, never user-owned content outside that set.
+ *
+ * Errors:
+ *   - 404 from Drive (file deleted server-side) → DRIVE_FILE_NOT_FOUND
+ *     so the route can return a stable 404 to the client. The client
+ *     will mark that chunk_index as corrupt in the export result.
+ *   - any other non-2xx → DRIVE_DOWNLOAD_FAILED (502). Network/timeout
+ *     errors propagate from `fetchWithTimeout` and surface the same way.
+ *
+ * Memory: holds the full file in memory as a Buffer. Chunks are ~16 KB
+ * in the MVP, so this is fine; the same trade-off is documented for
+ * `uploadFile`.
+ */
+export async function downloadFile(
+  accessToken: string,
+  fileId: string,
+): Promise<Buffer> {
+  const safeId = encodeURIComponent(fileId);
+  const res = await fetchWithTimeout(
+    `${DRIVE_API_BASE}/files/${safeId}?alt=media`,
+    { headers: { Authorization: `Bearer ${accessToken}` } },
+  );
+
+  if (res.status === 404) {
+    throw new AppError(
+      404,
+      'DRIVE_FILE_NOT_FOUND',
+      'Drive file not found for the given remote_reference',
+    );
+  }
+
+  if (!res.ok) {
+    const detail = await res.text().catch(() => '<no body>');
+    logger.warn(
+      {
+        op: 'drive.downloadFile',
+        status: res.status,
+        detail: detail.substring(0, 200),
+      },
+      'Drive download failed',
+    );
+    throw new AppError(
+      502,
+      'DRIVE_DOWNLOAD_FAILED',
+      `Drive download failed (${res.status})`,
+    );
+  }
+
+  const ab = await res.arrayBuffer();
+  return Buffer.from(ab);
+}

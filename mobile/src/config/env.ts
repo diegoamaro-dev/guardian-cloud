@@ -23,7 +23,7 @@ const EnvSchema = z.object({
 });
 
 const parsed = EnvSchema.safeParse({
-  EXPO_PUBLIC_API_URL: 'http://10.0.2.2:3000',
+  EXPO_PUBLIC_API_URL: 'http://192.168.178.21:3000',
   EXPO_PUBLIC_SUPABASE_URL: 'https://nahksdkcvhveoctpjrea.supabase.co',
   EXPO_PUBLIC_SUPABASE_ANON_KEY: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im5haGtzZGtjdmh2ZW9jdHBqcmVhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzYyMzY5OTcsImV4cCI6MjA5MTgxMjk5N30.mAAF3FZppADN6nbDr5mxIVlJsmzjFmJxeH6HPA9MpTw',
 });

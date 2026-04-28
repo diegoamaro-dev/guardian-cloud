@@ -1,0 +1,366 @@
+[1mdiff --git a/backend/src/routes/sessions.routes.ts b/backend/src/routes/sessions.routes.ts[m
+[1mindex a324639..f78f03f 100644[m
+[1m--- a/backend/src/routes/sessions.routes.ts[m
+[1m+++ b/backend/src/routes/sessions.routes.ts[m
+[36m@@ -13,7 +13,7 @@[m
+  */[m
+ [m
+ import { Router, type NextFunction, type Request, type Response } from 'express';[m
+[31m-import { UnauthorizedError } from '../errors/AppError.js';[m
+[32m+[m[32mimport { AppError, UnauthorizedError } from '../errors/AppError.js';[m
+ import { authMiddleware } from '../middleware/auth.js';[m
+ import { userRateLimiter } from '../middleware/rateLimit.js';[m
+ import { validateBody } from '../middleware/validate.js';[m
+[36m@@ -27,6 +27,12 @@[m [mimport {[m
+   getOwnedSession,[m
+ } from '../services/sessions.service.js';[m
+ import { listChunksForSession } from '../services/chunks.service.js';[m
+[32m+[m[32mimport { getDestinationWithSecretForUser } from '../services/destinations.service.js';[m
+[32m+[m[32mimport {[m
+[32m+[m[32m  downloadFileBytes,[m
+[32m+[m[32m  getAccessToken,[m
+[32m+[m[32m} from '../services/drive.service.js';[m
+[32m+[m[32mimport { supabase } from '../config/supabase.js';[m
+ import { logger } from '../utils/logger.js';[m
+ [m
+ const router = Router();[m
+[36m@@ -110,6 +116,138 @@[m [mrouter.get([m
+   },[m
+ );[m
+ [m
+[32m+[m[32m/**[m
+[32m+[m[32m * GET /sessions/:id/chunks/:index/download[m
+[32m+[m[32m *[m
+[32m+[m[32m * Proxy read-only download of a single chunk's raw bytes from the user's[m
+[32m+[m[32m * Google Drive. Used by the export-evidence flow in the mobile client,[m
+[32m+[m[32m * which cannot call Drive directly (refresh_token stays on the backend).[m
+[32m+[m[32m *[m
+[32m+[m[32m * Ownership (strict — no leakage of other users' data):[m
+[32m+[m[32m *   1. `getOwnedSession(userId, sessionId)` → throws 404 if the session[m
+[32m+[m[32m *      does not exist OR does not belong to the caller. "Not yours" and[m
+[32m+[m[32m *      "not found" are deliberately collapsed.[m
+[32m+[m[32m *   2. The chunks row lookup is keyed by (session_id, chunk_index).[m
+[32m+[m[32m *      Because step 1 already proved the session belongs to the caller,[m
+[32m+[m[32m *      any chunk row under that session is owned by them by construction.[m
+[32m+[m[32m *[m
+[32m+[m[32m * Preconditions for a successful download:[m
+[32m+[m[32m *   - chunk row exists                 → else 404 CHUNK_NOT_FOUND[m
+[32m+[m[32m *   - chunk.status === 'uploaded'      → else 409 CHUNK_NOT_READY[m
+[32m+[m[32m *   - chunk.remote_reference != null   → else 409 CHUNK_NO_REMOTE_REFERENCE[m
+[32m+[m[32m *   - user has a connected Drive dest  → else 409 DRIVE_NOT_CONNECTED[m
+[32m+[m[32m *[m
+[32m+[m[32m * Response: 200 application/octet-stream with the Drive file bytes.[m
+[32m+[m[32m *   Header `X-Chunk-Hash` carries the DB-recorded sha256 so the client[m
+[32m+[m[32m *   can verify integrity locally without a second round-trip.[m
+[32m+[m[32m *[m
+[32m+[m[32m * Intentionally does NOT modify any row — read-only path.[m
+[32m+[m[32m */[m
+[32m+[m[32mconst UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;[m
+[32m+[m
+[32m+[m[32mrouter.get([m
+[32m+[m[32m  '/:id/chunks/:index/download',[m
+[32m+[m[32m  authMiddleware,[m
+[32m+[m[32m  userRateLimiter(60),[m
+[32m+[m[32m  async (req: Request, res: Response, next: NextFunction) => {[m
+[32m+[m[32m    try {[m
+[32m+[m[32m      if (!req.user) throw new UnauthorizedError();[m
+[32m+[m
+[32m+[m[32m      const sessionId = (req.params.id ?? '').trim();[m
+[32m+[m[32m      const indexRaw = (req.params.index ?? '').trim();[m
+[32m+[m
+[32m+[m[32m      if (!UUID_RE.test(sessionId)) {[m
+[32m+[m[32m        throw new AppError(400, 'INVALID_SESSION_ID', 'Invalid session id');[m
+[32m+[m[32m      }[m
+[32m+[m[32m      const chunkIndex = Number.parseInt(indexRaw, 10);[m
+[32m+[m[32m      if (!Number.isInteger(chunkIndex) || chunkIndex < 0) {[m
+[32m+[m[32m        throw new AppError(400, 'INVALID_CHUNK_INDEX', 'Invalid chunk index');[m
+[32m+[m[32m      }[m
+[32m+[m
+[32m+[m[32m      // Strict ownership gate — throws 404 SESSION_NOT_FOUND if the[m
+[32m+[m[32m      // session is missing OR belongs to someone else. Must run BEFORE[m
+[32m+[m[32m      // any chunks.select so we never confirm existence of a chunk under[m
+[32m+[m[32m      // a foreign session.[m
+[32m+[m[32m      await getOwnedSession(req.user.id, sessionId);[m
+[32m+[m
+[32m+[m[32m      const { data, error } = await supabase[m
+[32m+[m[32m        .from('chunks')[m
+[32m+[m[32m        .select('chunk_index, hash, status, remote_reference')[m
+[32m+[m[32m        .eq('session_id', sessionId)[m
+[32m+[m[32m        .eq('chunk_index', chunkIndex)[m
+[32m+[m[32m        .maybeSingle();[m
+[32m+[m
+[32m+[m[32m      if (error) {[m
+[32m+[m[32m        logger.error([m
+[32m+[m[32m          {[m
+[32m+[m[32m            op: 'chunks.download.lookup',[m
+[32m+[m[32m            sessionId,[m
+[32m+[m[32m            chunkIndex,[m
+[32m+[m[32m            supabase_error: {[m
+[32m+[m[32m              code: error.code,[m
+[32m+[m[32m              message: error.message,[m
+[32m+[m[32m              details: error.details,[m
+[32m+[m[32m              hint: error.hint,[m
+[32m+[m[32m            },[m
+[32m+[m[32m          },[m
+[32m+[m[32m          'chunks.select for download failed',[m
+[32m+[m[32m        );[m
+[32m+[m[32m        throw new AppError(500, 'CHUNK_LOOKUP_FAILED', 'Failed to lookup chunk');[m
+[32m+[m[32m      }[m
+[32m+[m[32m      if (!data) {[m
+[32m+[m[32m        throw new AppError(404, 'CHUNK_NOT_FOUND', 'Chunk not found');[m
+[32m+[m[32m      }[m
+[32m+[m[32m      const row = data as {[m
+[32m+[m[32m        chunk_index: number;[m
+[32m+[m[32m        hash: string;[m
+[32m+[m[32m        status: 'pending' | 'uploaded' | 'failed';[m
+[32m+[m[32m        remote_reference: string | null;[m
+[32m+[m[32m      };[m
+[32m+[m
+[32m+[m[32m      if (row.status !== 'uploaded') {[m
+[32m+[m[32m        throw new AppError(409, 'CHUNK_NOT_READY', 'Chunk is not uploaded');[m
+[32m+[m[32m      }[m
+[32m+[m[32m      if (!row.remote_reference) {[m
+[32m+[m[32m        throw new AppError([m
+[32m+[m[32m          409,[m
+[32m+[m[32m          'CHUNK_NO_REMOTE_REFERENCE',[m
+[32m+[m[32m          'Chunk has no remote_reference in storage',[m
+[32m+[m[32m        );[m
+[32m+[m[32m      }[m
+[32m+[m
+[32m+[m[32m      const dest = await getDestinationWithSecretForUser(req.user.id, 'drive');[m
+[32m+[m[32m      if (!dest || !dest.refresh_token) {[m
+[32m+[m[32m        throw new AppError([m
+[32m+[m[32m          409,[m
+[32m+[m[32m          'DRIVE_NOT_CONNECTED',[m
+[32m+[m[32m          'No connected Google Drive destination for this user',[m
+[32m+[m[32m        );[m
+[32m+[m[32m      }[m
+[32m+[m
+[32m+[m[32m      const accessToken = await getAccessToken(dest.refresh_token);[m
+[32m+[m[32m      const bytes = await downloadFileBytes(accessToken, row.remote_reference);[m
+[32m+[m
+[32m+[m[32m      logger.info([m
+[32m+[m[32m        {[m
+[32m+[m[32m          op: 'chunks.download',[m
+[32m+[m[32m          sessionId,[m
+[32m+[m[32m          chunkIndex,[m
+[32m+[m[32m          size: bytes.length,[m
+[32m+[m[32m        },[m
+[32m+[m[32m        'chunk downloaded from Drive',[m
+[32m+[m[32m      );[m
+[32m+[m
+[32m+[m[32m      res.status(200);[m
+[32m+[m[32m      res.setHeader('Content-Type', 'application/octet-stream');[m
+[32m+[m[32m      res.setHeader('Content-Length', String(bytes.length));[m
+[32m+[m[32m      res.setHeader('X-Chunk-Hash', row.hash);[m
+[32m+[m[32m      res.send(bytes);[m
+[32m+[m[32m    } catch (err) {[m
+[32m+[m[32m      next(err);[m
+[32m+[m[32m    }[m
+[32m+[m[32m  },[m
+[32m+[m[32m);[m
+[32m+[m
+ router.post([m
+   '/:id/complete',[m
+   authMiddleware,[m
+[1mdiff --git a/backend/src/services/drive.service.ts b/backend/src/services/drive.service.ts[m
+[1mindex a64f64e..5142502 100644[m
+[1m--- a/backend/src/services/drive.service.ts[m
+[1m+++ b/backend/src/services/drive.service.ts[m
+[36m@@ -422,6 +422,60 @@[m [mexport interface DriveUploadResult {[m
+   size: number;[m
+ }[m
+ [m
+[32m+[m[32m/**[m
+[32m+[m[32m * Download the raw bytes of a Drive file by id.[m
+[32m+[m[32m *[m
+[32m+[m[32m * Used exclusively by the export-evidence flow: the mobile client cannot[m
+[32m+[m[32m * call Drive directly (refresh_token lives on the backend). The route[m
+[32m+[m[32m * layer (`GET /sessions/:id/chunks/:index/download`) is the single[m
+[32m+[m[32m * caller; it enforces ownership against the `chunks` table BEFORE[m
+[32m+[m[32m * invoking this function — this function itself is scope-safe only to[m
+[32m+[m[32m * the extent that the access_token's `drive.file` scope is (the app can[m
+[32m+[m[32m * only read files it created).[m
+[32m+[m[32m *[m
+[32m+[m[32m * Uses Drive's `alt=media` endpoint, which returns the binary payload[m
+[32m+[m[32m * directly (no metadata wrapper). We cap the response at[m
+[32m+[m[32m * DOWNLOAD_MAX_BYTES to defend the backend RAM against a surprise giant[m
+[32m+[m[32m * file — in practice chunks are ~16 KB, so the cap is generous headroom.[m
+[32m+[m[32m */[m
+[32m+[m[32mconst DOWNLOAD_MAX_BYTES = 25 * 1024 * 1024;[m
+[32m+[m
+[32m+[m[32mexport async function downloadFileBytes([m
+[32m+[m[32m  accessToken: string,[m
+[32m+[m[32m  fileId: string,[m
+[32m+[m[32m): Promise<Buffer> {[m
+[32m+[m[32m  const safeId = encodeURIComponent(fileId);[m
+[32m+[m[32m  const res = await fetchWithTimeout([m
+[32m+[m[32m    `${DRIVE_API_BASE}/files/${safeId}?alt=media`,[m
+[32m+[m[32m    { headers: { Authorization: `Bearer ${accessToken}` } },[m
+[32m+[m[32m  );[m
+[32m+[m[32m  if (!res.ok) {[m
+[32m+[m[32m    const detail = await res.text().catch(() => '<no body>');[m
+[32m+[m[32m    logger.warn([m
+[32m+[m[32m      {[m
+[32m+[m[32m        op: 'drive.downloadFileBytes',[m
+[32m+[m[32m        status: res.status,[m
+[32m+[m[32m        detail: detail.substring(0, 200),[m
+[32m+[m[32m      },[m
+[32m+[m[32m      'Drive download failed',[m
+[32m+[m[32m    );[m
+[32m+[m[32m    throw new AppError([m
+[32m+[m[32m      502,[m
+[32m+[m[32m      'DRIVE_DOWNLOAD_FAILED',[m
+[32m+[m[32m      `Drive download failed (${res.status})`,[m
+[32m+[m[32m    );[m
+[32m+[m[32m  }[m
+[32m+[m[32m  const arrayBuffer = await res.arrayBuffer();[m
+[32m+[m[32m  if (arrayBuffer.byteLength > DOWNLOAD_MAX_BYTES) {[m
+[32m+[m[32m    throw new AppError([m
+[32m+[m[32m      502,[m
+[32m+[m[32m      'DRIVE_DOWNLOAD_TOO_LARGE',[m
+[32m+[m[32m      `Drive download exceeded limit (${arrayBuffer.byteLength} bytes)`,[m
+[32m+[m[32m    );[m
+[32m+[m[32m  }[m
+[32m+[m[32m  return Buffer.from(arrayBuffer);[m
+[32m+[m[32m}[m
+[32m+[m
+ /**[m
+  * Upload `content` to Drive under `folderId` as `fileName` using the[m
+  * simple multipart upload path (Drive's "one shot" upload, suitable for[m
+[1mdiff --git a/docs/IMPLEMENTATION_STATUS.md b/docs/IMPLEMENTATION_STATUS.md[m
+[1mindex 837e3d3..0cd5cbe 100644[m
+[1m--- a/docs/IMPLEMENTATION_STATUS.md[m
+[1m+++ b/docs/IMPLEMENTATION_STATUS.md[m
+[36m@@ -16,7 +16,8 @@[m [mThe MVP currently supports:[m
+ - Recovery after device reboot[m
+ - Session completion[m
+ - Local cleanup after success[m
+[32m+[m[32m- Evidence export from a given session (download chunks via backend proxy, verify sha256, concatenate in order, write .m4a to documentDirectory, produce partial result when some chunks are missing/corrupt)[m
+ [m
+ ## Current validated criterion[m
+ [m
+[31m-The system can record, generate chunks, upload them to Drive, recover pending chunks after failure, complete the session and clean local state.[m
+\ No newline at end of file[m
+[32m+[m[32mThe system can record, generate chunks, upload them to Drive, recover pending chunks after failure, complete the session, clean local state, and export the session's evidence back as a single .m4a file from the recorded chunks.[m
+\ No newline at end of file[m
+[1mdiff --git a/docs/KNOWN_DEBT.md b/docs/KNOWN_DEBT.md[m
+[1mindex fdd3130..5658b92 100644[m
+[1m--- a/docs/KNOWN_DEBT.md[m
+[1m+++ b/docs/KNOWN_DEBT.md[m
+[36m@@ -6,4 +6,7 @@[m
+ - Backend proxy Drive upload is acceptable for MVP, but should be reviewed before production.[m
+ - expo-av is deprecated and should later migrate to expo-audio / expo-video.[m
+ - Existing failing tests need review after the recovery flow is stabilized.[m
+[31m-- Logs should be reduced before release.[m
+\ No newline at end of file[m
+[32m+[m[32m- Logs should be reduced before release.[m
+[32m+[m[32m- Export flow has no entry point from the home screen yet (reachable only via direct route `/session/:id`). A Historial brick should list past sessions and link in (see `TODO(export-history)`).[m
+[32m+[m[32m- Export accumulates the full session bytes in memory before writing. Acceptable for MVP-size recordings but will OOM on large files — switch to an incremental append (see `TODO(export-large)`).[m
+[32m+[m[32m- A partial export missing the last chunk loses the MP4 `moov` atom and the resulting .m4a is generally unplayable. File is still produced as forensic output; moov-patching is out of scope (see `TODO(export-headerless-partial)`).[m
+\ No newline at end of file[m
+[1mdiff --git a/mobile/android/app/src/main/res/mipmap-hdpi/ic_launcher.webp b/mobile/android/app/src/main/res/mipmap-hdpi/ic_launcher.webp[m
+[1mindex a2f5908..da81d76 100644[m
+Binary files a/mobile/android/app/src/main/res/mipmap-hdpi/ic_launcher.webp and b/mobile/android/app/src/main/res/mipmap-hdpi/ic_launcher.webp differ
+[1mdiff --git a/mobile/android/app/src/main/res/mipmap-hdpi/ic_launcher_round.webp b/mobile/android/app/src/main/res/mipmap-hdpi/ic_launcher_round.webp[m
+[1mindex 1b52399..367c683 100644[m
+Binary files a/mobile/android/app/src/main/res/mipmap-hdpi/ic_launcher_round.webp and b/mobile/android/app/src/main/res/mipmap-hdpi/ic_launcher_round.webp differ
+[1mdiff --git a/mobile/android/app/src/main/res/mipmap-mdpi/ic_launcher.webp b/mobile/android/app/src/main/res/mipmap-mdpi/ic_launcher.webp[m
+[1mindex ff10afd..8195782 100644[m
+Binary files a/mobile/android/app/src/main/res/mipmap-mdpi/ic_launcher.webp and b/mobile/android/app/src/main/res/mipmap-mdpi/ic_launcher.webp differ
+[1mdiff --git a/mobile/android/app/src/main/res/mipmap-mdpi/ic_launcher_round.webp b/mobile/android/app/src/main/res/mipmap-mdpi/ic_launcher_round.webp[m
+[1mindex 115a4c7..3318a00 100644[m
+Binary files a/mobile/android/app/src/main/res/mipmap-mdpi/ic_launcher_round.webp and b/mobile/android/app/src/main/res/mipmap-mdpi/ic_launcher_round.webp differ
+[1mdiff --git a/mobile/android/app/src/main/res/mipmap-xhdpi/ic_launcher.webp b/mobile/android/app/src/main/res/mipmap-xhdpi/ic_launcher.webp[m
+[1mindex dcd3cd8..372b82b 100644[m
+Binary files a/mobile/android/app/src/main/res/mipmap-xhdpi/ic_launcher.webp and b/mobile/android/app/src/main/res/mipmap-xhdpi/ic_launcher.webp differ
+[1mdiff --git a/mobile/android/app/src/main/res/mipmap-xhdpi/ic_launcher_round.webp b/mobile/android/app/src/main/res/mipmap-xhdpi/ic_launcher_round.webp[m
+[1mindex 459ca60..89d5219 100644[m
+Binary files a/mobile/android/app/src/main/res/mipmap-xhdpi/ic_launcher_round.webp and b/mobile/android/app/src/main/res/mipmap-xhdpi/ic_launcher_round.webp differ
+[1mdiff --git a/mobile/android/app/src/main/res/mipmap-xxhdpi/ic_launcher.webp b/mobile/android/app/src/main/res/mipmap-xxhdpi/ic_launcher.webp[m
+[1mindex 8ca12fe..95b785c 100644[m
+Binary files a/mobile/android/app/src/main/res/mipmap-xxhdpi/ic_launcher.webp and b/mobile/android/app/src/main/res/mipmap-xxhdpi/ic_launcher.webp differ
+[1mdiff --git a/mobile/android/app/src/main/res/mipmap-xxhdpi/ic_launcher_round.webp b/mobile/android/app/src/main/res/mipmap-xxhdpi/ic_launcher_round.webp[m
+[1mindex 8e19b41..3809ab0 100644[m
+Binary files a/mobile/android/app/src/main/res/mipmap-xxhdpi/ic_launcher_round.webp and b/mobile/android/app/src/main/res/mipmap-xxhdpi/ic_launcher_round.webp differ
+[1mdiff --git a/mobile/android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.webp b/mobile/android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.webp[m
+[1mindex b824ebd..5265b8d 100644[m
+Binary files a/mobile/android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.webp and b/mobile/android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.webp differ
+[1mdiff --git a/mobile/android/app/src/main/res/mipmap-xxxhdpi/ic_launcher_round.webp b/mobile/android/app/src/main/res/mipmap-xxxhdpi/ic_launcher_round.webp[m
+[1mindex 4c19a13..abd8b07 100644[m
+Binary files a/mobile/android/app/src/main/res/mipmap-xxxhdpi/ic_launcher_round.webp and b/mobile/android/app/src/main/res/mipmap-xxxhdpi/ic_launcher_round.webp differ
+[1mdiff --git a/mobile/android/app/src/main/res/values/colors.xml b/mobile/android/app/src/main/res/values/colors.xml[m
+[1mindex a890727..8ed3fc2 100644[m
+[1m--- a/mobile/android/app/src/main/res/values/colors.xml[m
+[1m+++ b/mobile/android/app/src/main/res/values/colors.xml[m
+[36m@@ -1,5 +1,6 @@[m
+ <resources>[m
+   <color name="splashscreen_background">#FFFFFF</color>[m
+[32m+[m[32m  <color name="iconBackground">#000000</color>[m
+   <color name="colorPrimary">#023c69</color>[m
+   <color name="colorPrimaryDark">#ffffff</color>[m
+ </resources>[m
+\ No newline at end of file[m
+[1mdiff --git a/mobile/app.config.ts b/mobile/app.config.ts[m
+[1mindex bd703b3..de484d9 100644[m
+[1m--- a/mobile/app.config.ts[m
+[1m+++ b/mobile/app.config.ts[m
+[36m@@ -19,12 +19,17 @@[m [mexport default ({ config }: ConfigContext): ExpoConfig => ({[m
+   orientation: 'portrait',[m
+   userInterfaceStyle: 'automatic',[m
+   newArchEnabled: true,[m
+[32m+[m[32m  icon: './assets/foreground.png',[m
+   ios: {[m
+     supportsTablet: false,[m
+     bundleIdentifier: 'com.guardiancloud.app',[m
+   },[m
+   android: {[m
+     package: 'com.guardiancloud.app',[m
+[32m+[m[32m    adaptiveIcon: {[m
+[32m+[m[32m      foregroundImage: './assets/foreground.png',[m
+[32m+[m[32m      backgroundColor: '#000000',[m
+[32m+[m[32m    },[m
+   },[m
+   plugins: [[m
+     'expo-router',[m
+[1mdiff --git a/mobile/app/index.tsx b/mobile/app/index.tsx[m
+[1mindex a39482f..6682a25 100644[m
+[1m--- a/mobile/app/index.tsx[m
+[1m+++ b/mobile/app/index.tsx[m
+[36m@@ -12,7 +12,8 @@[m [mimport {[m
+   uploadChunkBytes,[m
+   type PublicDestination,[m
+ } from '@/api/destinations';[m
+[31m-import { useAuthStore } from '@/auth/store';[m
+[32m+[m[32mimport { ApiError } from '@/api/client';[m
+[32m+[m[32mimport { useAuthStore, getFreshAccessToken } from '@/auth/store';[m
+ [m
+ /**[m
+  * Real-audio + real-network-failure recovery test.[m
+[36m@@ -41,6 +42,17 @@[m [mimport { useAuthStore } from '@/auth/store';[m
+  */[m
+ [m
+ const PENDING_RETRY_KEY = 'test.pending_retry';[m
+[32m+[m
+[32m+[m[32m/**[m
+[32m+[m[32m * Last known session_id on this device. Persisted as a side observation[m
+[32m+[m[32m * (never read by the upload pipeline, never gates recovery) purely so the[m
+[32m+[m[32m * Settings screen can offer a "Exportar última sesión" shortcut without[m
+[32m+[m[32m * maintaining a full session history yet.[m
+[32m+[m[32m *[m
+[32m+[m[32m * Unlike PENDING_RETRY_KEY, this key is NEVER cleared on completion — it[m
+[32m+[m[32m * always points to the most recent session_id the app was aware of.[m
+[32m+[m[32m */[m
+[32m+[m[32mconst LAST_SESSION_ID_KEY = 'export.last_session_id';[m
+ /**[m
+  * DEBUG-only toggle for the multi-chunk recovery test.[m
+  *[m
+[36m@@ -89,6 +101,24 @@[m [mconst DEBUG_DUPLICATE_SUBMISSION = false;[m
+  */[m
+ const DEBUG_DELAY_BEFORE_COMPLETE_MS = 0;[m
+ [m
+[32m+[m[32m/**[m
+[32m+[m[32m * Verbose queue/worker tracing for diagnostics.[m
+[32m+[m[32m *[m
+[32m+[m[32m *   true  → Emit GC_DEBUG lines covering every drain-loop iteration,[m
+[32m+[m[32m *           queueAppendChunk save, pic
