@@ -145,12 +145,17 @@ const DRIVE_CHUNK_UPLOAD_ENABLED = true;
 
 // Audio chunk size is unchanged from the pre-video baseline (16 KB) — the
 // audio pipeline is "fully stable" per the project doc and any change to
-// this constant is out of scope. Video uses a much larger chunk because a
-// 3–5 MB recording at 16 KB produces ~80–100 chunks → too many requests
-// and a bad "Subiendo evidencia 4/98" UX. Mode-pick happens in the chunker
-// only; queue/worker/retry/recovery shapes are untouched.
+// this constant is out of scope. Video uses a larger chunk because a 3–5
+// MB recording at 16 KB produces ~80–100 chunks → too many requests and a
+// bad "Subiendo evidencia 4/98" UX. The video size is capped at 64 KB:
+// 256 KB caused "Row too big to fit into CursorWindow" on AsyncStorage
+// reads and OOM on FileSystem.readAsStringAsync (base64 expansion blows
+// the heap). 64 KB lands ~50–80 chunks for a typical clip — not ideal but
+// the only safe value until the queue moves off AsyncStorage. Mode-pick
+// happens in the chunker only; queue/worker/retry/recovery shapes are
+// untouched.
 const CHUNK_SIZE_AUDIO = 16 * 1024;
-const CHUNK_SIZE_VIDEO = 256 * 1024;
+const CHUNK_SIZE_VIDEO = 64 * 1024;
 const CHUNK_SIZE_BASE64_AUDIO =
   Math.ceil(Math.ceil((CHUNK_SIZE_AUDIO * 4) / 3) / 4) * 4;
 const CHUNK_SIZE_BASE64_VIDEO =
