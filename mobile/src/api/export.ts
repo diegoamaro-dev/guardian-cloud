@@ -37,6 +37,7 @@ import * as Crypto from 'expo-crypto';
 import { env } from '@/config/env';
 import { getFreshAccessToken } from '@/auth/store';
 import { apiFetch, ApiError } from './client';
+import { type SessionMode } from './history';
 
 /**
  * DEBUG-only: simulate a corrupted download for the chunk whose
@@ -234,8 +235,21 @@ export async function verifyHash(
 export async function exportSession(
   sessionId: string,
   onProgress?: (p: ExportProgress) => void,
+  /**
+   * Optional recording mode. When 'video', the output extension is forced
+   * to '.mp4' regardless of what the byte-sniff would say (an MP4 video
+   * starts with `ftyp`, which the sniff classifies as `.m4a` — wrong for
+   * video). When 'audio' or undefined the existing sniff runs unchanged
+   * (audio sessions are AAC ADTS or legacy MP4-audio; both are correctly
+   * classified by `hasAacSync` / `hasFtyp`).
+   *
+   * Optional so existing audio-only callers do not need to change. The
+   * caller (session detail screen) reads the mode from the local history
+   * index, which records `mode` per session at creation time.
+   */
+  mode?: SessionMode,
 ): Promise<ExportResult> {
-  console.log('EXPORT START', { sessionId });
+  console.log('EXPORT START', { sessionId, mode });
 
   let chunks: ChunkMeta[];
   try {
@@ -415,29 +429,44 @@ export async function exportSession(
     // modern `FileSystem.File.write` stream API) when sessions get bigger.
     const fullBytes = concatBytes(accumulated);
 
-    // Decide the output extension from the first bytes of the concat.
-    // MP4/M4A: 'ftyp' FourCC lives at offset 4 (box-type of the first
-    //          MP4 box; strict location, not just "contains ftyp").
-    // AAC ADTS: every frame starts with sync word 0xFFF in bits 0-11 of
-    //          the first two bytes; bits 13-14 (layer) must be 0. The
-    //          mask `(byte[1] & 0xF6) === 0xF0` checks both sync low
-    //          nibble and the two zero layer bits.
-    // Neither → '.bin' forensic dump, keeps the concat visible on disk.
-    const hasFtyp =
-      fullBytes.length >= 8 &&
-      fullBytes[4] === 0x66 &&
-      fullBytes[5] === 0x74 &&
-      fullBytes[6] === 0x79 &&
-      fullBytes[7] === 0x70;
-    const hasAacSync =
-      fullBytes.length >= 2 &&
-      fullBytes[0] === 0xff &&
-      ((fullBytes[1] ?? 0) & 0xf6) === 0xf0;
-    const extension = hasFtyp ? '.m4a' : hasAacSync ? '.aac' : '.bin';
+    // Decide the output extension. Two paths:
+    //
+    // (1) Video override: when the caller has told us this is a video
+    //     session, force '.mp4'. The byte-sniff cannot distinguish video
+    //     MP4 from audio M4A (both start with `ftyp`) and would otherwise
+    //     misclassify video as `.m4a`. Mode is the authoritative signal
+    //     for the container format; the sniff is only a fallback for when
+    //     the caller does not supply it.
+    //
+    // (2) Sniff fallback (audio path, unchanged from pre-video baseline):
+    //     - MP4/M4A: 'ftyp' FourCC at offset 4 (strict box-type position).
+    //     - AAC ADTS: sync word 0xFFF in bits 0-11 of the first two bytes;
+    //                 the mask `(byte[1] & 0xF6) === 0xF0` also asserts
+    //                 the two zero layer bits.
+    //     - Neither → '.bin' forensic dump, keeps the concat visible.
+    let extension: string;
+    let hasFtyp = false;
+    let hasAacSync = false;
+    if (mode === 'video') {
+      extension = '.mp4';
+    } else {
+      hasFtyp =
+        fullBytes.length >= 8 &&
+        fullBytes[4] === 0x66 &&
+        fullBytes[5] === 0x74 &&
+        fullBytes[6] === 0x79 &&
+        fullBytes[7] === 0x70;
+      hasAacSync =
+        fullBytes.length >= 2 &&
+        fullBytes[0] === 0xff &&
+        ((fullBytes[1] ?? 0) & 0xf6) === 0xf0;
+      extension = hasFtyp ? '.m4a' : hasAacSync ? '.aac' : '.bin';
+    }
     filePath = `${docDir}guardian_export_${sessionId}${extension}`;
     console.log('EXPORT EXT SNIFF', {
       sessionId,
       extension,
+      mode,
       hasFtyp,
       hasAacSync,
     });

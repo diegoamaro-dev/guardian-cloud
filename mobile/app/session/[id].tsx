@@ -32,8 +32,10 @@ import {
   type ExportResult,
 } from '@/api/export';
 import {
+  type SessionMode,
   type SessionStatusSummary,
   deriveSessionStatus,
+  readHistory,
 } from '@/api/history';
 
 async function handleShare(filePath: string) {
@@ -99,9 +101,26 @@ export default function SessionDetailScreen() {
     if (!sessionId) return;
     setPhase({ kind: 'running', progress: null });
     try {
-      const result = await exportSession(sessionId, (progress) => {
-        setPhase({ kind: 'running', progress });
-      });
+      // Look up this session's recording mode from the local history
+      // index so `exportSession` can pick the correct extension. Only
+      // 'video' has a behavioural effect inside `exportSession` (forces
+      // '.mp4'); 'audio' and undefined both keep the sniff path. Any
+      // failure to read history is treated as undefined → audio sniff.
+      let mode: SessionMode | undefined;
+      try {
+        const list = await readHistory();
+        const entry = list.find((e) => e.session_id === sessionId);
+        mode = entry?.mode;
+      } catch {
+        mode = undefined;
+      }
+      const result = await exportSession(
+        sessionId,
+        (progress) => {
+          setPhase({ kind: 'running', progress });
+        },
+        mode,
+      );
       setPhase({ kind: 'done', result });
     } catch (err) {
       // `exportSession` is supposed to never throw, but we defend in
