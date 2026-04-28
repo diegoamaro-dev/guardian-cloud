@@ -2003,10 +2003,19 @@ export default function Index() {
    */
   const [uploadedCount, setUploadedCount] = useState(0);
   const [totalCount, setTotalCount] = useState(0);
+  /**
+   * Chunks still in motion: status='pending' (waiting for the worker)
+   * or status='uploading' (in flight). Drives the "Subiendo evidencia"
+   * gate so a session that is fully settled — every chunk is `uploaded`
+   * or terminally `failed` — does NOT keep the banner up while
+   * `tryFinalizeReadySessions` works through `completeSession`.
+   */
+  const [activeCount, setActiveCount] = useState(0);
 
   function resetProgress() {
     setUploadedCount(0);
     setTotalCount(0);
+    setActiveCount(0);
   }
 
   async function refreshDestination() {
@@ -2115,6 +2124,45 @@ export default function Index() {
           }
         } catch (err) {
           console.log('GC_QUEUE normalize failed', err);
+        }
+
+        // Mid-upload recovery normalisation. At app open `chunkerStates`
+        // is empty (it is in-memory, rebuilt only on a fresh GRABAR), so
+        // any persisted entry belongs to a session that is no longer
+        // being recorded. Two stuck-state fixes that without this would
+        // leave the worker spinning forever after the last upload:
+        //   1. status='uploading' chunks were already in flight when the
+        //      previous run died. `pickNext` filters strictly on
+        //      status='pending', so without this reset the drain never
+        //      retries them — UI stays at "Subiendo evidencia (N-1 / N)".
+        //   2. recording_closed=false on a recovered entry blocks
+        //      `tryFinalizeReadySessions`. Even after every chunk lands,
+        //      the session never completes and the entry is never reaped.
+        try {
+          let stuckUploading = 0;
+          let entriesClosed = 0;
+          await queueMutate(q => {
+            for (const e of q) {
+              if (!e.recording_closed) {
+                e.recording_closed = true;
+                entriesClosed += 1;
+              }
+              for (const c of e.chunks) {
+                if (c.status === 'uploading') {
+                  c.status = 'pending';
+                  stuckUploading += 1;
+                }
+              }
+            }
+          });
+          if (stuckUploading > 0 || entriesClosed > 0) {
+            console.log('GC_QUEUE recovery finalize-prep', {
+              stuck_uploading_reset: stuckUploading,
+              entries_marked_closed: entriesClosed,
+            });
+          }
+        } catch (err) {
+          console.log('GC_QUEUE recovery finalize-prep failed', err);
         }
 
         // Reap entries that already finished (session_completed=true,
@@ -2580,13 +2628,18 @@ export default function Index() {
         const q = await queueRead();
         let total = 0;
         let uploaded = 0;
+        let active = 0;
         for (const e of q) {
           total += e.chunks.length;
-          uploaded += e.chunks.filter(c => c.status === 'uploaded').length;
+          for (const c of e.chunks) {
+            if (c.status === 'uploaded') uploaded += 1;
+            else if (c.status === 'pending' || c.status === 'uploading') active += 1;
+          }
         }
         if (!cancelled) {
           setTotalCount(total);
           setUploadedCount(uploaded);
+          setActiveCount(active);
           if (total > 0 && uploaded === total) {
             setTestStatus(prev =>
               prev !== null &&
@@ -2614,7 +2667,12 @@ export default function Index() {
   // upload work dominates "Listo"; only with an empty/settled queue do
   // we show "Listo". This guarantees "Listo" can never coexist with a
   // visible "Subiendo evidencia (X/Y)" — the contradiction the user saw.
-  const hasPendingUploads = totalCount > 0 && uploadedCount < totalCount;
+  // Gate on the IN-MOTION count, not on uploaded < total. Once every
+  // chunk has reached a terminal status (uploaded or failed), the banner
+  // must come down even if the entry has not yet been reaped — a
+  // permanently-failed chunk would otherwise leave uploaded < total
+  // forever, freezing the "Subiendo evidencia (X / Y)" line.
+  const hasPendingUploads = totalCount > 0 && activeCount > 0;
   const phaseLabel = isRecording
     ? 'Grabando'
     : hasPendingUploads
