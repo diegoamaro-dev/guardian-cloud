@@ -38,7 +38,14 @@ import {
   readHistory,
 } from '@/api/history';
 
+// Single-flight lock for `Sharing.shareAsync`. Native iOS/Android
+// rejects a second share request while one is mid-flight with
+// "Another share request is being processed now"; the lock turns a
+// double-tap into a no-op instead of a console error.
+let isSharing = false;
 async function handleShare(filePath: string) {
+  if (isSharing) return;
+  isSharing = true;
   try {
     const available = await Sharing.isAvailableAsync();
     if (!available) return;
@@ -46,6 +53,8 @@ async function handleShare(filePath: string) {
     await Sharing.shareAsync(filePath);
   } catch (e) {
     console.log('SHARE ERROR', e);
+  } finally {
+    isSharing = false;
   }
 }
 
@@ -291,6 +300,16 @@ function ResultBlock({ result }: { result: ExportResult }) {
     const firstChunkAffected =
       result.missingIndexes.includes(0) || result.corruptIndexes.includes(0);
     const isBinFile = result.filePath?.endsWith('.bin') ?? false;
+    // Video MP4 with any gap is unplayable — the moov atom and the
+    // continuous mdat byte stream both require every chunk_index in
+    // 0..lastIndex. Block the share button in this case so the user
+    // does not hand over a file no media player can open. The audio
+    // (.aac / .m4a) and forensic (.bin) branches keep their existing
+    // share behaviour.
+    const isMp4File = result.filePath?.endsWith('.mp4') ?? false;
+    const hasGaps =
+      result.missingIndexes.length > 0 || result.corruptIndexes.length > 0;
+    const isPartialMp4 = isMp4File && hasGaps;
 
     return (
       <View
@@ -331,26 +350,46 @@ function ResultBlock({ result }: { result: ExportResult }) {
           </View>
         )}
 
-        {result.filePath && (
-          <Pressable
-            onPress={() => handleShare(result.filePath as string)}
+        {isPartialMp4 ? (
+          <View
             style={{
               marginTop: 10,
-              paddingVertical: 10,
-              paddingHorizontal: 14,
+              padding: 10,
               borderWidth: 1,
-              borderColor: '#30363d',
-              borderRadius: 6,
-              backgroundColor: '#161b22',
-              alignItems: 'center',
+              borderColor: '#f85149',
+              borderRadius: 4,
+              backgroundColor: '#3d1518',
             }}
           >
             <Text
-              style={{ color: '#c9d1d9', fontSize: 13, fontWeight: '500' }}
+              style={{ color: '#f85149', fontSize: 12, fontWeight: '600' }}
             >
-              Compartir archivo
+              Exportación parcial no reproducible. El vídeo tiene huecos y
+              ningún reproductor podrá abrirlo. No se ofrece compartir.
             </Text>
-          </Pressable>
+          </View>
+        ) : (
+          result.filePath && (
+            <Pressable
+              onPress={() => handleShare(result.filePath as string)}
+              style={{
+                marginTop: 10,
+                paddingVertical: 10,
+                paddingHorizontal: 14,
+                borderWidth: 1,
+                borderColor: '#30363d',
+                borderRadius: 6,
+                backgroundColor: '#161b22',
+                alignItems: 'center',
+              }}
+            >
+              <Text
+                style={{ color: '#c9d1d9', fontSize: 13, fontWeight: '500' }}
+              >
+                Compartir archivo
+              </Text>
+            </Pressable>
+          )
         )}
 
         {/* Qualitative advisory: extension sniff fell back to .bin —

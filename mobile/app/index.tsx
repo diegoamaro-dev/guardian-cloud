@@ -1198,10 +1198,46 @@ async function tryFinalizeReadySessions(): Promise<boolean> {
   let anyFinalized = false;
   for (const entry of queue) {
     if (!entry.recording_closed) continue;
-    const allSettled = entry.chunks.every(
-      c => c.status === 'uploaded' || c.status === 'failed',
+
+    // Skip if anything is still in motion — the worker will process
+    // those and we will re-evaluate on the next drain pass.
+    const anyInMotion = entry.chunks.some(
+      c => c.status === 'pending' || c.status === 'uploading',
     );
-    if (!allSettled) continue;
+    if (anyInMotion) continue;
+
+    // Completion gate. The previous logic accepted `failed` chunks as
+    // "settled" and called completeSession with gaps in Drive — the
+    // backend then marked the session done while chunks 2..8 (or any
+    // permanently-failed range) were missing, producing partial,
+    // unplayable exports. The gate now requires every chunk_index in
+    // 0..next_chunk_index-1 to be `status='uploaded'` AND carry a
+    // truthy `remote_reference`. Missing indexes block completion;
+    // the entry stays in the queue (no reap, no completeSession call)
+    // for the user to resolve manually.
+    const expectedChunks = entry.next_chunk_index;
+    const uploadedIndexes = new Set(
+      entry.chunks
+        .filter(c => c.status === 'uploaded' && !!c.remote_reference)
+        .map(c => c.chunk_index),
+    );
+    const missingUploadedIndexes: number[] = [];
+    for (let i = 0; i < expectedChunks; i++) {
+      if (!uploadedIndexes.has(i)) missingUploadedIndexes.push(i);
+    }
+    console.log('GC_QUEUE completion gate', {
+      sessionId: entry.session_id,
+      expectedChunks,
+      uploadedChunks: uploadedIndexes.size,
+      missingUploadedIndexes,
+    });
+    if (missingUploadedIndexes.length > 0) {
+      // Do NOT call completeSession. Keeping the session row as `active`
+      // on the backend is the correct outcome — anything else would
+      // mark a session "complete" with permanent gaps.
+      continue;
+    }
+
     if (entry.session_completed) {
       await reapEntry(entry.session_id, entry.uri);
       anyFinalized = true;
