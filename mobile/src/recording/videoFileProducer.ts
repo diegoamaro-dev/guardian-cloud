@@ -2,10 +2,19 @@ import * as FileSystem from 'expo-file-system';
 
 import type { ChunkPayload, ChunkProducer } from './chunkProducer';
 
-/** Same byte size as `CHUNK_SIZE_AUDIO` in app/index.tsx. */
-const VIDEO_FILE_CHUNK_SIZE_BYTES = 16 * 1024;
+/**
+ * Video post-stop chunk size. Audio chunks are 16 KB because the
+ * real-time chunker emits ~12 KB/s at 64 kbps and a 1.5s tick — anything
+ * larger forces multi-tick latency. Video has no such cadence: chunking
+ * is a single post-stop pass, and a 16 KB cap on a typical 21 MB MP4
+ * yields ~1300 chunks (HTTP fan-out hell — UI appeared stuck at 5/100
+ * because each Drive upload is a full round-trip). 256 KB brings a 21 MB
+ * recording down to ~84 chunks while reusing the same queue/upload
+ * pipeline. Audio is intentionally untouched.
+ */
+const VIDEO_FILE_CHUNK_SIZE_BYTES = 256 * 1024;
 
-/** Same base64-char derivation as `CHUNK_SIZE_BASE64_AUDIO`. */
+/** Base64-char count derived from the byte size — same formula audio uses. */
 const VIDEO_FILE_CHUNK_SIZE_BASE64 =
   Math.ceil(Math.ceil((VIDEO_FILE_CHUNK_SIZE_BYTES * 4) / 3) / 4) * 4;
 
