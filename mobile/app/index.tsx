@@ -468,6 +468,19 @@ interface PendingQueueEntry {
 const CHUNK_TICK_MS = 1500;
 /** Cap retries for completeSession so a permanently-broken session does not hold a queue entry forever. */
 const MAX_COMPLETE_ATTEMPTS = 5;
+/**
+ * Outer per-chunk upload timeout. `uploadChunkBytes` already has a 30s
+ * AbortController internally, but a chunk can stuck in 'uploading' for
+ * other reasons (postChunk has no timeout, AsyncStorage stalls, JS
+ * bridge hangs, AbortController not respected on a particular RN
+ * version). This is the belt-and-suspenders cap: if the entire
+ * uploadChunkBytes → postChunk → queueUpdateChunk('uploaded') sequence
+ * doesn't complete within this window, we fire a synthetic transient
+ * error so the existing catch path resets the chunk to 'pending' with
+ * backoff. Without this, a hung HTTP write was leaving 1/N chunks in
+ * 'uploading' forever and freezing the completion gate at N-1/N.
+ */
+const CHUNK_UPLOAD_TIMEOUT_MS = 60_000;
 
 // ----- queue state (module-scope so it survives re-renders) -----
 
@@ -1113,46 +1126,78 @@ async function uploadDrainLoop(): Promise<void> {
         sessionId,
         chunk_index: chunk.chunk_index,
       });
+
+      // Outer per-chunk timeout. Wraps the entire upload attempt
+      // (uploadChunkBytes + postChunk + queueUpdateChunk('uploaded')) so
+      // a hang in any of those layers cannot leave the chunk in
+      // 'uploading' forever. The synthetic Error('CHUNK_UPLOAD_TIMEOUT')
+      // is a non-ApiError throw, which `classifyError` maps to
+      // 'transient' — the existing catch branch then resets the chunk
+      // to 'pending' with attempts++ and backoff. Backend dedup means a
+      // double-upload (timer fired but original eventually completed)
+      // is harmless.
+      const uploadStartedAt = Date.now();
+      let stuckTimer: ReturnType<typeof setTimeout> | null = null;
       try {
-        if (DEBUG_QUEUE) {
-          console.log('GC_DEBUG before uploadChunkBytes', {
+        const uploadAttempt = (async () => {
+          if (DEBUG_QUEUE) {
+            console.log('GC_DEBUG before uploadChunkBytes', {
+              sessionId,
+              chunk_index: chunk.chunk_index,
+            });
+          }
+          const drive = await uploadChunkBytes(
             sessionId,
-            chunk_index: chunk.chunk_index,
+            chunk.chunk_index,
+            chunk.hash,
+            rehydratedSlice,
+          );
+          if (DEBUG_QUEUE) {
+            console.log('GC_DEBUG after uploadChunkBytes', {
+              sessionId,
+              chunk_index: chunk.chunk_index,
+              remote_reference: drive.remote_reference,
+            });
+          }
+          const token = await getFreshAccessToken();
+          if (!token) throw new ApiError(401, 'NO_TOKEN', 'No access token in store', null);
+          await postChunk(
+            token,
+            sessionId,
+            { chunk_index: chunk.chunk_index, hash: chunk.hash, size: chunk.size },
+            'uploaded',
+            drive.remote_reference,
+          );
+          await queueUpdateChunk(sessionId, chunk.chunk_index, {
+            status: 'uploaded',
+            base64Slice: undefined,           // poda
+            remote_reference: drive.remote_reference,
+            last_error: undefined,
           });
-        }
-        const drive = await uploadChunkBytes(
-          sessionId,
-          chunk.chunk_index,
-          chunk.hash,
-          rehydratedSlice,
-        );
-        if (DEBUG_QUEUE) {
-          console.log('GC_DEBUG after uploadChunkBytes', {
+          console.log('GC_QUEUE chunk uploaded', {
             sessionId,
             chunk_index: chunk.chunk_index,
             remote_reference: drive.remote_reference,
           });
-        }
-        const token = await getFreshAccessToken();
-        if (!token) throw new ApiError(401, 'NO_TOKEN', 'No access token in store', null);
-        await postChunk(
-          token,
-          sessionId,
-          { chunk_index: chunk.chunk_index, hash: chunk.hash, size: chunk.size },
-          'uploaded',
-          drive.remote_reference,
-        );
-        await queueUpdateChunk(sessionId, chunk.chunk_index, {
-          status: 'uploaded',
-          base64Slice: undefined,           // poda
-          remote_reference: drive.remote_reference,
-          last_error: undefined,
+        })();
+        // Suppress unhandled-rejection if the timer wins and the upload
+        // eventually rejects after the catch has already moved on.
+        // Promise.race below is what propagates the rejection while the
+        // race is still pending.
+        uploadAttempt.catch(() => {});
+
+        const stuckSentinel = new Promise<never>((_, reject) => {
+          stuckTimer = setTimeout(() => {
+            console.log('GC_QUEUE upload stuck detected', {
+              sessionId,
+              chunk_index: chunk.chunk_index,
+              ageMs: Date.now() - uploadStartedAt,
+            });
+            reject(new Error('CHUNK_UPLOAD_TIMEOUT'));
+          }, CHUNK_UPLOAD_TIMEOUT_MS);
         });
-        console.log('GC_QUEUE chunk uploaded', {
-          sessionId,
-          chunk_index: chunk.chunk_index,
-          remote_reference: drive.remote_reference,
-        });
+
+        await Promise.race([uploadAttempt, stuckSentinel]);
       } catch (err) {
         const decision = classifyError(err);
         if (decision === 'permanent') {
@@ -1182,6 +1227,8 @@ async function uploadDrainLoop(): Promise<void> {
           });
           await sleep(backoff);
         }
+      } finally {
+        if (stuckTimer !== null) clearTimeout(stuckTimer);
       }
     }
   } finally {
