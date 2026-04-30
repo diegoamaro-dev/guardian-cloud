@@ -497,26 +497,28 @@ async function queueMutate<T>(
       try {
         raw = await AsyncStorage.getItem(PENDING_RETRY_KEY);
       } catch (err) {
-        // Android SQLite CursorWindow has a per-row hard limit (~2 MB on
-        // stock devices). When a session entry's accumulated, un-pruned
-        // base64Slices push the queue value past that limit, every
-        // subsequent getItem throws and the worker spins on poll
-        // errors. Recover by resetting the queue and continuing with an
-        // empty one — chunks already on Drive remain on Drive (export
-        // reads from there, not from this queue), so the user-visible
-        // damage is bounded to the in-flight session.
+        // Android SQLite CursorWindow has a per-row hard limit (~2 MB
+        // on stock devices). If an active session's accumulated,
+        // un-pruned base64Slices push the queue value past that limit,
+        // every subsequent getItem throws.
+        //
+        // We log the corruption signal and SURFACE the error (re-throw)
+        // — we do NOT auto-clear the queue. A previous version cleared
+        // PENDING_RETRY_KEY here; that destroyed evidence mid-emission
+        // (chunks 0..K already on disk, chunk K+1 trips the limit, and
+        // the clear wiped the entry — subsequent queueAppendChunk calls
+        // silently no-oped because `e = q.find(...)` returned undefined,
+        // leaving `next_chunk_index = 0` even after 58 chunks emitted).
+        //
+        // Failing safely is better than corrupting the in-flight
+        // session. Surgical "clear only the broken entry" recovery is
+        // a future task — for MVP, the size guard in
+        // VideoFileChunkProducer is the primary defence.
         const msg = err instanceof Error ? err.message : String(err);
         if (msg.includes('Row too big') || msg.includes('CursorWindow')) {
           console.log('GC_QUEUE_CORRUPT_TOO_LARGE', { err: msg });
-          try {
-            await AsyncStorage.removeItem(PENDING_RETRY_KEY);
-          } catch (rmErr) {
-            console.log('GC_QUEUE corrupt reset failed', rmErr);
-          }
-          raw = null;
-        } else {
-          throw err;
         }
+        throw err;
       }
       let queue: PendingQueueEntry[];
       if (!raw) {
@@ -2851,9 +2853,16 @@ export default function Index() {
       // cache uri otherwise); `recording.getURI()` after stopAndUnload
       // + move is not reliable.
       const stopMode = recordingModeRef.current ?? 'audio';
+      // Authoritative chunk count for the video path. Captured directly
+      // from chunkFile's return value so a mid-emission storage error
+      // (GC_QUEUE_CORRUPT_TOO_LARGE) cannot silently leave
+      // next_chunk_index at 0 even after 58 chunks were really emitted.
+      // null for audio, where the legacy chunker's tally in the queue
+      // entry is still the source of truth.
+      let videoEmittedCount: number | null = null;
       if (stopMode === 'video') {
         await getController().stop();
-        await getController().chunkVideoFile(finalUri!);
+        videoEmittedCount = await getController().chunkVideoFile(finalUri!);
       } else {
         await stopChunkerForSession(sessionId, finalUri!);
         await getController().stop();
@@ -2865,7 +2874,13 @@ export default function Index() {
       const queue = await queueRead();
       const entry = queue.find(e => e.session_id === sessionId);
       const emitted = entry?.emitted_base64_length ?? 0;
-      const next = entry?.next_chunk_index ?? 0;
+      // Audio: trust the queue (legacy chunker mutates next_chunk_index
+      // through queueAppendChunk on each tick). Video: trust the count
+      // returned by chunkFile — see comment above.
+      const next =
+        videoEmittedCount !== null
+          ? videoEmittedCount
+          : entry?.next_chunk_index ?? 0;
       await queueMarkRecordingClosed(sessionId, finalUri!, emitted, next);
 
       uploadDrainLoop().catch(err => {

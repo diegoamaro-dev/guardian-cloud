@@ -86,8 +86,15 @@ export class VideoFileChunkProducer implements ChunkProducer {
    * Designed to be called AFTER the recorder has stopped and the file
    * has been moved into `documentDirectory`. Callers handle the
    * recording-closed bookkeeping (e.g. `queueMarkRecordingClosed`).
+   *
+   * Returns the number of chunks actually emitted. The host uses this
+   * value as the authoritative `next_chunk_index` when calling
+   * `queueMarkRecordingClosed` — reading it back from the queue is
+   * unsafe because a mid-emission storage corruption could have
+   * dropped chunks silently and leave the queue's `next_chunk_index`
+   * stuck at 0 even when 58 chunks were really emitted.
    */
-  async chunkFile(uri: string): Promise<void> {
+  async chunkFile(uri: string): Promise<number> {
     if (!this.sessionId) {
       throw new Error(
         'VideoFileChunkProducer: chunkFile called before start',
@@ -124,6 +131,7 @@ export class VideoFileChunkProducer implements ChunkProducer {
     );
     console.log('VIDEO_CHUNKS_GENERATED', { count: totalChunks });
 
+    let emittedCount = 0;
     for (let i = 0; i < totalChunks; i++) {
       if (i % 5 === 0) {
         await new Promise(r => setTimeout(r, 0));
@@ -153,6 +161,11 @@ export class VideoFileChunkProducer implements ChunkProducer {
       // and await if a Promise was returned so persistence stays
       // ordered relative to emission.
       await Promise.resolve(cb(payload));
+      // Increment AFTER the await so that if the sink throws (e.g.
+      // GC_QUEUE_CORRUPT_TOO_LARGE), we report the count of chunks
+      // that actually reached the queue, not the count we attempted.
+      emittedCount = i + 1;
     }
+    return emittedCount;
   }
 }

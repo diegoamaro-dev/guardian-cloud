@@ -63,12 +63,17 @@ export class RecordingController {
 
   /**
    * Video-only entry point. Hands the finalized recording's URI to
-   * the video producer so it can slice and emit chunks. No-op for
-   * audio (or if start has not been called).
+   * the video producer so it can slice and emit chunks. Returns the
+   * number of chunks emitted — the host uses this value as the
+   * authoritative `next_chunk_index` for `queueMarkRecordingClosed`
+   * instead of reading it back from the queue (storage corruption
+   * mid-emission can silently drop chunks and leave the queue's own
+   * counter stuck at 0). Returns 0 for audio sessions or when start
+   * has not been called.
    */
-  async chunkVideoFile(uri: string): Promise<void> {
-    if (this.mode !== 'video') return;
-    if (!(this.producer instanceof VideoFileChunkProducer)) return;
-    await this.producer.chunkFile(uri);
+  async chunkVideoFile(uri: string): Promise<number> {
+    if (this.mode !== 'video') return 0;
+    if (!(this.producer instanceof VideoFileChunkProducer)) return 0;
+    return await this.producer.chunkFile(uri);
   }
 }
