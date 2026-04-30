@@ -69,6 +69,10 @@ export class VideoFileChunkProducer implements ChunkProducer {
     const cb = this.callback;
 
     console.log('VIDEO_FILE_READY', { uri });
+    const info = await FileSystem.getInfoAsync(uri);
+    if (info.exists && info.size > 50 * 1024 * 1024) {
+      throw new Error('VIDEO_TOO_LARGE_FOR_MVP');
+    }
     const base64 = await FileSystem.readAsStringAsync(uri, {
       encoding: FileSystem.EncodingType.Base64,
     });
@@ -79,6 +83,9 @@ export class VideoFileChunkProducer implements ChunkProducer {
     console.log('VIDEO_CHUNKS_GENERATED', { count: totalChunks });
 
     for (let i = 0; i < totalChunks; i++) {
+      if (i % 5 === 0) {
+        await new Promise(r => setTimeout(r, 0));
+      }
       const start = i * VIDEO_FILE_CHUNK_SIZE_BASE64;
       const slice = base64.substring(
         start,
@@ -103,10 +110,7 @@ export class VideoFileChunkProducer implements ChunkProducer {
       // sink does async hashing + queueAppendChunk. Cast to unknown
       // and await if a Promise was returned so persistence stays
       // ordered relative to emission.
-      const maybe: unknown = cb(payload);
-      if (maybe instanceof Promise) {
-        await maybe;
-      }
+      await Promise.resolve(cb(payload));
     }
   }
 }
