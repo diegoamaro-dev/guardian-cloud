@@ -250,6 +250,17 @@ function ProgressBlock({ progress }: { progress: ExportProgress | null }) {
 }
 
 function ResultBlock({ result }: { result: ExportResult }) {
+  // Post-export integrity verdict. Computed from the data the export
+  // pipeline already produced (missingIndexes / corruptIndexes) — no
+  // new state, no new fetch. Decoupled from `summary.status` on
+  // purpose: the session can be `Cerrada` (backend lifecycle terminal)
+  // and STILL have an integrity gap if the completion gate let some
+  // chunk through as failed. UI must never conflate the two.
+  const integrityStatus: 'full' | 'partial' =
+    result.missingIndexes.length === 0 && result.corruptIndexes.length === 0
+      ? 'full'
+      : 'partial';
+
   if (result.status === 'complete') {
     return (
       <View
@@ -268,26 +279,60 @@ function ResultBlock({ result }: { result: ExportResult }) {
         <Text style={{ color: '#c9d1d9', fontSize: 12, marginTop: 6 }}>
           Archivo generado correctamente.
         </Text>
-        {result.filePath && (
-          <Pressable
-            onPress={() => handleShare(result.filePath as string)}
+        <Text style={{ color: '#c9d1d9', fontSize: 12, marginTop: 6 }}>
+          {integrityStatus === 'full'
+            ? 'Integridad: Completa ✅'
+            : 'Integridad: Parcial ⚠️'}
+        </Text>
+        <Text style={{ color: '#c9d1d9', fontSize: 12, marginTop: 2 }}>
+          {integrityStatus === 'full' ? 'Reproducible: Sí' : 'Reproducible: No'}
+        </Text>
+        {integrityStatus === 'full' ? (
+          result.filePath && (
+            <Pressable
+              onPress={() => handleShare(result.filePath as string)}
+              style={{
+                marginTop: 10,
+                paddingVertical: 10,
+                paddingHorizontal: 14,
+                borderWidth: 1,
+                borderColor: '#30363d',
+                borderRadius: 6,
+                backgroundColor: '#161b22',
+                alignItems: 'center',
+              }}
+            >
+              <Text
+                style={{ color: '#c9d1d9', fontSize: 13, fontWeight: '500' }}
+              >
+                Compartir archivo
+              </Text>
+            </Pressable>
+          )
+        ) : (
+          // Safety guard: a session whose backend status is `complete`
+          // can still surface integrity gaps if a chunk was lost between
+          // upload and Drive (download/hash failure during export).
+          // Reuse the same red warning block as the partial-MP4 path so
+          // the user never gets a "share" button on a file that no
+          // player can open.
+          <View
             style={{
               marginTop: 10,
-              paddingVertical: 10,
-              paddingHorizontal: 14,
+              padding: 10,
               borderWidth: 1,
-              borderColor: '#30363d',
-              borderRadius: 6,
-              backgroundColor: '#161b22',
-              alignItems: 'center',
+              borderColor: '#f85149',
+              borderRadius: 4,
+              backgroundColor: '#3d1518',
             }}
           >
             <Text
-              style={{ color: '#c9d1d9', fontSize: 13, fontWeight: '500' }}
+              style={{ color: '#f85149', fontSize: 12, fontWeight: '600' }}
             >
-              Compartir archivo
+              Exportación parcial no reproducible. El vídeo tiene huecos y
+              ningún reproductor podrá abrirlo. No se ofrece compartir.
             </Text>
-          </Pressable>
+          </View>
         )}
       </View>
     );
@@ -327,6 +372,12 @@ function ResultBlock({ result }: { result: ExportResult }) {
         </Text>
         <Text style={{ color: '#c9d1d9', fontSize: 12, marginTop: 6 }}>
           Algunos fragmentos no pudieron recuperarse.
+        </Text>
+        <Text style={{ color: '#c9d1d9', fontSize: 12, marginTop: 6 }}>
+          Integridad: Parcial ⚠️
+        </Text>
+        <Text style={{ color: '#c9d1d9', fontSize: 12, marginTop: 2 }}>
+          Reproducible: No
         </Text>
 
         {/* Qualitative advisory: missing/corrupt chunk_index 0 makes
@@ -511,9 +562,13 @@ function StatusHeader({ summary }: { summary: SessionStatusSummary | null }) {
   // the user sees consistent semantics across screens. The `unknown`
   // case is now an explicit network error rather than a generic "Sin
   // datos" — matches the History badge.
+  // "Cerrada" = backend-lifecycle terminal state (every chunk uploaded,
+  // session row marked complete on the backend). It deliberately does
+  // NOT imply that the evidence is intact or playable — that question
+  // is answered post-export by `integrityStatus` in `ResultBlock`.
   const palette =
     summary.status === 'complete'
-      ? { color: '#56d364', bg: '#0a2a14', label: 'Completa' }
+      ? { color: '#56d364', bg: '#0a2a14', label: 'Cerrada' }
       : summary.status === 'partial'
         ? { color: '#e3b341', bg: '#2d1f06', label: 'Parcial' }
         : summary.status === 'failed'

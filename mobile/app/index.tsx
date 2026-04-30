@@ -1193,6 +1193,27 @@ async function uploadDrainLoop(): Promise<void> {
  * then drop the entry. Returns true if any entry was finalized in this
  * pass (used to decide whether the drain loop should keep spinning).
  */
+/**
+ * Per-session log throttle for `GC_QUEUE completion gate`. The drain
+ * loop calls `tryFinalizeReadySessions` every ~500ms; without this the
+ * same `missingUploadedIndexes` line floods the console while the user
+ * stares at a blocked session.
+ *
+ * Re-emit rule: only log when the missing-set signature changes OR when
+ * `COMPLETION_GATE_LOG_TTL_MS` has elapsed since the last emission for
+ * this session. The companion `GC_QUEUE missing chunk states` line is
+ * emitted on the same trigger so the two are always read together.
+ *
+ * Cleanup: `reapEntry` deletes the per-session record so the Map cannot
+ * grow without bound across long-running app sessions.
+ */
+interface CompletionGateLogState {
+  signature: string;
+  lastLoggedAt: number;
+}
+const completionGateLogState = new Map<string, CompletionGateLogState>();
+const COMPLETION_GATE_LOG_TTL_MS = 10_000;
+
 async function tryFinalizeReadySessions(): Promise<boolean> {
   const queue = await queueRead();
   let anyFinalized = false;
@@ -1225,12 +1246,68 @@ async function tryFinalizeReadySessions(): Promise<boolean> {
     for (let i = 0; i < expectedChunks; i++) {
       if (!uploadedIndexes.has(i)) missingUploadedIndexes.push(i);
     }
-    console.log('GC_QUEUE completion gate', {
-      sessionId: entry.session_id,
-      expectedChunks,
-      uploadedChunks: uploadedIndexes.size,
-      missingUploadedIndexes,
-    });
+
+    // Throttled gate log. Re-emit on signature change OR after the TTL
+    // has elapsed, never on every drain tick.
+    const signature = missingUploadedIndexes.join(',');
+    const prevLog = completionGateLogState.get(entry.session_id);
+    const nowMs = Date.now();
+    const shouldLog =
+      !prevLog ||
+      prevLog.signature !== signature ||
+      nowMs - prevLog.lastLoggedAt >= COMPLETION_GATE_LOG_TTL_MS;
+    if (shouldLog) {
+      console.log('GC_QUEUE completion gate', {
+        sessionId: entry.session_id,
+        expectedChunks,
+        uploadedChunks: uploadedIndexes.size,
+        missingUploadedIndexes,
+      });
+      if (missingUploadedIndexes.length > 0) {
+        // Compact diagnostic for blocked sessions: per-missing-index
+        // status snapshot so the operator can see at a glance whether
+        // the chunks are absent from the queue, sitting in `failed`,
+        // missing their `base64Slice`, or missing `remote_reference`.
+        const missingSet = new Set(missingUploadedIndexes);
+        const presentByIndex = new Map<number, QueueChunk>();
+        for (const c of entry.chunks) {
+          if (missingSet.has(c.chunk_index)) presentByIndex.set(c.chunk_index, c);
+        }
+        const missing = missingUploadedIndexes.map(idx => {
+          const c = presentByIndex.get(idx);
+          if (!c) {
+            // Chunk index expected (< next_chunk_index) but no entry in
+            // the queue at all — this is the "never emitted / lost in
+            // migration" case, distinct from `failed`.
+            return {
+              chunk_index: idx,
+              status: 'absent' as const,
+              hasBase64Slice: false,
+              hasRemoteReference: false,
+              attempts: 0,
+              last_error: undefined,
+            };
+          }
+          return {
+            chunk_index: c.chunk_index,
+            status: c.status,
+            hasBase64Slice: !!c.base64Slice,
+            hasRemoteReference: !!c.remote_reference,
+            attempts: c.attempts,
+            last_error: c.last_error,
+          };
+        });
+        console.log('GC_QUEUE missing chunk states', {
+          sessionId: entry.session_id,
+          missing,
+        });
+      }
+      completionGateLogState.set(entry.session_id, {
+        signature,
+        lastLoggedAt: nowMs,
+      });
+    }
+
     if (missingUploadedIndexes.length > 0) {
       // Do NOT call completeSession. Keeping the session row as `active`
       // on the backend is the correct outcome — anything else would
@@ -1277,6 +1354,7 @@ async function tryFinalizeReadySessions(): Promise<boolean> {
 async function reapEntry(sessionId: string, uri: string): Promise<void> {
   await queueDropEntry(sessionId);
   rehydrationCache.delete(uri);
+  completionGateLogState.delete(sessionId);
   await deleteRecordingBestEffort(uri);
 }
 
