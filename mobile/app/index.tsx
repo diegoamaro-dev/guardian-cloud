@@ -17,6 +17,8 @@ import { ApiError } from '@/api/client';
 import { useAuthStore, getFreshAccessToken } from '@/auth/store';
 import { appendHistoryEntry, type SessionMode } from '@/api/history';
 import { hardResetAppState } from '@/dev/reset';
+import type { ChunkPayload } from '@/recording/chunkProducer';
+import { RecordingController } from '@/recording/recordingController';
 
 /**
  * Real-audio + real-network-failure recovery test.
@@ -1781,6 +1783,54 @@ async function emitVideoChunk(
   });
 }
 
+/**
+ * Sink wired into `RecordingController` for the video post-stop path.
+ * Receives a `ChunkPayload` from `VideoFileChunkProducer.chunkFile`,
+ * mirrors the audio `emitChunk` shape (hash → build QueueChunk →
+ * queueAppendChunk → wake worker), and persists the full base64Slice
+ * the producer emitted (post-stop video uses 16 KB chunks like audio,
+ * so the queue blob stays well below the CursorWindow ceiling).
+ *
+ * `emittedBase64Length` is passed as `null`: the video path tracks
+ * progress by `chunks[*]` count, not by the audio-only resume cursor.
+ */
+async function videoChunkSink(payload: ChunkPayload): Promise<void> {
+  const bytes = sliceToBytes(payload.base64Slice);
+  const hash = bytesDigestToHex(
+    await Crypto.digest(Crypto.CryptoDigestAlgorithm.SHA256, bytes),
+  );
+  const chunk: QueueChunk = {
+    chunk_index: payload.chunk_index,
+    hash,
+    size: bytes.length,
+    status: 'pending',
+    attempts: 0,
+    base64Slice: payload.base64Slice,
+  };
+  await queueAppendChunk(
+    payload.sessionId,
+    chunk,
+    /*emittedBase64Length*/ null,
+    payload.chunk_index + 1,
+  );
+  console.log('GC_QUEUE chunk emitted (video post-stop)', {
+    sessionId: payload.sessionId,
+    chunk_index: payload.chunk_index,
+    size: bytes.length,
+    hash_short: hash.substring(0, 12),
+    isFinal: payload.isFinal === true,
+  });
+  uploadDrainLoop().catch(err => {
+    if (DEBUG_QUEUE) {
+      console.log('GC_DEBUG drain rejected (from videoChunkSink)', {
+        sessionId: payload.sessionId,
+        chunk_index: payload.chunk_index,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+  });
+}
+
 async function deriveChunksFromFile(uri: string): Promise<RealChunk[]> {
   const base64 = await FileSystem.readAsStringAsync(uri, {
     encoding: FileSystem.EncodingType.Base64,
@@ -2064,6 +2114,30 @@ export default function Index() {
    * recording in flight.
    */
   const sessionIdRef = useRef<string | null>(null);
+  /**
+   * Mode of the currently-active recording. Mirrors `recordingMode`
+   * captured at GRABAR but lives across the start/stop boundary so
+   * `stopRecording` knows which producer path to take WITHOUT depending
+   * on the in-memory chunkerStates Map (which is empty for video under
+   * the post-stop producer flow).
+   */
+  const recordingModeRef = useRef<SessionMode | null>(null);
+  /**
+   * Lazy-initialized RecordingController. The controller dispatches
+   * chunk-producer choice on mode and exposes start/stop + the video
+   * post-stop entry point. The audio path is a no-op shim through the
+   * controller so the legacy real-time chunker (`startChunkerForSession`
+   * / `stopChunkerForSession`) keeps driving audio unchanged.
+   */
+  const controllerRef = useRef<RecordingController | null>(null);
+  function getController(): RecordingController {
+    if (!controllerRef.current) {
+      const c = new RecordingController();
+      c.setChunkSink(videoChunkSink);
+      controllerRef.current = c;
+    }
+    return controllerRef.current;
+  }
   // Synchronous re-entrancy lock for startRecording. Closes the gap
   // between the user tap and setIsRecording(true) during which GRABAR is
   // still visible and re-tappable. Refs are read/written atomically on
@@ -2500,11 +2574,30 @@ export default function Index() {
         chunks: [],
       });
 
+      // Capture the mode for stopRecording's dispatch. Stays in a ref
+      // so the value survives across the user-tap boundary without
+      // relying on chunkerStates (which is empty for video under the
+      // post-stop producer flow).
+      recordingModeRef.current = recordingMode;
+
+      // Producer dispatch. Logs PRODUCER_SELECTED. For audio this is a
+      // no-op shim — the legacy real-time chunker below keeps driving
+      // emission. For video this installs VideoFileChunkProducer and
+      // wires its onChunk to the module-level videoChunkSink.
+      await getController().start(recordingMode, sessionId);
+
       // Kick off the incremental chunker and wake the worker. Both run
       // on the JS event loop, never on the recorder thread — HC1
       // (recorder must NEVER stop because of upload failure) and HC2
       // (upload must be asynchronous) are enforced by isolation.
-      startChunkerForSession(sessionId, cacheUri, recordingMode);
+      //
+      // Gate on audio: video uses post-stop chunking (see stopRecording
+      // → controller.chunkVideoFile) and intentionally has NO live
+      // chunker. The audio path is byte-identical to before this
+      // milestone — same call, same arguments, same timing.
+      if (recordingMode === 'audio') {
+        startChunkerForSession(sessionId, cacheUri, recordingMode);
+      }
       uploadDrainLoop().catch(err => {
         if (DEBUG_QUEUE) {
           console.log('GC_DEBUG drain rejected (from startRecording)', {
@@ -2675,12 +2768,25 @@ export default function Index() {
     }
 
     try {
-      // Cancel chunker tick and run the final pass against finalUri
-      // explicitly. Per the user's correction, do NOT trust
-      // recording.getURI() at this point — after stopAndUnload + move
-      // the cache uri may be gone. We pass the local finalUri (cache
-      // when move failed, doc dir otherwise).
-      await stopChunkerForSession(sessionId, finalUri!);
+      // Mode dispatch for stop:
+      //   - audio: legacy real-time chunker — final pass via
+      //     stopChunkerForSession (UNCHANGED).
+      //   - video: post-stop producer — read finalized file and emit
+      //     all chunks via the registered onChunk sink. No live
+      //     chunker was started in startRecording for video, so there
+      //     is nothing to "stop" on that side.
+      // Per the user's correction we read explicitly from `finalUri`
+      // (the documentDirectory copy when the move succeeded, the
+      // cache uri otherwise); `recording.getURI()` after stopAndUnload
+      // + move is not reliable.
+      const stopMode = recordingModeRef.current ?? 'audio';
+      if (stopMode === 'video') {
+        await getController().stop();
+        await getController().chunkVideoFile(finalUri!);
+      } else {
+        await stopChunkerForSession(sessionId, finalUri!);
+        await getController().stop();
+      }
 
       // Read the latest offsets the final pass produced and persist
       // recording_closed=true. The worker uses recording_closed +
@@ -2712,6 +2818,7 @@ export default function Index() {
       console.log('ERROR REC STOP:', error);
     } finally {
       sessionIdRef.current = null;
+      recordingModeRef.current = null;
       setIsStopping(false);
     }
   }
