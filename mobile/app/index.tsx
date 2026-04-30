@@ -440,6 +440,20 @@ interface QueueChunk {
    * presence rule (audio chunks do not set this).
    */
   byteLength?: number | undefined;
+  /**
+   * VIDEO post-stop path only. Absolute filesystem URI of a file that
+   * holds this chunk's base64 (under
+   * `documentDirectory/chunks/{sessionId}/{chunk_index}.b64`). Set at
+   * emit time by `videoChunkSink`; deleted after a successful upload
+   * and on `reapEntry`. Persisting the base64 OUT of AsyncStorage is
+   * how the queue avoids the SQLite CursorWindow ~2 MB per-row limit
+   * for video sessions — the in-queue row stays metadata-only.
+   *
+   * Mutually exclusive with `base64Slice`: a chunk has either the
+   * in-queue audio payload or the on-disk video payload, never both.
+   * `rehydrateChunkSlice` branches on field presence.
+   */
+  local_uri?: string | undefined;
   /** Set when the upload to Drive returned a file_id we should use as remote_reference on /chunks. */
   remote_reference?: string | null | undefined;
   last_error?: { status: number; code?: string; message: string } | undefined;
@@ -1018,13 +1032,35 @@ async function rehydrateChunkSlice(
   // Audio path: in-memory base64 attached at emit, pruned on 200 OK.
   // Always preferred when present — short-circuits before any disk I/O.
   if (chunk.base64Slice) return chunk.base64Slice;
+
+  // Video post-stop path: payload lives on disk under
+  // `documentDirectory/chunks/{sessionId}/{chunk_index}.b64`. We
+  // wrote it with EncodingType.Base64, so reading with the same
+  // encoding gives back the original base64 string. Missing file
+  // returns null → pickNext promotes the chunk to permanent failure
+  // with REHYDRATE_FAILED, exactly as for a missing legacy recording.
+  if (chunk.local_uri) {
+    try {
+      return await FileSystem.readAsStringAsync(chunk.local_uri, {
+        encoding: FileSystem.EncodingType.Base64,
+      });
+    } catch (err) {
+      console.log('GC_QUEUE local_uri rehydrate read failed', {
+        local_uri: chunk.local_uri,
+        chunk_index: chunk.chunk_index,
+        err,
+      });
+      return null;
+    }
+  }
+
   if (!entry.uri) return null;
 
-  // Video path: do an O(chunk_size) partial read against the recording
-  // file. The whole-file read used by the audio legacy fallback below
-  // would re-introduce the OutOfMemoryError that motivated this design,
-  // so this arm MUST run for any chunk carrying `byteOffset`/`byteLength`
-  // even if the file would also be cacheable.
+  // Legacy video real-time path: do an O(chunk_size) partial read
+  // against the recording file. The whole-file read used by the audio
+  // legacy fallback below would re-introduce the OutOfMemoryError that
+  // motivated this design, so this arm MUST run for any chunk carrying
+  // `byteOffset`/`byteLength` even if the file would also be cacheable.
   if (chunk.byteOffset !== undefined && chunk.byteLength !== undefined) {
     try {
       return await FileSystem.readAsStringAsync(entry.uri, {
@@ -1200,6 +1236,23 @@ async function uploadDrainLoop(): Promise<void> {
             remote_reference: drive.remote_reference,
             last_error: undefined,
           });
+          // Best-effort cleanup of the on-disk video payload. The file
+          // is no longer needed once the chunk is acknowledged on the
+          // backend AND in Drive; leaving it would just consume disk
+          // until the session reaps. Audio chunks have no local_uri,
+          // so this is a no-op for them.
+          if (chunk.local_uri) {
+            try {
+              await FileSystem.deleteAsync(chunk.local_uri, { idempotent: true });
+            } catch (cleanupErr) {
+              console.log('GC_QUEUE local_uri cleanup failed', {
+                sessionId,
+                chunk_index: chunk.chunk_index,
+                local_uri: chunk.local_uri,
+                err: cleanupErr,
+              });
+            }
+          }
           console.log('GC_QUEUE chunk uploaded', {
             sessionId,
             chunk_index: chunk.chunk_index,
@@ -1431,6 +1484,20 @@ async function reapEntry(sessionId: string, uri: string): Promise<void> {
   rehydrationCache.delete(uri);
   completionGateLogState.delete(sessionId);
   await deleteRecordingBestEffort(uri);
+  // Catch-all cleanup of the per-session chunks directory used by the
+  // video post-stop path. Successful uploads delete files one by one;
+  // permanent-failure / give-up paths leave files behind. Removing the
+  // whole directory at reap time keeps disk usage bounded regardless
+  // of which terminal path the session took.
+  const docDir = FileSystem.documentDirectory;
+  if (docDir) {
+    const sessionDir = `${docDir}chunks/${sessionId}/`;
+    try {
+      await FileSystem.deleteAsync(sessionDir, { idempotent: true });
+    } catch (err) {
+      console.log('GC_QUEUE chunks dir cleanup failed', { sessionId, err });
+    }
+  }
 }
 
 // ----- chunker (incremental slicer driven by setTimeout) -----
@@ -1857,12 +1924,28 @@ async function emitVideoChunk(
 }
 
 /**
+ * Build the per-chunk file path under `documentDirectory/chunks/...`.
+ * Used by the video post-stop path so chunk payloads live on disk
+ * instead of inside the AsyncStorage JSON blob (which trips the SQLite
+ * CursorWindow ~2 MB per-row limit for anything bigger than a couple
+ * of chunks). Audio is unaffected — audio's `emitChunk` keeps writing
+ * `base64Slice` straight into the queue exactly as before.
+ */
+function videoChunkLocalUri(sessionId: string, chunk_index: number): string {
+  const docDir = FileSystem.documentDirectory;
+  if (!docDir) {
+    throw new Error('videoChunkLocalUri: documentDirectory unavailable');
+  }
+  return `${docDir}chunks/${sessionId}/${chunk_index}.b64`;
+}
+
+/**
  * Sink wired into `RecordingController` for the video post-stop path.
  * Receives a `ChunkPayload` from `VideoFileChunkProducer.chunkFile`,
- * mirrors the audio `emitChunk` shape (hash → build QueueChunk →
- * queueAppendChunk → wake worker), and persists the full base64Slice
- * the producer emitted (post-stop video uses 16 KB chunks like audio,
- * so the queue blob stays well below the CursorWindow ceiling).
+ * writes the base64 to a per-chunk file on disk, and persists ONLY
+ * metadata (`local_uri`) into the queue. The upload worker will read
+ * the file at upload time via `rehydrateChunkSlice`, and the
+ * post-200-OK path deletes the file.
  *
  * `emittedBase64Length` is passed as `null`: the video path tracks
  * progress by `chunks[*]` count, not by the audio-only resume cursor.
@@ -1872,13 +1955,29 @@ async function videoChunkSink(payload: ChunkPayload): Promise<void> {
   const hash = bytesDigestToHex(
     await Crypto.digest(Crypto.CryptoDigestAlgorithm.SHA256, bytes),
   );
+  // Write base64 to disk BEFORE adding the queue entry. If the write
+  // fails, we never insert a metadata row that points at a file that
+  // does not exist. Encoding=Base64 round-trip lets the file hold the
+  // raw bytes (33% smaller than utf8-encoded base64 text); on read we
+  // ask for Base64 back out and get the exact same string.
+  const local_uri = videoChunkLocalUri(payload.sessionId, payload.chunk_index);
+  const sessionDir = `${FileSystem.documentDirectory}chunks/${payload.sessionId}/`;
+  try {
+    await FileSystem.makeDirectoryAsync(sessionDir, { intermediates: true });
+  } catch {
+    // Directory may already exist — best-effort create.
+  }
+  await FileSystem.writeAsStringAsync(local_uri, payload.base64Slice, {
+    encoding: FileSystem.EncodingType.Base64,
+  });
+
   const chunk: QueueChunk = {
     chunk_index: payload.chunk_index,
     hash,
     size: bytes.length,
     status: 'pending',
     attempts: 0,
-    base64Slice: payload.base64Slice,
+    local_uri,
   };
   await queueAppendChunk(
     payload.sessionId,
@@ -1891,6 +1990,7 @@ async function videoChunkSink(payload: ChunkPayload): Promise<void> {
     chunk_index: payload.chunk_index,
     size: bytes.length,
     hash_short: hash.substring(0, 12),
+    local_uri,
     isFinal: payload.isFinal === true,
   });
   uploadDrainLoop().catch(err => {
