@@ -14,33 +14,42 @@ import type { ChunkPayload, ChunkProducer } from './chunkProducer';
  *     were `OutOfMemoryError` reading the file as base64 (separate
  *     issue, addressed by the size guard below) AND `Row too big to fit
  *     into CursorWindow` on every queueRead afterwards.
- *   - 64 KB is the MVP compromise: small enough that a single chunk's
- *     base64Slice (~88 KB) is well under CursorWindow, large enough to
- *     keep total chunk count manageable for short MVP recordings.
+ *   - 64 KB held briefly but the matching 2 MB max-video cap was too
+ *     strict: ordinary tiny recordings (~3 MB) were rejected outright.
+ *   - 32 KB is the current setting — each base64Slice is ~44 KB, so the
+ *     per-row base64 pressure scales more slowly with chunk count and
+ *     the worker has more time to prune before CursorWindow trips.
  *
  * Pair this with VIDEO_MAX_SIZE_BYTES below — together they bound the
  * worst-case in-queue base64 footprint to something the persistence
  * layer can actually hold.
  */
-const VIDEO_FILE_CHUNK_SIZE_BYTES = 64 * 1024;
+const VIDEO_FILE_CHUNK_SIZE_BYTES = 32 * 1024;
 
 /** Base64-char count derived from the byte size — same formula audio uses. */
 const VIDEO_FILE_CHUNK_SIZE_BASE64 =
   Math.ceil(Math.ceil((VIDEO_FILE_CHUNK_SIZE_BYTES * 4) / 3) / 4) * 4;
 
 /**
- * Hard cap on input video size for MVP. Two failure modes drove this:
- *   - readAsStringAsync(base64) loads the whole file into a JS string.
- *     A 40 MB file → ~53 MB base64 → OOM on Android.
- *   - GC_QUEUE persistence is bounded by SQLite CursorWindow per row.
- *     Even at 64 KB chunks, a long video accumulates enough un-pruned
- *     base64 to push the row past the limit before the worker drains.
+ * Hard cap on input video size for MVP.
  *
- * 10 MB is the MVP-safe bound for both. Above this we fail FAST (before
- * any base64 read or queue mutation) so the queue cannot be corrupted.
- * Long video is explicitly out of MVP scope.
+ * History:
+ *   - 50 MB → OOM on readAsStringAsync(base64) for files past ~30 MB.
+ *   - 10 MB → CursorWindow blow-up: a 7.6 MB video produced 117 chunks
+ *     (~16 MB peak base64 in queue, far over the ~2 MB SQLite per-row
+ *     limit). Also corrupted the queue mid-emission.
+ *   - 2 MB → over-correction: a normal short recording is ~3 MB and
+ *     was rejected outright before any chunk could be emitted.
+ *   - 5 MB is the current balance, paired with 32 KB chunks. A 3 MB
+ *     video at 32 KB chunks → ~96 chunks, ~4 MB peak base64 if nothing
+ *     pruned; in practice the upload worker prunes faster than emission
+ *     produces, so steady-state queue size stays under CursorWindow.
+ *
+ * Above this we fail FAST (before any base64 read or queue mutation).
+ * Long video is explicitly out of MVP scope until payloads move out of
+ * AsyncStorage (e.g. per-chunk files keyed by hash).
  */
-const VIDEO_MAX_SIZE_BYTES = 10 * 1024 * 1024;
+const VIDEO_MAX_SIZE_BYTES = 5 * 1024 * 1024;
 
 /**
  * Video post-stop producer.
