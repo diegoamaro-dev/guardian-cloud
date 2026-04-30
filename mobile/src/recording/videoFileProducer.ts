@@ -3,20 +3,44 @@ import * as FileSystem from 'expo-file-system';
 import type { ChunkPayload, ChunkProducer } from './chunkProducer';
 
 /**
- * Video post-stop chunk size. Audio chunks are 16 KB because the
- * real-time chunker emits ~12 KB/s at 64 kbps and a 1.5s tick — anything
- * larger forces multi-tick latency. Video has no such cadence: chunking
- * is a single post-stop pass, and a 16 KB cap on a typical 21 MB MP4
- * yields ~1300 chunks (HTTP fan-out hell — UI appeared stuck at 5/100
- * because each Drive upload is a full round-trip). 256 KB brings a 21 MB
- * recording down to ~84 chunks while reusing the same queue/upload
- * pipeline. Audio is intentionally untouched.
+ * Video post-stop chunk size.
+ *
+ * History:
+ *   - 16 KB matched the audio chunker but produced ~1300 chunks for a
+ *     21 MB MP4 (HTTP fan-out hell, UI stuck around 5/100).
+ *   - 256 KB cut chunk count ~16x but each base64Slice was ~352 KB and
+ *     the GC_QUEUE row blew past Android SQLite's CursorWindow ~2 MB
+ *     per-row limit after only a handful of un-pruned chunks. Symptoms
+ *     were `OutOfMemoryError` reading the file as base64 (separate
+ *     issue, addressed by the size guard below) AND `Row too big to fit
+ *     into CursorWindow` on every queueRead afterwards.
+ *   - 64 KB is the MVP compromise: small enough that a single chunk's
+ *     base64Slice (~88 KB) is well under CursorWindow, large enough to
+ *     keep total chunk count manageable for short MVP recordings.
+ *
+ * Pair this with VIDEO_MAX_SIZE_BYTES below — together they bound the
+ * worst-case in-queue base64 footprint to something the persistence
+ * layer can actually hold.
  */
-const VIDEO_FILE_CHUNK_SIZE_BYTES = 256 * 1024;
+const VIDEO_FILE_CHUNK_SIZE_BYTES = 64 * 1024;
 
 /** Base64-char count derived from the byte size — same formula audio uses. */
 const VIDEO_FILE_CHUNK_SIZE_BASE64 =
   Math.ceil(Math.ceil((VIDEO_FILE_CHUNK_SIZE_BYTES * 4) / 3) / 4) * 4;
+
+/**
+ * Hard cap on input video size for MVP. Two failure modes drove this:
+ *   - readAsStringAsync(base64) loads the whole file into a JS string.
+ *     A 40 MB file → ~53 MB base64 → OOM on Android.
+ *   - GC_QUEUE persistence is bounded by SQLite CursorWindow per row.
+ *     Even at 64 KB chunks, a long video accumulates enough un-pruned
+ *     base64 to push the row past the limit before the worker drains.
+ *
+ * 10 MB is the MVP-safe bound for both. Above this we fail FAST (before
+ * any base64 read or queue mutation) so the queue cannot be corrupted.
+ * Long video is explicitly out of MVP scope.
+ */
+const VIDEO_MAX_SIZE_BYTES = 10 * 1024 * 1024;
 
 /**
  * Video post-stop producer.
@@ -79,7 +103,16 @@ export class VideoFileChunkProducer implements ChunkProducer {
 
     console.log('VIDEO_FILE_READY', { uri });
     const info = await FileSystem.getInfoAsync(uri);
-    if (info.exists && info.size > 50 * 1024 * 1024) {
+    if (info.exists && info.size > VIDEO_MAX_SIZE_BYTES) {
+      // Fail BEFORE the base64 read and BEFORE any queue mutation. No
+      // chunks have been emitted, no queue entry has been touched — the
+      // throw propagates to the host's stopRecording path, which leaves
+      // the session entry in its empty/just-created state for the
+      // worker to finalize as a zero-chunk session.
+      console.log('VIDEO_TOO_LARGE_FOR_MVP', {
+        size: info.size,
+        max: VIDEO_MAX_SIZE_BYTES,
+      });
       throw new Error('VIDEO_TOO_LARGE_FOR_MVP');
     }
     const base64 = await FileSystem.readAsStringAsync(uri, {

@@ -493,7 +493,31 @@ async function queueMutate<T>(
   writeChain = writeChain
     .catch(() => undefined)
     .then(async () => {
-      const raw = await AsyncStorage.getItem(PENDING_RETRY_KEY);
+      let raw: string | null;
+      try {
+        raw = await AsyncStorage.getItem(PENDING_RETRY_KEY);
+      } catch (err) {
+        // Android SQLite CursorWindow has a per-row hard limit (~2 MB on
+        // stock devices). When a session entry's accumulated, un-pruned
+        // base64Slices push the queue value past that limit, every
+        // subsequent getItem throws and the worker spins on poll
+        // errors. Recover by resetting the queue and continuing with an
+        // empty one — chunks already on Drive remain on Drive (export
+        // reads from there, not from this queue), so the user-visible
+        // damage is bounded to the in-flight session.
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.includes('Row too big') || msg.includes('CursorWindow')) {
+          console.log('GC_QUEUE_CORRUPT_TOO_LARGE', { err: msg });
+          try {
+            await AsyncStorage.removeItem(PENDING_RETRY_KEY);
+          } catch (rmErr) {
+            console.log('GC_QUEUE corrupt reset failed', rmErr);
+          }
+          raw = null;
+        } else {
+          throw err;
+        }
+      }
       let queue: PendingQueueEntry[];
       if (!raw) {
         queue = [];
