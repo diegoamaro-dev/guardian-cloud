@@ -69,6 +69,7 @@ export async function apiFetch<T = unknown>(
     // timer didn't fire on time).
     const token = await getFreshAccessToken();
     if (!token) {
+      console.log('AUTH MISSING', { path });
       throw new ApiError(401, 'NO_TOKEN', 'No access token in store', null);
     }
     headers.Authorization = `Bearer ${token}`;
@@ -91,9 +92,11 @@ export async function apiFetch<T = unknown>(
     requestInit.body = JSON.stringify(body);
   }
 
+  const url = `${env.apiUrl}${path}`;
+  console.log('API CALL', { method, url, authed: auth });
   let response: Response;
   try {
-    response = await fetch(`${env.apiUrl}${path}`, requestInit);
+    response = await fetch(url, requestInit);
   } catch (e) {
     throw new ApiError(
       0,

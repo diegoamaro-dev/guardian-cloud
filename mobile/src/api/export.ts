@@ -156,24 +156,25 @@ export async function downloadChunk(
   chunkIndex: number,
   timeoutMs = 30_000,
 ): Promise<{ bytes: Uint8Array; headerHash: string }> {
+  const path = `/sessions/${encodeURIComponent(sessionId)}/chunks/${chunkIndex}/download`;
   const token = await getFreshAccessToken();
   if (!token) {
+    console.log('AUTH MISSING', { path });
     throw new ApiError(401, 'NO_TOKEN', 'No access token in store', null);
   }
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
+  const url = `${env.apiUrl}${path}`;
+  console.log('API CALL', { method: 'GET', url, authed: true });
   let response: Response;
   try {
-    response = await fetch(
-      `${env.apiUrl}/sessions/${encodeURIComponent(sessionId)}/chunks/${chunkIndex}/download`,
-      {
-        method: 'GET',
-        headers: { Authorization: `Bearer ${token}` },
-        signal: controller.signal,
-      },
-    );
+    response = await fetch(url, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${token}` },
+      signal: controller.signal,
+    });
   } catch (e) {
     throw new ApiError(
       0,

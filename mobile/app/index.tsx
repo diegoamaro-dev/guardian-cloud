@@ -2135,7 +2135,10 @@ async function postChunk(
   if (remoteReference !== undefined) {
     body.remote_reference = remoteReference;
   }
-  const res = await fetch(`${env.apiUrl}/chunks`, {
+  const url = `${env.apiUrl}/chunks`;
+  if (!token) console.log('AUTH MISSING', { path: '/chunks' });
+  console.log('API CALL', { method: 'POST', url, authed: true });
+  const res = await fetch(url, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -2161,7 +2164,10 @@ async function postChunk(
 }
 
 async function getChunks(token: string, sessionId: string): Promise<unknown> {
-  const res = await fetch(`${env.apiUrl}/sessions/${sessionId}/chunks`, {
+  const url = `${env.apiUrl}/sessions/${sessionId}/chunks`;
+  if (!token) console.log('AUTH MISSING', { path: `/sessions/${sessionId}/chunks` });
+  console.log('API CALL', { method: 'GET', url, authed: true });
+  const res = await fetch(url, {
     headers: { Authorization: `Bearer ${token}` },
   });
   return res.json();
@@ -2196,7 +2202,10 @@ async function completeSession(
   token: string,
   sessionId: string,
 ): Promise<unknown> {
-  const res = await fetch(`${env.apiUrl}/sessions/${sessionId}/complete`, {
+  const url = `${env.apiUrl}/sessions/${sessionId}/complete`;
+  if (!token) console.log('AUTH MISSING', { path: `/sessions/${sessionId}/complete` });
+  console.log('API CALL', { method: 'POST', url, authed: true });
+  const res = await fetch(url, {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}` },
   });
@@ -2229,9 +2238,12 @@ async function createSessionRequest(
   });
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 5000);
+  const url = `${env.apiUrl}/sessions`;
+  if (!token) console.log('AUTH MISSING', { path: '/sessions' });
+  console.log('API CALL', { method: 'POST', url, authed: true });
   let res: Response;
   try {
-    res = await fetch(`${env.apiUrl}/sessions`, {
+    res = await fetch(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

@@ -205,6 +205,7 @@ export async function uploadChunkBytes(
   // has expired.
   const token = await getFreshAccessToken();
   if (!token) {
+    console.log('AUTH MISSING', { path: '/destinations/drive/chunks' });
     throw new ApiError(401, 'NO_TOKEN', 'No access token in store', null);
   }
 
@@ -213,9 +214,11 @@ export async function uploadChunkBytes(
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
+  const url = `${env.apiUrl}/destinations/drive/chunks`;
+  console.log('API CALL', { method: 'POST', url, authed: true });
   let response: Response;
   try {
-    response = await fetch(`${env.apiUrl}/destinations/drive/chunks`, {
+    response = await fetch(url, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${token}`,
