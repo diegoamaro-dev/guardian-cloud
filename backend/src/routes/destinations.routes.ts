@@ -359,6 +359,12 @@ router.post(
   // Content-Type matches — so JSON routes remain unaffected.
   express.raw({ limit: RAW_CHUNK_LIMIT_BYTES, type: 'application/octet-stream' }),
   async (req: Request, res: Response, next: NextFunction) => {
+    // Phase tracker so the unified DRIVE_CHUNK_UPLOAD_FAILED log can name
+    // exactly which step blew up. Updated in-place as we progress; the
+    // catch block at the bottom reads it. Surgical: no behavior change.
+    let phase: string = 'enter';
+    let sessionIdLog: string | undefined;
+    let chunkIndexLog: number | undefined;
     try {
       if (!req.user) throw new UnauthorizedError();
 
@@ -366,7 +372,25 @@ router.post(
       const sessionId = (req.header('x-session-id') ?? '').trim();
       const chunkIndexRaw = (req.header('x-chunk-index') ?? '').trim();
       const hash = (req.header('x-hash') ?? '').trim().toLowerCase();
+      sessionIdLog = sessionId;
 
+      // Earliest "we got the request" log — emitted before any validation
+      // so even a malformed header is observable. Includes the resolved
+      // userId (which is `dev-user` under the dev bypass) so a Drive that
+      // was connected under a real Supabase id is instantly visible as a
+      // user_id mismatch.
+      logger.info(
+        {
+          op: 'drive.chunks.upload',
+          userId: req.user.id,
+          sessionId: sessionId || null,
+          chunkIndex: chunkIndexRaw || null,
+          contentLength: req.header('content-length') ?? null,
+        },
+        'DRIVE_CHUNK_UPLOAD_START',
+      );
+
+      phase = 'validate_headers';
       if (!UUID_RE.test(sessionId)) {
         throw new AppError(400, 'INVALID_HEADERS', 'X-Session-Id missing or not a UUID');
       }
@@ -377,8 +401,10 @@ router.post(
       if (!HEX64_RE.test(hash)) {
         throw new AppError(400, 'INVALID_HEADERS', 'X-Hash missing or invalid');
       }
+      chunkIndexLog = chunkIndex;
 
       // --- 2) Body
+      phase = 'validate_body';
       const body = req.body;
       if (!Buffer.isBuffer(body) || body.length === 0) {
         throw new AppError(
@@ -392,6 +418,7 @@ router.post(
       }
 
       // --- 3) Integrity guardrail — body must match the claimed hash.
+      phase = 'verify_hash';
       const actualHash = createHash('sha256').update(body).digest('hex');
       if (actualHash !== hash) {
         logger.warn(
@@ -411,12 +438,14 @@ router.post(
       // --- 4) Session ownership + active state.
       // Mirrors chunks.service: collapse "not yours" and "doesn't exist"
       // into 404 so we don't leak which UUIDs belong to other users.
+      phase = 'session_ownership';
       const session = await getOwnedSession(req.user.id, sessionId);
       if (session.status !== 'active') {
         throw new AppError(409, 'SESSION_NOT_ACTIVE', 'Session is not active');
       }
 
       // --- 5) Layer 1 dedupe — DB already has the chunk row.
+      phase = 'db_dedup_lookup';
       const existingRef = await findExistingChunkRemoteReference(
         sessionId,
         chunkIndex,
@@ -432,8 +461,42 @@ router.post(
       }
 
       // --- 6) Drive handshake.
+      phase = 'destination_lookup';
       const dest = await getDestinationWithSecretForUser(req.user.id, 'drive');
-      if (!dest || !dest.refresh_token) {
+      // Split the original "no row OR no token" branch into two named
+      // log lines. Behavior unchanged (still 409 DRIVE_NOT_CONNECTED in
+      // both cases) but the operator now sees WHICH of the two it was —
+      // critical for diagnosing the dev-user case where Drive was
+      // connected under a real Supabase user.
+      if (!dest) {
+        logger.warn(
+          {
+            op: 'drive.chunks.upload',
+            userId: req.user.id,
+            sessionId,
+            chunkIndex,
+            isDevUser: req.user.id === 'dev-user',
+          },
+          'DRIVE_CHUNK_NO_DESTINATION',
+        );
+        throw new AppError(
+          409,
+          'DRIVE_NOT_CONNECTED',
+          'No connected Google Drive destination for this user',
+        );
+      }
+      if (!dest.refresh_token) {
+        logger.warn(
+          {
+            op: 'drive.chunks.upload',
+            userId: req.user.id,
+            sessionId,
+            chunkIndex,
+            destinationId: dest.id,
+            destinationStatus: dest.status,
+          },
+          'DRIVE_CHUNK_MISSING_TOKEN',
+        );
         throw new AppError(
           409,
           'DRIVE_NOT_CONNECTED',
@@ -441,10 +504,12 @@ router.post(
         );
       }
 
+      phase = 'token_refresh';
       const accessToken = await getAccessToken(dest.refresh_token);
 
       // Self-heal: if the stored folder is missing (user deleted it by
       // hand), recreate and persist. Same pattern as /drive/test-upload.
+      phase = 'ensure_folder';
       const folderId = dest.folder_id ?? (await ensureRootFolder(accessToken));
       if (!dest.folder_id) {
         await upsertDestination(req.user.id, 'drive', { folder_id: folderId });
@@ -457,6 +522,7 @@ router.post(
       const fileName = `${sessionId}_${paddedIndex}_${shortHash}.chunk`;
 
       // --- 8) Layer 2 dedupe — same filename already exists in Drive.
+      phase = 'drive_dedup_lookup';
       const existingInDrive = await findFileByName(accessToken, folderId, fileName);
       if (existingInDrive) {
         logger.info(
@@ -468,6 +534,7 @@ router.post(
       }
 
       // --- 9) Actual upload.
+      phase = 'drive_upload';
       const result = await uploadFile(
         accessToken,
         folderId,
@@ -484,11 +551,31 @@ router.post(
           size: body.length,
           file_id: result.file_id,
         },
-        'chunk uploaded to Drive',
+        'DRIVE_CHUNK_UPLOAD_SUCCESS',
       );
 
       res.status(200).json({ remote_reference: result.file_id, dedup: null });
     } catch (err) {
+      // Unified failure log. Names the phase, the error class, and (for
+      // AppError) the stable code/status — so the mobile-side detail log
+      // and the backend log can be cross-referenced by sessionId+chunk.
+      // Drive-specific phases are also surfaced as DRIVE_CHUNK_GOOGLE_ERROR
+      // so the operator can grep for upstream Google failures alone.
+      const isAppErr = err instanceof AppError;
+      const failurePayload = {
+        op: 'drive.chunks.upload',
+        userId: req.user?.id,
+        sessionId: sessionIdLog ?? null,
+        chunkIndex: chunkIndexLog ?? null,
+        phase,
+        status: isAppErr ? err.status : 500,
+        code: isAppErr ? err.code : 'INTERNAL_ERROR',
+        message: err instanceof Error ? err.message : String(err),
+      };
+      if (phase === 'token_refresh' || phase === 'drive_upload' || phase === 'ensure_folder' || phase === 'drive_dedup_lookup') {
+        logger.warn(failurePayload, 'DRIVE_CHUNK_GOOGLE_ERROR');
+      }
+      logger.warn(failurePayload, 'DRIVE_CHUNK_UPLOAD_FAILED');
       next(err);
     }
   },

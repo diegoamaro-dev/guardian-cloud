@@ -1296,25 +1296,50 @@ async function uploadDrainLoop(): Promise<void> {
         await Promise.race([uploadAttempt, stuckSentinel]);
       } catch (err) {
         const decision = classifyError(err);
+        const errShape = shapeError(err);
+        // Server-side reasons (DRIVE_NOT_CONNECTED, HASH_MISMATCH,
+        // SESSION_NOT_FOUND, etc.) and Google API errors are carried
+        // on `ApiError.body`. Surface that whole object alongside the
+        // shaped status/code/message so the operator does not have to
+        // tail the backend logs to know why a chunk failed. The shape
+        // persisted to the queue (`last_error`) stays compact — only
+        // the diagnostic console.log carries the body.
+        const errorDetail = {
+          sessionId,
+          chunk_index: chunk.chunk_index,
+          status: errShape.status,
+          code: errShape.code,
+          message: errShape.message,
+          body: err instanceof ApiError ? err.body : undefined,
+        };
+        // Single canonical diagnostic line emitted for every failure
+        // (transient OR permanent) so the operator never has to guess
+        // whether the chunk gave up or will retry. The legacy
+        // `chunk transient — backoff` line earlier in the log hid the
+        // real reason; this one carries it inline.
+        console.log('GC_QUEUE chunk upload failed detail', {
+          ...errorDetail,
+          classification: decision,
+        });
         if (decision === 'permanent') {
           await queueUpdateChunk(sessionId, chunk.chunk_index, {
             status: 'failed',
             base64Slice: undefined,         // poda — no sirve reintentar
-            last_error: shapeError(err),
+            last_error: errShape,
           });
-          console.log('GC_QUEUE chunk failed (permanent)', {
-            sessionId,
-            chunk_index: chunk.chunk_index,
-            err: shapeError(err),
-          });
+          console.log('GC_QUEUE chunk failed (permanent)', errorDetail);
         } else {
           const attempts = chunk.attempts + 1;
           await queueUpdateChunk(sessionId, chunk.chunk_index, {
             status: 'pending',
             attempts,
-            last_error: shapeError(err),
+            last_error: errShape,
           });
           const backoff = Math.min(2 ** attempts * 1000, 30_000);
+          // Two lines on purpose: detail first (the real reason), then
+          // the throttling decision (attempts + sleep). Earlier builds
+          // emitted only the second line, hiding why the chunk failed.
+          console.log('GC_QUEUE chunk transient — error detail', errorDetail);
           console.log('GC_QUEUE chunk transient — backoff', {
             sessionId,
             chunk_index: chunk.chunk_index,
