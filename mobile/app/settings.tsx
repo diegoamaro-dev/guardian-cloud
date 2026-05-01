@@ -13,7 +13,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { router } from 'expo-router';
 
 import { supabase } from '@/auth/supabase';
-import { DEV_BYPASS_TOKEN, useAuthStore } from '@/auth/store';
+import { useAuthStore } from '@/auth/store';
 import {
   driveTestUpload,
   exchangeDriveCode,
@@ -100,16 +100,7 @@ export default function SettingsScreen() {
   async function refreshState() {
     try {
       const { data } = await supabase.auth.getSession();
-      let token = data.session?.access_token ?? null;
-      if (!token && __DEV__) {
-        // DEV-ONLY bypass — aligns this screen's "signed-in?" check with
-        // `getFreshAccessToken`, which already falls back to
-        // DEV_BYPASS_TOKEN when there is no real session. Without this
-        // mirror the Connect Drive button would stay disabled in dev
-        // even though every authenticated API call would succeed.
-        console.log('DEV MODE TOKEN');
-        token = DEV_BYPASS_TOKEN;
-      }
+      const token = data.session?.access_token ?? null;
       if (!token) {
         setScreen({ kind: 'signed-out' });
         return;
@@ -272,7 +263,7 @@ export default function SettingsScreen() {
           </View>
         ) : screen.kind === 'signed-out' ? (
           <Text style={{ color: '#f85149' }}>
-            No hay sesión activa. Vuelve al inicio para autenticarte.
+            Necesitas iniciar sesión.
           </Text>
         ) : (
           <DriveStatusBlock drive={screen.drive} />

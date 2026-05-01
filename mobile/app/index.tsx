@@ -14,7 +14,7 @@ import {
   type PublicDestination,
 } from '@/api/destinations';
 import { ApiError } from '@/api/client';
-import { DEV_BYPASS_TOKEN, useAuthStore, getFreshAccessToken } from '@/auth/store';
+import { useAuthStore, getFreshAccessToken } from '@/auth/store';
 import { appendHistoryEntry, type SessionMode } from '@/api/history';
 import { hardResetAppState } from '@/dev/reset';
 import type { ChunkPayload } from '@/recording/chunkProducer';
@@ -2462,28 +2462,18 @@ export default function Index() {
           email: 'diego@hotmail.com',
           password: 'Diegoou96.',
         });
-        if (authError && !__DEV__) {
-          setTestStatus('ERROR AUTH');
-          console.log('ERROR:', authError);
+        if (authError) {
+          setTestStatus('Necesitas iniciar sesión');
+          console.log('ERROR AUTH:', authError);
           return;
-        }
-        if (authError && __DEV__) {
-          // Swallow real-auth failure in dev so the rest of the bootstrap
-          // (refreshDestination, recovery) can still run via the dev
-          // bypass token below. The error is logged for diagnosis.
-          console.log('DEV AUTH BYPASS — signInWithPassword failed:', authError);
         }
 
         const {
           data: { session },
         } = await supabase.auth.getSession();
-        let token = session?.access_token ?? null;
-        if (!token && __DEV__) {
-          console.log('DEV MODE TOKEN');
-          token = DEV_BYPASS_TOKEN;
-        }
+        const token = session?.access_token ?? null;
         if (!token) {
-          setTestStatus('TOKEN MISSING');
+          setTestStatus('Necesitas iniciar sesión');
           console.log('ERROR: missing access_token');
           return;
         }

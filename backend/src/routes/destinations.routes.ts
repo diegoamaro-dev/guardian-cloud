@@ -376,9 +376,8 @@ router.post(
 
       // Earliest "we got the request" log — emitted before any validation
       // so even a malformed header is observable. Includes the resolved
-      // userId (which is `dev-user` under the dev bypass) so a Drive that
-      // was connected under a real Supabase id is instantly visible as a
-      // user_id mismatch.
+      // userId so a user_id mismatch between connect and upload is
+      // instantly visible.
       logger.info(
         {
           op: 'drive.chunks.upload',
@@ -465,9 +464,7 @@ router.post(
       const dest = await getDestinationWithSecretForUser(req.user.id, 'drive');
       // Split the original "no row OR no token" branch into two named
       // log lines. Behavior unchanged (still 409 DRIVE_NOT_CONNECTED in
-      // both cases) but the operator now sees WHICH of the two it was —
-      // critical for diagnosing the dev-user case where Drive was
-      // connected under a real Supabase user.
+      // both cases) but the operator now sees WHICH of the two it was.
       if (!dest) {
         logger.warn(
           {
@@ -475,7 +472,6 @@ router.post(
             userId: req.user.id,
             sessionId,
             chunkIndex,
-            isDevUser: req.user.id === 'dev-user',
           },
           'DRIVE_CHUNK_NO_DESTINATION',
         );

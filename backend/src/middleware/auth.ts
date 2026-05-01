@@ -33,19 +33,6 @@ import { logger } from '../utils/logger.js';
  */
 const AUTH_TIMEOUT_MS = 4000;
 
-/**
- * DEV-ONLY auth bypass token. Mirrors `DEV_BYPASS_TOKEN` in the mobile
- * `auth/store.ts`. The middleware accepts this bearer only when
- * `NODE_ENV !== 'production'`; in production the same string falls
- * through to JWKS verification, which rejects it as malformed/unsigned.
- *
- * Exists so the mobile dev build can exercise authenticated endpoints
- * (e.g. Drive connect) without going through Supabase sign-in. Remove
- * when real auth UX lands in the app.
- */
-const DEV_BYPASS_TOKEN = 'dev-user-123';
-const DEV_BYPASS_USER_ID = 'dev-user';
-
 /** Shape of the user object attached to authenticated requests. */
 export interface AuthenticatedUser {
   id: string;
@@ -82,21 +69,6 @@ export async function authMiddleware(
       'REQ_AUTH_FAIL',
     );
     return next(new UnauthorizedError('Missing bearer token'));
-  }
-
-  // DEV-only bypass. Production rejects this string at the JWKS step
-  // below like any other malformed JWT. The env check is the safety
-  // gate — without it the bypass would be live in every deployment.
-  if (
-    process.env.NODE_ENV !== 'production' &&
-    token === DEV_BYPASS_TOKEN
-  ) {
-    req.user = { id: DEV_BYPASS_USER_ID };
-    logger.info(
-      { reqId, duration_ms: Date.now() - startMs, sub: DEV_BYPASS_USER_ID },
-      'REQ_AUTH_DEV_BYPASS',
-    );
-    return next();
   }
 
   // Race the verifier against an explicit timeout so a stuck JWKS fetch
