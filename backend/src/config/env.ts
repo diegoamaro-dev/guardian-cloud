@@ -44,6 +44,19 @@ const EnvSchema = z.object({
   // Must match the redirect URI registered on the Google Cloud OAuth
   // client. Mobile uses the app scheme, e.g. `guardiancloud://oauth/drive`.
   GOOGLE_REDIRECT_URI: z.string().url().optional(),
+
+  // Deep link the OAuth callback redirects to after Google's redirect
+  // lands on this backend. In Expo dev/Go this is the dev-server URL
+  // (`exp://<lan-ip>:8081/--/oauth/drive`) so the device opens the
+  // running JS bundle rather than a standalone install. In a production
+  // build it would be the app's custom scheme (`guardiancloud://oauth/drive`).
+  // Default targets the dev machine the project is currently running on
+  // so the OAuth round-trip works out of the box; override per-machine
+  // by setting MOBILE_OAUTH_REDIRECT in `.env`.
+  MOBILE_OAUTH_REDIRECT: z
+    .string()
+    .min(1)
+    .default('exp://192.168.178.21:8081/--/oauth/drive'),
 });
 
 const parsed = EnvSchema.safeParse(process.env);

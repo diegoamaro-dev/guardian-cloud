@@ -149,6 +149,10 @@ router.post(
   return;
 }
       // action === 'exchange'
+logger.info(
+  { op: 'drive.connect.exchange', userId: req.user.id },
+  'DRIVE_OAUTH_EXCHANGE_START',
+);
 const tokens = await exchangeCodeForTokens(
   input.code,
   env.GOOGLE_REDIRECT_URI!,
@@ -640,9 +644,21 @@ router.use(
  *
  * Google redirects the user's browser here after they accept the Drive
  * consent screen. The backend's only job is to hand the `code` + `state`
- * pair back to the mobile app via a custom-scheme deep link; the actual
- * token exchange is still driven by the mobile client calling
+ * pair back to the mobile app via a deep link; the actual token exchange
+ * is still driven by the mobile client calling
  * POST /destinations/drive/connect {action:'exchange'} with that code.
+ *
+ * The deep link target is configurable via `env.MOBILE_OAUTH_REDIRECT`
+ * because in Expo dev/Go the device opens its running JS bundle through
+ * the LAN dev URL (`exp://<lan-ip>:8081/--/...`), not the app's custom
+ * scheme. Hardcoding `guardiancloud://` here used to make the browser
+ * "succeed" (200 OK) but the device never received the deep link, so the
+ * mobile-side `exchangeDriveCode` call never fired, and no token was
+ * persisted — observable as the absence of DRIVE_OAUTH_CALLBACK_HAS_REFRESH_TOKEN.
+ *
+ * We respond with HTTP 302 so the browser follows the redirect into the
+ * device's deep-link handler. The body is a small fallback for the rare
+ * browser that refuses to auto-follow non-http(s) Location headers.
  *
  * Lives in the same file as /drive/connect so the OAuth-related
  * handlers stay co-located. Exported as its own Router (not mounted on
@@ -656,25 +672,54 @@ const oauthCallbackRouter = Router();
 oauthCallbackRouter.get('/auth/drive/callback', (req: Request, res: Response) => {
   const code = typeof req.query.code === 'string' ? req.query.code : '';
   const state = typeof req.query.state === 'string' ? req.query.state : '';
+  const oauthError = typeof req.query.error === 'string' ? req.query.error : '';
 
+  // Earliest "we got hit" log. NEVER log the raw `code` value — it is a
+  // single-use credential. `hasCode`/`hasState` are enough to diagnose.
+  logger.info(
+    {
+      op: 'drive.oauth.callback',
+      hasCode: Boolean(code),
+      hasState: Boolean(state),
+      oauthError: oauthError || null,
+    },
+    'DRIVE_OAUTH_CALLBACK_RECEIVED',
+  );
+
+  if (oauthError) {
+    res.status(400).send(`OAuth error from Google: ${oauthError}`);
+    return;
+  }
   if (!code) {
     res.status(400).send('Missing OAuth code');
     return;
   }
 
+  const base = env.MOBILE_OAUTH_REDIRECT;
   const deepLink =
-    `guardiancloud://oauth/drive?code=${encodeURIComponent(code)}` +
-    `&state=${encodeURIComponent(state)}`;
+    `${base}?code=${encodeURIComponent(code)}` +
+    (state ? `&state=${encodeURIComponent(state)}` : '');
 
-  res.status(200).send(`
+  // Log the BASE only (not the code-bearing URL) so the operator can see
+  // we redirected to the expected deep link without leaking the OAuth
+  // code in plain text.
+  logger.info(
+    { op: 'drive.oauth.callback', target: base, hasState: Boolean(state) },
+    'DRIVE_OAUTH_CALLBACK_REDIRECT_TO_APP',
+  );
+
+  // Set Location explicitly via res.redirect so Express also writes a
+  // tiny default body. Adding our own minimal HTML fallback below keeps
+  // a clickable link visible if the browser refuses to auto-follow a
+  // non-http(s) scheme (rare, but cheap insurance — the mobile listener
+  // accepts the same URL whether the browser bounced automatically or
+  // the user tapped through manually).
+  res.status(302).set('Location', deepLink).send(`
     <html>
       <head>
         <meta name="viewport" content="width=device-width, initial-scale=1" />
       </head>
       <body style="font-family: -apple-system, Roboto, sans-serif; padding: 24px; text-align: center;">
-        <script>
-          window.location.href = "${deepLink}";
-        </script>
         <p>Abriendo Guardian Cloud&hellip;</p>
         <p style="font-size: 14px; color: #555;">Si no se abre automáticamente, pulsa el enlace:</p>
         <p>
