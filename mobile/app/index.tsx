@@ -2609,6 +2609,23 @@ export default function Index() {
    * to finalize. No new field, no timestamp, no persistence.
    */
   const [backgroundSessions, setBackgroundSessions] = useState(0);
+  /**
+   * Sticky-visual marker for the "Evidencia protegida" moment.
+   *
+   * Purpose: the underlying `guardianStatus === 'protegido'` window can
+   * be very brief — the worker reaps a closed entry soon after the last
+   * 200 OK, so the user may not see it. We remember WHEN we last saw
+   * `protegido` and keep the green banner visible for a few seconds
+   * afterwards, even if the system has already returned to `listo`.
+   *
+   * This is PURELY a UI affordance:
+   *   - never written to the queue
+   *   - never sent to the backend
+   *   - never gates recording, upload, recovery, or export
+   *   - never read by `deriveGuardianStatus` (which is untouched)
+   * The single source of truth for the system stays `guardianStatus`.
+   */
+  const [protectedShownAt, setProtectedShownAt] = useState<number | null>(null);
 
   function resetProgress() {
     setUploadedCount(0);
@@ -3401,6 +3418,39 @@ export default function Index() {
     failedCount,
   });
   const hasPendingUploads = guardianStatus === 'subiendo';
+
+  // ----- "Evidencia protegida" sticky banner (UI-only) -----
+  //
+  // When the derived status enters 'protegido', stamp the moment and
+  // schedule a clear after PROTECTED_BANNER_MS so the visual lingers
+  // even after the system has reaped the entry and returned to 'listo'.
+  // We deliberately do NOT change `guardianStatus`, `phaseLabel` or
+  // `phaseColor` — the system's truth is unchanged. Only the banner
+  // below reads `protectedShownAt`.
+  const PROTECTED_BANNER_MS = 4_000;
+  useEffect(() => {
+    if (guardianStatus === 'protegido') {
+      setProtectedShownAt(Date.now());
+    }
+  }, [guardianStatus]);
+  useEffect(() => {
+    if (protectedShownAt === null) return;
+    const elapsed = Date.now() - protectedShownAt;
+    const remaining = Math.max(0, PROTECTED_BANNER_MS - elapsed);
+    const timer = setTimeout(() => {
+      // Guard against a newer 'protegido' restamp racing with this fire.
+      setProtectedShownAt(prev => (prev === protectedShownAt ? null : prev));
+    }, remaining);
+    return () => clearTimeout(timer);
+  }, [protectedShownAt]);
+  // The banner stays visible across the brief `protegido` → `listo`
+  // transition. It is hidden as soon as the user starts recording, the
+  // queue starts uploading again, recovery kicks in, or any failure
+  // happens — those states must never be hidden behind a stale "all
+  // good" message.
+  const showProtectedBanner =
+    protectedShownAt !== null &&
+    (guardianStatus === 'protegido' || guardianStatus === 'listo');
   const phaseLabel =
     guardianStatus === 'grabando'
       ? 'Grabando'
@@ -3534,26 +3584,58 @@ export default function Index() {
         GUARDIAN CLOUD
       </Text>
 
-      <View
-        style={{
-          flexDirection: 'row',
-          alignItems: 'center',
-          marginBottom: 16,
-        }}
-      >
+      {showProtectedBanner ? (
+        // UI-only emphasis for the "Evidencia protegida" moment.
+        // Strictly visual: same data source as the dot/label below
+        // (guardianStatus + a render-only timestamp); never gates logic.
         <View
           style={{
-            width: 10,
-            height: 10,
-            borderRadius: 5,
-            backgroundColor: phaseColor,
-            marginRight: 8,
+            flexDirection: 'row',
+            alignItems: 'center',
+            justifyContent: 'center',
+            paddingVertical: 14,
+            paddingHorizontal: 18,
+            borderRadius: 10,
+            backgroundColor: '#0a2a14',
+            borderWidth: 1,
+            borderColor: '#3ddc84',
+            marginBottom: 16,
+            alignSelf: 'stretch',
           }}
-        />
-        <Text style={{ color: phaseColor, fontSize: 16, fontWeight: '600' }}>
-          {phaseLabel}
-        </Text>
-      </View>
+        >
+          <Text
+            style={{
+              color: '#3ddc84',
+              fontSize: 18,
+              fontWeight: '700',
+              letterSpacing: 0.5,
+            }}
+          >
+            Evidencia protegida ✅
+          </Text>
+        </View>
+      ) : (
+        <View
+          style={{
+            flexDirection: 'row',
+            alignItems: 'center',
+            marginBottom: 16,
+          }}
+        >
+          <View
+            style={{
+              width: 10,
+              height: 10,
+              borderRadius: 5,
+              backgroundColor: phaseColor,
+              marginRight: 8,
+            }}
+          />
+          <Text style={{ color: phaseColor, fontSize: 16, fontWeight: '600' }}>
+            {phaseLabel}
+          </Text>
+        </View>
+      )}
 
       {/* Older sessions still draining behind the current one. Plain
           count derived from the queue length (q.length - 1); never
