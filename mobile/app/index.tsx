@@ -2436,12 +2436,22 @@ export default function Index() {
    * of `Subiendo evidencia (N-1 / N)` forever.
    */
   const [failedCount, setFailedCount] = useState(0);
+  /**
+   * Older sessions still draining in the queue while the user looks at
+   * the most recent one. Derived from `queue.length - 1` — the queue
+   * is appended in creation order by `queueAppendNewSession`'s
+   * `q.push(entry)`, so anything before the last element is a session
+   * that finished recording earlier and is still uploading or waiting
+   * to finalize. No new field, no timestamp, no persistence.
+   */
+  const [backgroundSessions, setBackgroundSessions] = useState(0);
 
   function resetProgress() {
     setUploadedCount(0);
     setTotalCount(0);
     setActiveCount(0);
     setFailedCount(0);
+    setBackgroundSessions(0);
   }
 
   async function refreshDestination() {
@@ -3118,23 +3128,34 @@ export default function Index() {
       if (cancelled) return;
       try {
         const q = await queueRead();
+        // Drive the visible counters from the MOST RECENT session only
+        // (last element appended to the queue). Older sessions still
+        // draining are surfaced separately via `backgroundSessions` so
+        // their progress does not leak into "Subiendo evidencia (X / Y)"
+        // and confuse the user about which clip they just recorded.
+        // `queueAppendNewSession` is `q.push(entry)` (or in-place
+        // replace), so insertion order = creation order; the last
+        // element is the authoritative "current" session.
+        const current = q.length > 0 ? q[q.length - 1] : null;
         let total = 0;
         let uploaded = 0;
         let active = 0;
         let failed = 0;
-        for (const e of q) {
-          total += e.chunks.length;
-          for (const c of e.chunks) {
+        if (current) {
+          total = current.chunks.length;
+          for (const c of current.chunks) {
             if (c.status === 'uploaded') uploaded += 1;
             else if (c.status === 'pending' || c.status === 'uploading') active += 1;
             else if (c.status === 'failed') failed += 1;
           }
         }
+        const background = Math.max(0, q.length - 1);
         if (!cancelled) {
           setTotalCount(total);
           setUploadedCount(uploaded);
           setActiveCount(active);
           setFailedCount(failed);
+          setBackgroundSessions(background);
           if (total > 0 && uploaded === total) {
             setTestStatus(prev =>
               prev !== null &&
@@ -3321,6 +3342,23 @@ export default function Index() {
           {phaseLabel}
         </Text>
       </View>
+
+      {/* Older sessions still draining behind the current one. Plain
+          count derived from the queue length (q.length - 1); never
+          shown when there is exactly one active session, so it doesn't
+          add noise during the typical record-then-export flow. */}
+      {backgroundSessions > 0 ? (
+        <Text
+          style={{
+            color: '#8b949e',
+            fontSize: 12,
+            marginTop: -8,
+            marginBottom: 16,
+          }}
+        >
+          +{backgroundSessions} {backgroundSessions === 1 ? 'sesión' : 'sesiones'} en segundo plano
+        </Text>
+      ) : null}
 
       {/* Destination indicator. Shows the currently active destination so
           the user never has to guess where evidence will land. No
