@@ -2610,6 +2610,31 @@ export default function Index() {
    */
   const [backgroundSessions, setBackgroundSessions] = useState(0);
   /**
+   * Aggregate of chunks across the older queue entries (q[0..n-2]) that
+   * still have at least one `pending` / `uploading` chunk. Lets the home
+   * screen render `+N sesiones subiendo (X / Y)` instead of just the
+   * count, so the user can see WHY background sessions are still
+   * lingering. Derived strictly from the queue on each poll tick — no
+   * new persistence, no new model.
+   */
+  const [bgActiveSessions, setBgActiveSessions] = useState(0);
+  const [bgUploaded, setBgUploaded] = useState(0);
+  const [bgTotal, setBgTotal] = useState(0);
+  /**
+   * Per-session "I have already shown the protected banner for this
+   * session_id" memo. Refs (not state) on purpose: writing here MUST
+   * NOT trigger re-renders. Lifetime is the component mount; not
+   * persisted, not exported, not part of any contract.
+   *
+   * `firstPollTickRef` ensures a recovered queue at boot — entries
+   * whose chunks were already 100% uploaded before the app reopened —
+   * silently seeds the seen set without firing the banner. Otherwise
+   * the user would see a stale "Evidencia protegida ✅" flash on every
+   * cold start that happened to have a finished but un-reaped entry.
+   */
+  const seenProtectedSessionIdsRef = useRef<Set<string>>(new Set());
+  const firstPollTickRef = useRef(true);
+  /**
    * Sticky-visual marker for the "Evidencia protegida" moment.
    *
    * Purpose: the underlying `guardianStatus === 'protegido'` window can
@@ -3372,12 +3397,70 @@ export default function Index() {
           }
         }
         const background = Math.max(0, q.length - 1);
+
+        // Background-session aggregates. Walk q[0..n-2] (everything
+        // except the "current" session) and count chunks of entries
+        // that still have at least one `pending` / `uploading` chunk.
+        // Sessions whose chunks are 100% uploaded but not yet reaped
+        // are NOT counted here — they are already announced via the
+        // per-session detection below as a protected event.
+        let bgActiveSessions_ = 0;
+        let bgUploaded_ = 0;
+        let bgTotal_ = 0;
+        for (let i = 0; i < q.length - 1; i++) {
+          const entry = q[i];
+          if (!entry) continue;
+          const t = entry.chunks.length;
+          if (t === 0) continue;
+          let u = 0;
+          let hasActive = false;
+          for (const c of entry.chunks) {
+            if (c.status === 'uploaded') u += 1;
+            else if (c.status === 'pending' || c.status === 'uploading') hasActive = true;
+          }
+          if (hasActive) {
+            bgActiveSessions_ += 1;
+            bgUploaded_ += u;
+            bgTotal_ += t;
+          }
+        }
+
+        // Per-session protected detection. Walk the WHOLE queue and
+        // for every entry whose chunks are non-empty AND all uploaded,
+        // stamp `protectedShownAt` once — guarded by a Set so we never
+        // re-stamp the same session_id. The first poll tick seeds the
+        // set silently so a recovered queue with already-finished
+        // entries does not flash a stale banner at boot.
+        const newlyProtected: string[] = [];
+        for (const entry of q) {
+          const t = entry.chunks.length;
+          if (t === 0) continue;
+          const u = entry.chunks.filter(c => c.status === 'uploaded').length;
+          if (u !== t) continue;
+          if (seenProtectedSessionIdsRef.current.has(entry.session_id)) continue;
+          seenProtectedSessionIdsRef.current.add(entry.session_id);
+          if (!firstPollTickRef.current) newlyProtected.push(entry.session_id);
+        }
+        firstPollTickRef.current = false;
+
         if (!cancelled) {
           setTotalCount(total);
           setUploadedCount(uploaded);
           setActiveCount(active);
           setFailedCount(failed);
           setBackgroundSessions(background);
+          setBgActiveSessions(bgActiveSessions_);
+          setBgUploaded(bgUploaded_);
+          setBgTotal(bgTotal_);
+          if (newlyProtected.length > 0) {
+            // One stamp per tick is enough — the banner is generic, so
+            // detecting any number of completions in this tick collapses
+            // to a single sticky moment.
+            setProtectedShownAt(Date.now());
+            console.log('GC_LOCAL_FIRST per-session protected', {
+              session_ids: newlyProtected,
+            });
+          }
           if (total > 0 && uploaded === total) {
             setTestStatus(prev =>
               prev !== null &&
@@ -3443,14 +3526,16 @@ export default function Index() {
     }, remaining);
     return () => clearTimeout(timer);
   }, [protectedShownAt]);
-  // The banner stays visible across the brief `protegido` → `listo`
-  // transition. It is hidden as soon as the user starts recording, the
-  // queue starts uploading again, recovery kicks in, or any failure
-  // happens — those states must never be hidden behind a stale "all
-  // good" message.
-  const showProtectedBanner =
-    protectedShownAt !== null &&
-    (guardianStatus === 'protegido' || guardianStatus === 'listo');
+  // The banner is independent of the current session's status: when
+  // ANY session completes (current OR background) we want the user to
+  // see the protected moment, even if other sessions are still
+  // uploading. The 4-second sticky timer is the only thing that hides
+  // it; concurrent "Subiendo evidencia (X / Y)" on the dot/label below
+  // is fine because they describe DIFFERENT sessions. Visibility is
+  // strictly time-bounded, never reads back into any logic, and never
+  // contradicts the system's truth — `guardianStatus` keeps its meaning
+  // and `deriveGuardianStatus` is unchanged.
+  const showProtectedBanner = protectedShownAt !== null;
   const phaseLabel =
     guardianStatus === 'grabando'
       ? 'Grabando'
@@ -3585,9 +3670,12 @@ export default function Index() {
       </Text>
 
       {showProtectedBanner ? (
-        // UI-only emphasis for the "Evidencia protegida" moment.
-        // Strictly visual: same data source as the dot/label below
-        // (guardianStatus + a render-only timestamp); never gates logic.
+        // UI-only emphasis for any "Evidencia protegida" moment (current
+        // session or a background session that just finished). Rendered
+        // ABOVE the dot/label, not as a replacement — so a second session
+        // still uploading remains visible to the user via the dot/label
+        // below. Strictly visual; never gates logic, never read by
+        // `deriveGuardianStatus`.
         <View
           style={{
             flexDirection: 'row',
@@ -3599,7 +3687,7 @@ export default function Index() {
             backgroundColor: '#0a2a14',
             borderWidth: 1,
             borderColor: '#3ddc84',
-            marginBottom: 16,
+            marginBottom: 12,
             alignSelf: 'stretch',
           }}
         >
@@ -3614,34 +3702,40 @@ export default function Index() {
             Evidencia protegida ✅
           </Text>
         </View>
-      ) : (
+      ) : null}
+
+      <View
+        style={{
+          flexDirection: 'row',
+          alignItems: 'center',
+          marginBottom: 16,
+        }}
+      >
         <View
           style={{
-            flexDirection: 'row',
-            alignItems: 'center',
-            marginBottom: 16,
+            width: 10,
+            height: 10,
+            borderRadius: 5,
+            backgroundColor: phaseColor,
+            marginRight: 8,
           }}
-        >
-          <View
-            style={{
-              width: 10,
-              height: 10,
-              borderRadius: 5,
-              backgroundColor: phaseColor,
-              marginRight: 8,
-            }}
-          />
-          <Text style={{ color: phaseColor, fontSize: 16, fontWeight: '600' }}>
-            {phaseLabel}
-          </Text>
-        </View>
-      )}
+        />
+        <Text style={{ color: phaseColor, fontSize: 16, fontWeight: '600' }}>
+          {phaseLabel}
+        </Text>
+      </View>
 
-      {/* Older sessions still draining behind the current one. Plain
-          count derived from the queue length (q.length - 1); never
-          shown when there is exactly one active session, so it doesn't
-          add noise during the typical record-then-export flow. */}
-      {backgroundSessions > 0 ? (
+      {/* Older sessions still draining behind the current one. Two
+          shapes, both derived from the queue on the same poll tick:
+          - `bgActiveSessions > 0`: at least one background session is
+            still uploading. Show aggregate chunk progress so the user
+            can see WHY background sessions are not done yet.
+            "+N sesión(es) subiendo (uploaded / total)"
+          - else if `backgroundSessions > 0`: background entries exist
+            but their chunks are all settled (e.g. the just-finished
+            session in its brief pre-reap window). Fall back to the
+            count-only line. Never shown when q.length <= 1. */}
+      {bgActiveSessions > 0 ? (
         <Text
           style={{
             color: '#8b949e',
@@ -3650,7 +3744,21 @@ export default function Index() {
             marginBottom: 16,
           }}
         >
-          +{backgroundSessions} {backgroundSessions === 1 ? 'sesión' : 'sesiones'} en segundo plano
+          +{bgActiveSessions}{' '}
+          {bgActiveSessions === 1 ? 'sesión' : 'sesiones'} subiendo (
+          {bgUploaded} / {bgTotal})
+        </Text>
+      ) : backgroundSessions > 0 ? (
+        <Text
+          style={{
+            color: '#8b949e',
+            fontSize: 12,
+            marginTop: -8,
+            marginBottom: 16,
+          }}
+        >
+          +{backgroundSessions}{' '}
+          {backgroundSessions === 1 ? 'sesión' : 'sesiones'} en segundo plano
         </Text>
       ) : null}
 
