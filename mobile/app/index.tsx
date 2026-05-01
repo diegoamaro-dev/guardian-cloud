@@ -19,6 +19,7 @@ import { appendHistoryEntry, type SessionMode } from '@/api/history';
 import { hardResetAppState } from '@/dev/reset';
 import type { ChunkPayload } from '@/recording/chunkProducer';
 import { RecordingController } from '@/recording/recordingController';
+import { deriveGuardianStatus } from '@/recording/deriveGuardianStatus';
 
 /**
  * Real-audio + real-network-failure recovery test.
@@ -2426,11 +2427,21 @@ export default function Index() {
    * `tryFinalizeReadySessions` works through `completeSession`.
    */
   const [activeCount, setActiveCount] = useState(0);
+  /**
+   * Chunks at terminal `failed` status. Same data source and lifecycle
+   * as `activeCount` / `uploadedCount` — the polling tick already walks
+   * the queue, this is one extra branch in the existing for-loop. Used
+   * by `deriveGuardianStatus` to flip the pill to `error` so a chunk
+   * that the worker has given up on does not silently sit at the bottom
+   * of `Subiendo evidencia (N-1 / N)` forever.
+   */
+  const [failedCount, setFailedCount] = useState(0);
 
   function resetProgress() {
     setUploadedCount(0);
     setTotalCount(0);
     setActiveCount(0);
+    setFailedCount(0);
   }
 
   async function refreshDestination() {
@@ -3110,17 +3121,20 @@ export default function Index() {
         let total = 0;
         let uploaded = 0;
         let active = 0;
+        let failed = 0;
         for (const e of q) {
           total += e.chunks.length;
           for (const c of e.chunks) {
             if (c.status === 'uploaded') uploaded += 1;
             else if (c.status === 'pending' || c.status === 'uploading') active += 1;
+            else if (c.status === 'failed') failed += 1;
           }
         }
         if (!cancelled) {
           setTotalCount(total);
           setUploadedCount(uploaded);
           setActiveCount(active);
+          setFailedCount(failed);
           if (total > 0 && uploaded === total) {
             setTestStatus(prev =>
               prev !== null &&
@@ -3148,24 +3162,39 @@ export default function Index() {
   // upload work dominates "Listo"; only with an empty/settled queue do
   // we show "Listo". This guarantees "Listo" can never coexist with a
   // visible "Subiendo evidencia (X/Y)" — the contradiction the user saw.
-  // Gate on the IN-MOTION count, not on uploaded < total. Once every
-  // chunk has reached a terminal status (uploaded or failed), the banner
-  // must come down even if the entry has not yet been reaped — a
-  // permanently-failed chunk would otherwise leave uploaded < total
-  // forever, freezing the "Subiendo evidencia (X / Y)" line.
-  const hasPendingUploads = totalCount > 0 && activeCount > 0;
-  const phaseLabel = isRecording
-    ? 'Grabando'
-    : hasPendingUploads
-      ? `Subiendo evidencia (${uploadedCount} / ${totalCount})`
-      : isBusy
-        ? 'Procesando…'
-        : 'Listo';
-  const phaseColor = isRecording
-    ? '#ff4d4d'
-    : hasPendingUploads || isBusy
-      ? '#f0b400'
-      : '#3ddc84';
+  // Single source of truth for the visible status — derived purely from
+  // the same queue counters and recorder flags above. The UI does NOT
+  // own this decision; it only renders the result. See
+  // `deriveGuardianStatus` for the precedence rules.
+  const guardianStatus = deriveGuardianStatus({
+    isRecording,
+    isRecovering,
+    totalCount,
+    uploadedCount,
+    activeCount,
+    failedCount,
+  });
+  const hasPendingUploads = guardianStatus === 'subiendo';
+  const phaseLabel =
+    guardianStatus === 'grabando'
+      ? 'Grabando'
+      : guardianStatus === 'subiendo'
+        ? `Subiendo evidencia (${uploadedCount} / ${totalCount})`
+        : guardianStatus === 'recuperando'
+          ? 'Recuperando'
+          : guardianStatus === 'protegido'
+            ? 'Protegido'
+            : guardianStatus === 'error'
+              ? 'Error'
+              : 'Listo';
+  const phaseColor =
+    guardianStatus === 'grabando'
+      ? '#ff4d4d'
+      : guardianStatus === 'subiendo' || guardianStatus === 'recuperando'
+        ? '#f0b400'
+        : guardianStatus === 'error'
+          ? '#f85149'
+          : '#3ddc84';
 
   // Destination gate. We never block a STOP — even with no destination,
   // a running recording must always be stoppable. The block only applies
