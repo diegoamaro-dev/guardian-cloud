@@ -3419,27 +3419,6 @@ export default function Index() {
         </Text>
       )}
 
-      {/* TEMPORARY — gating diagnostic for video support (step 0 only).
-          Remove this Pressable and the /debug-camera-probe route file
-          once the diagnostic passes and the real video branch is wired. */}
-      <Pressable
-        onPress={() => router.push('/debug-camera-probe')}
-        hitSlop={8}
-        style={{
-          marginTop: 8,
-          paddingHorizontal: 10,
-          paddingVertical: 6,
-          borderWidth: 1,
-          borderColor: '#30363d',
-          borderRadius: 6,
-          backgroundColor: '#161b22',
-        }}
-      >
-        <Text style={{ color: '#8b949e', fontSize: 11 }}>
-          [debug] camera probe
-        </Text>
-      </Pressable>
-
       {/* DEV-only hard reset. Long-press, gated on __DEV__. */}
       {__DEV__ ? (
         <Pressable
