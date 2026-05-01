@@ -19,6 +19,14 @@ export type SessionStatus = 'active' | 'completed' | 'failed';
 export interface CreateSessionInput {
   mode: SessionMode;
   destination_type: string;
+  /**
+   * Optional client-provided session id. When present, `createSession`
+   * acts idempotently: it returns the existing row if (id, user_id)
+   * already exists, otherwise inserts with that id. Used by the mobile
+   * offline-first path so a recording started with no network can later
+   * be registered using the same UUID it was emitted under.
+   */
+  id?: string;
 }
 
 export interface SessionRow {
@@ -55,6 +63,49 @@ export async function createSession(
 ): Promise<SessionRow> {
   const startMs = Date.now();
   logger.info({ reqId, userId, op: 'createSession' }, 'REQ_DB_START');
+
+  // Idempotency for the offline-first path: if the client supplied an id
+  // AND a row with that (id, user_id) pair already exists, return it
+  // instead of trying to insert a duplicate (which would fail on the
+  // primary key constraint and surface as a 500). Same shape as the
+  // standard insert return — callers cannot tell the difference.
+  if (input.id) {
+    const { data: existing, error: lookupErr } = await supabase
+      .from('sessions')
+      .select('*')
+      .eq('id', input.id)
+      .eq('user_id', userId)
+      .maybeSingle();
+    if (lookupErr) {
+      logger.warn(
+        {
+          reqId,
+          op: 'createSession.idempotent_lookup',
+          userId,
+          requested_id: input.id,
+          supabase_error: {
+            code: lookupErr.code,
+            message: lookupErr.message,
+          },
+        },
+        'createSession idempotent lookup failed; falling through to insert',
+      );
+      // Don't fail on lookup error — fall through to insert. Worst case
+      // the insert hits a unique-violation and the existing error path
+      // returns 500; mobile-side retry handles that.
+    } else if (existing) {
+      logger.info(
+        {
+          reqId,
+          userId,
+          session_id: (existing as SessionRow).id,
+          duration_ms: Date.now() - startMs,
+        },
+        'createSession idempotent hit',
+      );
+      return existing as SessionRow;
+    }
+  }
 
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeoutPromise = new Promise<never>((_, reject) => {
@@ -127,16 +178,17 @@ export async function createSession(
 }
 
 function runInsert(userId: string, input: CreateSessionInput) {
-  return supabase
-    .from('sessions')
-    .insert({
-      user_id: userId,
-      mode: input.mode,
-      destination_type: input.destination_type,
-      status: 'active',
-    })
-    .select('*')
-    .single();
+  // Conditionally include `id` so existing callers that don't pass one
+  // continue to rely on the column DEFAULT (gen_random_uuid). When the
+  // mobile offline-first path passes an id, we honour it.
+  const row: Record<string, unknown> = {
+    user_id: userId,
+    mode: input.mode,
+    destination_type: input.destination_type,
+    status: 'active',
+  };
+  if (input.id) row.id = input.id;
+  return supabase.from('sessions').insert(row).select('*').single();
 }
 
 export async function getOwnedSession(

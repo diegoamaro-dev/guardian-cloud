@@ -989,7 +989,16 @@ function classifyError(err: unknown): 'transient' | 'permanent' {
     if (err.status === 408 || err.status === 429) return 'transient';
     // 5xx server
     if (err.status >= 500 && err.status < 600) return 'transient';
-    // 4xx client (incl. HASH_MISMATCH, 400, 403, 404, 409, 422) — permanent
+    // Offline-first: a chunk uploaded for a session whose POST /sessions
+    // has not been replayed yet (recording started with no network)
+    // returns 404 SESSION_NOT_FOUND. The bootstrap re-registers pending
+    // sessions in the background, so this MUST be transient — otherwise
+    // the chunk would be marked failed-permanent and its base64Slice
+    // purged before the session even exists on the backend, losing
+    // evidence we already have on disk.
+    if (err.code === 'SESSION_NOT_FOUND') return 'transient';
+    // 4xx client (incl. HASH_MISMATCH, 400, 403, 409, 422) — permanent.
+    // 404 falls here too, except for SESSION_NOT_FOUND handled above.
     if (err.status >= 400 && err.status < 500) return 'permanent';
     return 'transient';
   }
@@ -1031,6 +1040,152 @@ function shapeError(
 
 function sleep(ms: number): Promise<void> {
   return new Promise(r => setTimeout(r, ms));
+}
+
+// ----- pending remote-session registrations (offline-first) -----
+//
+// When the user starts a recording with no network, POST /sessions
+// cannot reach the backend. The recorder still starts, the chunker
+// still emits, and chunks queue locally under a client-generated UUID.
+// This module owns the small "register this id with the backend later"
+// retry loop. It is INTENTIONALLY decoupled from `GC_QUEUE`:
+//   - GC_QUEUE format is unchanged; no new fields on PendingQueueEntry.
+//   - The worker is unchanged; SESSION_NOT_FOUND now classifies as
+//     transient (one line in `classifyError` above) so chunks survive
+//     until this loop registers the session.
+// Persistence uses a SEPARATE AsyncStorage key so a queue read/write
+// path that pre-dates this feature never has to know about it.
+
+const PENDING_SESSIONS_KEY = 'guardian.pending_session_registrations';
+const PENDING_SESSIONS_RETRY_INTERVAL_MS = 5_000;
+
+interface PendingSessionRegistration {
+  session_id: string;
+  mode: SessionMode;
+}
+
+async function loadPendingRegistrations(): Promise<PendingSessionRegistration[]> {
+  try {
+    const raw = await AsyncStorage.getItem(PENDING_SESSIONS_KEY);
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    // Defensive — drop malformed entries silently rather than crash.
+    return (parsed as unknown[]).filter(
+      (e): e is PendingSessionRegistration =>
+        !!e &&
+        typeof (e as PendingSessionRegistration).session_id === 'string' &&
+        ((e as PendingSessionRegistration).mode === 'audio' ||
+          (e as PendingSessionRegistration).mode === 'video'),
+    );
+  } catch {
+    return [];
+  }
+}
+
+async function savePendingRegistrations(
+  list: PendingSessionRegistration[],
+): Promise<void> {
+  await AsyncStorage.setItem(PENDING_SESSIONS_KEY, JSON.stringify(list));
+}
+
+async function addPendingRegistration(
+  session_id: string,
+  mode: SessionMode,
+): Promise<void> {
+  const list = await loadPendingRegistrations();
+  if (!list.find(p => p.session_id === session_id)) {
+    list.push({ session_id, mode });
+    await savePendingRegistrations(list);
+  }
+}
+
+async function removePendingRegistration(session_id: string): Promise<void> {
+  const list = await loadPendingRegistrations();
+  const next = list.filter(p => p.session_id !== session_id);
+  if (next.length !== list.length) {
+    await savePendingRegistrations(next);
+  }
+}
+
+let pendingRegistrationLoopRunning = false;
+
+/**
+ * Periodically retry POST /sessions for any session that was started
+ * offline. Backend is idempotent on (id, user_id) so retries are safe.
+ *
+ * Self-terminating: exits cleanly when the pending list is empty.
+ * Single-flight: a second caller while the loop is already running is
+ * a no-op (the running instance covers their entry too once persisted).
+ */
+async function runPendingRegistrationLoop(): Promise<void> {
+  if (pendingRegistrationLoopRunning) return;
+  pendingRegistrationLoopRunning = true;
+  try {
+    while (true) {
+      const list = await loadPendingRegistrations();
+      if (list.length === 0) return;
+
+      const token = await getFreshAccessToken();
+      if (token) {
+        for (const item of list) {
+          try {
+            await createSessionRequest(token, item.mode, item.session_id);
+            console.log('GC_LOCAL_FIRST session registered', {
+              session_id: item.session_id,
+              mode: item.mode,
+            });
+            await removePendingRegistration(item.session_id);
+          } catch (err) {
+            console.log('GC_LOCAL_FIRST register retry failed', {
+              session_id: item.session_id,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
+      } else {
+        console.log('GC_LOCAL_FIRST register loop — no token yet');
+      }
+
+      const remaining = await loadPendingRegistrations();
+      if (remaining.length === 0) return;
+      await sleep(PENDING_SESSIONS_RETRY_INTERVAL_MS);
+    }
+  } finally {
+    pendingRegistrationLoopRunning = false;
+  }
+}
+
+async function schedulePendingSessionRegistration(
+  session_id: string,
+  mode: SessionMode,
+): Promise<void> {
+  await addPendingRegistration(session_id, mode);
+  // Fire-and-forget. The loop self-terminates when the list is empty.
+  runPendingRegistrationLoop().catch(err => {
+    console.log('GC_LOCAL_FIRST register loop rejected', err);
+  });
+}
+
+/**
+ * Detect errors from `createSessionRequest` that warrant local-first
+ * fallback (retry in background) rather than aborting the recording.
+ *
+ * Retryable: any failure that did NOT come back as a 4xx HTTP response.
+ * That covers offline (TypeError "Network request failed"), DNS errors,
+ * AbortError on timeout, and 5xx/408/429.
+ *
+ * Not retryable: 4xx (validation/auth errors) — the user input is wrong
+ * and recording should not start. The original `throw` path handles it.
+ */
+function isRetryableSessionCreateError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const m = err.message.match(/HTTP (\d{3})/);
+  if (!m) return true; // no HTTP status → network/abort
+  const status = Number(m[1]);
+  if (status === 408 || status === 429) return true;
+  if (status >= 500 && status < 600) return true;
+  return false;
 }
 
 // ----- upload worker (single-flight, multi-session) -----
@@ -2273,11 +2428,20 @@ async function completeSession(
 async function createSessionRequest(
   token: string,
   mode: SessionMode = 'audio',
+  /**
+   * Optional client-provided session id. The backend treats POST
+   * /sessions idempotently when this is present: same (id, user_id) →
+   * existing row returned, new id → row inserted with that id. Used by
+   * the offline-first path so a recording started with no network can
+   * be re-registered later under the same UUID it was emitted with.
+   */
+  clientId?: string,
 ): Promise<string> {
   const sessionBody = JSON.stringify({
     user_id: 'test_user',
     mode,
     destination_type: 'drive',
+    ...(clientId ? { id: clientId } : {}),
   });
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 5000);
@@ -2614,6 +2778,13 @@ export default function Index() {
           console.log('GC_QUEUE recovery reap failed', err);
         }
 
+        // Local-first recovery: re-fire the pending-registration loop in
+        // case the previous app instance died with sessions still
+        // unregistered remotely. Idempotent — empty list is a no-op.
+        runPendingRegistrationLoop().catch(err => {
+          console.log('GC_LOCAL_FIRST register loop rejected (boot)', err);
+        });
+
         const queueAtBoot = await queueRead();
         if (queueAtBoot.length > 0) {
           setIsRecovering(true);
@@ -2711,9 +2882,43 @@ export default function Index() {
       // succeeds but recorder.startAsync fails below, the session is
       // orphan in `active` — the worker's tryFinalizeReadySessions
       // path will reap it (chunks=[] → all-settled → completeSession).
+      //
+      // Local-first: generate the UUID up front so we have a stable
+      // session_id whether or not the backend is reachable. Backend is
+      // idempotent on (id, user_id) — replaying the same id later (when
+      // the network returns) returns the existing row instead of
+      // creating a duplicate. If POST /sessions fails for a retryable
+      // reason (offline, DNS, 5xx), we keep the local id, schedule a
+      // background re-register loop, and let the recorder/chunker run
+      // normally. The worker tolerates SESSION_NOT_FOUND as transient
+      // (see classifyError) so chunks emitted before registration just
+      // back off and retry — base64Slice is preserved on disk/queue.
       setTestStatus('REC SESSION CREATING');
       await new Promise(r => setTimeout(r, 50));
-      const sessionId = await createSessionRequest(token, recordingMode);
+      const localSessionId = Crypto.randomUUID();
+      let sessionId: string = localSessionId;
+      try {
+        sessionId = await createSessionRequest(
+          token,
+          recordingMode,
+          localSessionId,
+        );
+      } catch (err) {
+        if (isRetryableSessionCreateError(err)) {
+          await schedulePendingSessionRegistration(
+            localSessionId,
+            recordingMode,
+          );
+          console.log('GC_LOCAL_FIRST session deferred', {
+            session_id: localSessionId,
+            reason: err instanceof Error ? err.message : String(err),
+          });
+          setTestStatus('REC SESSION DEFERRED — sin conexión');
+          await new Promise(r => setTimeout(r, 50));
+        } else {
+          throw err;
+        }
+      }
       sessionIdRef.current = sessionId;
       AsyncStorage.setItem(LAST_SESSION_ID_KEY, sessionId).catch(() => {});
       // Append to local history index (best-effort, never blocks the
@@ -3222,12 +3427,19 @@ export default function Index() {
   // to starting a new recording.
   const hasDrive = drive !== null && drive !== undefined;
   const driveCheckLoading = drive === null;
+  // Local-first product rule: lack of network MUST NOT block recording
+  // start — only `drive === undefined` (the destinations check returned
+  // an empty list, i.e. the user really has no destination configured)
+  // disables GRABAR. `drive === null` (transient/offline/loading) lets
+  // the user record; chunks queue locally and the worker uploads when
+  // the network returns.
+  const driveConfirmedMissing = drive === undefined;
   const showStop = isRecording || isStopping;
-  // Disable GRABAR when no drive is connected (or we haven't finished
-  // checking yet). Never disable PARAR.
+  // Disable GRABAR when destinations check confirms the user has none.
+  // Never disable PARAR.
   const buttonDisabled = showStop
     ? isStopping
-    : isStarting || isBusy || !hasDrive;
+    : isStarting || isBusy || driveConfirmedMissing;
   const buttonLabel = showStop ? 'PARAR' : 'GRABAR';
   const buttonBg = showStop ? '#d73a49' : '#1f6feb';
 
