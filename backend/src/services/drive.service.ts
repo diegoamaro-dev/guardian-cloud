@@ -234,6 +234,16 @@ export async function getAccessToken(refreshToken: string): Promise<string> {
     if (res.ok) {
       const json = (await res.json()) as { access_token?: string };
       if (!json.access_token) {
+        logger.warn(
+          {
+            op: 'getAccessToken',
+            attempt,
+            status: res.status,
+            reason: 'no_access_token_in_2xx_body',
+            refresh_token_length: refreshToken.length,
+          },
+          'DRIVE_TOKEN_REFRESH_FAILED_DETAIL',
+        );
         throw new AppError(
           502,
           'DRIVE_REFRESH_FAILED',
@@ -262,6 +272,17 @@ export async function getAccessToken(refreshToken: string): Promise<string> {
       // 400 from Google on refresh usually means the refresh_token was
       // revoked (user removed access). Surface as a distinct code so
       // the UI can prompt a reconnect.
+      logger.warn(
+        {
+          op: 'getAccessToken',
+          attempt,
+          status: res.status,
+          transient: false,
+          detail: detail.substring(0, 200),
+          refresh_token_length: refreshToken.length,
+        },
+        'DRIVE_TOKEN_REFRESH_FAILED_DETAIL',
+      );
       throw new AppError(
         res.status === 400 ? 401 : 502,
         'DRIVE_REFRESH_FAILED',
@@ -285,6 +306,17 @@ export async function getAccessToken(refreshToken: string): Promise<string> {
       reason: lastError instanceof Error ? lastError.message : String(lastError),
     },
     'Google token refresh failed after retries',
+  );
+  logger.warn(
+    {
+      op: 'getAccessToken',
+      attempts: REFRESH_MAX_ATTEMPTS,
+      transient: true,
+      exhausted: true,
+      reason: lastError instanceof Error ? lastError.message : String(lastError),
+      refresh_token_length: refreshToken.length,
+    },
+    'DRIVE_TOKEN_REFRESH_FAILED_DETAIL',
   );
   throw new AppError(
     502,

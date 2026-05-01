@@ -154,14 +154,37 @@ const tokens = await exchangeCodeForTokens(
   env.GOOGLE_REDIRECT_URI!,
 );
 
-      // Without offline access + consent prompt we can't reliably get a
-      // refresh_token — but the library asks for both. If Google still
-      // returns nothing (e.g. a replayed code), fail cleanly.
-      if (!tokens.refresh_token) {
-        logger.warn(
+      // Look up any stored destination first, so a re-consent that does
+      // NOT return a refresh_token can fall back to the one we already
+      // have on file. Without this, a second connect attempt would null
+      // out the only working refresh_token and break every subsequent
+      // chunk upload (DRIVE_REFRESH_FAILED 401).
+      const existingDest = await getDestinationWithSecretForUser(
+        req.user.id,
+        'drive',
+      );
+
+      if (tokens.refresh_token) {
+        logger.info(
           { op: 'drive.connect.exchange', userId: req.user.id },
-          'Google returned no refresh_token (possible replay or missing offline consent)',
+          'DRIVE_OAUTH_CALLBACK_HAS_REFRESH_TOKEN',
         );
+      } else {
+        logger.warn(
+          {
+            op: 'drive.connect.exchange',
+            userId: req.user.id,
+            hasExistingRefreshToken: Boolean(existingDest?.refresh_token),
+          },
+          'DRIVE_OAUTH_REFRESH_TOKEN_MISSING',
+        );
+      }
+
+      // Hard-fail only when BOTH the response and the stored row lack a
+      // refresh_token — there is genuinely nothing usable. A re-consent
+      // that omits the field but matches an existing destination is fine:
+      // we keep the stored token and just refresh the access fields.
+      if (!tokens.refresh_token && !existingDest?.refresh_token) {
         throw new AppError(
           400,
           'DRIVE_NO_REFRESH_TOKEN',
@@ -172,12 +195,26 @@ const tokens = await exchangeCodeForTokens(
       const info = await getUserInfo(tokens.access_token);
       const folderId = await ensureRootFolder(tokens.access_token, ROOT_FOLDER_NAME);
 
-      const saved = await upsertDestination(req.user.id, 'drive', {
+      // Build the upsert payload step-by-step so we never pass
+      // `refresh_token: undefined`. `upsertDestination` preserves the
+      // stored value when the field is absent — that is the whole point
+      // of the fallback path above. (exactOptionalPropertyTypes also
+      // forbids assigning undefined to `refresh_token?: string | null`.)
+      const upsertFields: {
+        status: 'connected';
+        refresh_token?: string;
+        folder_id: string | null;
+        account_email: string | null;
+      } = {
         status: 'connected',
-        refresh_token: tokens.refresh_token,
         folder_id: folderId,
         account_email: info.email ?? null,
-      });
+      };
+      if (tokens.refresh_token) {
+        upsertFields.refresh_token = tokens.refresh_token;
+      }
+
+      const saved = await upsertDestination(req.user.id, 'drive', upsertFields);
 
       res.status(200).json({ destination: toPublic(saved) });
     } catch (err) {
