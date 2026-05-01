@@ -2721,7 +2721,15 @@ export default function Index() {
         }) as Promise<{ uri: string } | undefined>;
         videoRecordPromiseRef.current = recordPromise;
 
-        // Discover the in-flight URI by listing-diff (probe-validated).
+        // Best-effort early URI discovery via cache listing-diff. This
+        // is DIAGNOSTIC ONLY under the post-stop chunker: the
+        // authoritative URI comes from `recordPromise.then(({uri}) =>
+        // ...)` at stop, and `controller.chunkVideoFile(uri)` consumes
+        // THAT — not the cache scan. A missing or late file is no
+        // longer a hard failure; we log it and let the recording
+        // continue. Earlier builds tore the recording down here on the
+        // assumption the live chunker needed `cacheUri` to read from,
+        // but that path no longer runs for video.
         let inFlightUri: string | null = null;
         const tCallStart = Date.now();
         const deadline = tCallStart + VIDEO_URI_DISCOVERY_TIMEOUT_MS;
@@ -2737,25 +2745,28 @@ export default function Index() {
             break;
           }
         }
-        if (!inFlightUri) {
-          // The diagnostic passed on this device; if discovery fails
-          // here something is materially different. Tear down hard
-          // rather than fall back to chunk-after-stop.
-          try {
-            cameraRef.current.stopRecording();
-          } catch {
-            /* ignore — about to throw anyway */
-          }
-          await recordPromise.catch(() => {});
-          videoRecordPromiseRef.current = null;
-          throw new Error('VIDEO_URI_NOT_DISCOVERED');
+        if (inFlightUri) {
+          videoRecordingUriRef.current = inFlightUri;
+          cacheUri = inFlightUri;
+          console.log('GC_DIAG: VIDEO_URI_DISCOVERED', {
+            uri: inFlightUri,
+            discovered_at_ms: Date.now() - tCallStart,
+          });
+        } else {
+          // No novel cache file appeared inside the diagnostic window.
+          // The recording is still alive (recordPromise was not
+          // rejected); we just don't have a URI yet. The post-stop
+          // chunker reads from the URI returned by the camera promise
+          // at stopRecording, so this is recoverable. Empty placeholder
+          // for queueAppendNewSession — `queueMarkRecordingClosed`
+          // overwrites `entry.uri` with the authoritative URI at stop.
+          videoRecordingUriRef.current = null;
+          cacheUri = '';
+          console.log('VIDEO_URI_DISCOVERY_PENDING', {
+            waited_ms: Date.now() - tCallStart,
+            note: 'Authoritative URI will be taken from recordPromise at stop',
+          });
         }
-        videoRecordingUriRef.current = inFlightUri;
-        cacheUri = inFlightUri;
-        console.log('GC_DIAG: VIDEO_URI_DISCOVERED', {
-          uri: inFlightUri,
-          discovered_at_ms: Date.now() - tCallStart,
-        });
       }
 
       await queueAppendNewSession({
