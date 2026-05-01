@@ -219,6 +219,23 @@ const RECORDING_OPTIONS = {
 const VIDEO_MAX_DURATION_S = 60 * 60;
 
 /**
+ * Capture-time quality settings.
+ *
+ * The MVP queue path keeps `VIDEO_MAX_SIZE_BYTES` at 5 MB (see
+ * `videoFileProducer.ts`). At default camera quality (1080p, ~6–10
+ * Mbps) a 2-second recording overshoots that cap immediately. Forcing
+ * 480p with a low bitrate keeps even moderately-long clips inside the
+ * cap — at 500 kbps a one-minute recording is ~3.8 MB.
+ *
+ * The `VideoQuality` cross-platform low option is `'480p'`. iOS also
+ * accepts `'4:3'` (640×480) but it isn't available on Android, so we
+ * stick with `'480p'` to stay portable. Bitrate is the prop that
+ * actually drives file size; quality controls resolution.
+ */
+const VIDEO_RECORDING_QUALITY = '480p' as const;
+const VIDEO_RECORDING_BITRATE_BPS = 500_000;
+
+/**
  * How long startRecording polls FileSystem.cacheDirectory after invoking
  * recordAsync() before giving up on URI discovery. The pre-flight
  * diagnostic (app/debug-camera-probe/index.tsx) validated that the file
@@ -2716,6 +2733,15 @@ export default function Index() {
 
         // Kick off recording. DO NOT await — the promise resolves only
         // when stopRecording() is called (returns the authoritative URI).
+        // Quality settings come from CameraView props (videoQuality,
+        // videoBitrate) and are logged here so the file-size envelope
+        // is visible at session start, not just inferred from the
+        // resulting mp4.
+        console.log('VIDEO_RECORDING_OPTIONS', {
+          quality: VIDEO_RECORDING_QUALITY,
+          bitrate_bps: VIDEO_RECORDING_BITRATE_BPS,
+          maxDuration: VIDEO_MAX_DURATION_S,
+        });
         const recordPromise = cameraRef.current.recordAsync({
           maxDuration: VIDEO_MAX_DURATION_S,
         }) as Promise<{ uri: string } | undefined>;
@@ -3167,6 +3193,8 @@ export default function Index() {
             cameraRef.current = r;
           }}
           mode="video"
+          videoQuality={VIDEO_RECORDING_QUALITY}
+          videoBitrate={VIDEO_RECORDING_BITRATE_BPS}
           style={{
             position: 'absolute',
             top: 0,
