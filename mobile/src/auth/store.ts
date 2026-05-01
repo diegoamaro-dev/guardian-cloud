@@ -99,8 +99,24 @@ export const useAuthStore = create<AuthState>((set) => ({
  * token) it returns `{ session: null }` and we propagate that as a
  * null token — callers then surface the 401 path.
  */
+/**
+ * DEV-ONLY auth bypass token.
+ *
+ * Frontend falls back to this when there is no real Supabase session
+ * (and only in `__DEV__`). The backend's auth middleware accepts the
+ * exact same string only when `NODE_ENV !== 'production'`. Both sides
+ * MUST stay in sync — releasing one without the other breaks dev or,
+ * worse, ships a usable bypass to production.
+ */
+export const DEV_BYPASS_TOKEN = 'dev-user-123';
+
 export async function getFreshAccessToken(): Promise<string | null> {
   const { data, error } = await supabase.auth.getSession();
-  if (error) return null;
-  return data.session?.access_token ?? null;
+  const realToken = error ? null : data.session?.access_token ?? null;
+  if (realToken) return realToken;
+  if (__DEV__) {
+    console.log('DEV MODE TOKEN');
+    return DEV_BYPASS_TOKEN;
+  }
+  return null;
 }
