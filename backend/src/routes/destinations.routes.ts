@@ -708,16 +708,28 @@ oauthCallbackRouter.get('/auth/drive/callback', (req: Request, res: Response) =>
     'DRIVE_OAUTH_CALLBACK_REDIRECT_TO_APP',
   );
 
-  // Set Location explicitly via res.redirect so Express also writes a
-  // tiny default body. Adding our own minimal HTML fallback below keeps
-  // a clickable link visible if the browser refuses to auto-follow a
-  // non-http(s) scheme (rare, but cheap insurance — the mobile listener
-  // accepts the same URL whether the browser bounced automatically or
-  // the user tapped through manually).
+  // Triple-redundant redirect to the mobile deep link:
+  //   (1) HTTP 302 + Location header — the canonical behaviour, but
+  //       some browsers (notably Firefox and stock Android WebView)
+  //       refuse to auto-follow a `Location` whose scheme is not
+  //       http(s). When that happens the browser shows the body
+  //       statically with status 200/302 and the device never wakes
+  //       up, so neither DRIVE_OAUTH_EXCHANGE_START nor
+  //       DRIVE_OAUTH_CALLBACK_HAS_REFRESH_TOKEN ever fires. That's
+  //       the failure mode this hardening fixes.
+  //   (2) <meta http-equiv="refresh"> — pure HTML, runs even with JS
+  //       disabled. Most browsers DO follow custom-scheme refreshes.
+  //   (3) <script>window.location.href = …</script> — the most
+  //       reliable cross-browser path for non-http schemes; the OS
+  //       intent filter / scheme association picks it up.
+  // The clickable fallback link stays visible for the rare case that
+  // none of the three mechanisms fire.
   res.status(302).set('Location', deepLink).send(`
     <html>
       <head>
         <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <meta http-equiv="refresh" content="0;url=${deepLink}" />
+        <script>window.location.href = ${JSON.stringify(deepLink)};</script>
       </head>
       <body style="font-family: -apple-system, Roboto, sans-serif; padding: 24px; text-align: center;">
         <p>Abriendo Guardian Cloud&hellip;</p>
