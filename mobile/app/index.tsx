@@ -604,12 +604,25 @@ async function queueRead(): Promise<PendingQueueEntry[]> {
  */
 async function hasPendingUploadWork(): Promise<boolean> {
   const q = await queueRead();
+  let pendingCount = 0;
+  let uploadingCount = 0;
   for (const entry of q) {
     for (const c of entry.chunks) {
-      if (c.status === 'pending' || c.status === 'uploading') return true;
+      if (c.status === 'pending') pendingCount += 1;
+      else if (c.status === 'uploading') uploadingCount += 1;
     }
   }
-  return false;
+  const result = pendingCount > 0 || uploadingCount > 0;
+  // Diagnostic: lets the operator correlate KEEPALIVE / STOP decisions
+  // with the actual chunk counts the helper observed. Counts are tiny
+  // numbers so the log stays readable across many ticks.
+  console.log('HAS_PENDING_UPLOAD_WORK', {
+    result,
+    pending: pendingCount,
+    uploading: uploadingCount,
+    entries: q.length,
+  });
+  return result;
 }
 
 async function queueAppendNewSession(
@@ -2545,6 +2558,27 @@ export default function Index() {
   const cameraRef = useRef<CameraView | null>(null);
   const videoRecordPromiseRef = useRef<Promise<{ uri: string } | undefined> | null>(null);
   const videoRecordingUriRef = useRef<string | null>(null);
+  /**
+   * "Post-stop chunking is in flight" flag.
+   *
+   * Closes the foreground-service race that hit video sessions:
+   *   - camera stops → `videoRecordPromiseRef.current = null`
+   *   - file move runs (can take seconds)
+   *   - `chunkVideoFile` runs (can take more seconds, emits all chunks)
+   *   - only after that do chunks reach the queue
+   *
+   * If the service tick fires anywhere in that window, both predicates
+   * read false (recorder ref nulled, queue still empty) and the tick
+   * stops the service with `no_pending_work` — exactly when the user
+   * needs it alive most. This ref is set true at the start of the
+   * post-stop processing block and cleared in the finally; it is read
+   * by the `isRecordingActive` callback so the service treats the
+   * post-stop window as "still recording" for lifecycle purposes.
+   *
+   * UI-screen-local ref: never persisted, never sent to backend, never
+   * mutates queue/worker. Pure observability of an in-flight async.
+   */
+  const postStopChunkingInFlightRef = useRef(false);
   // Camera permission hook. Permission is requested at GRABAR-time when
   // mode === 'video', not on screen mount, so audio sessions never
   // surface a camera prompt.
@@ -2924,7 +2958,8 @@ export default function Index() {
               drain: () => uploadDrainLoop(),
               isRecordingActive: () =>
                 recordingRef.current !== null ||
-                videoRecordPromiseRef.current !== null,
+                videoRecordPromiseRef.current !== null ||
+                postStopChunkingInFlightRef.current,
               hasPendingWork: hasPendingUploadWork,
             }).catch(err => {
               console.log('GC_BACKGROUND_UPLOAD_ERROR', {
@@ -3009,12 +3044,21 @@ export default function Index() {
       //     after the recorder ends.
       // Idempotent; non-fatal if it fails (foreground recording carries
       // on, only background lifetime is lost).
-      await startBackgroundProtection({
+      console.log('GC_BACKGROUND_CALL_START_BEGIN', {
+        site: 'startRecording',
+        mode: recordingMode,
+      });
+      const bgStarted = await startBackgroundProtection({
         drain: () => uploadDrainLoop(),
         isRecordingActive: () =>
           recordingRef.current !== null ||
-          videoRecordPromiseRef.current !== null,
+          videoRecordPromiseRef.current !== null ||
+          postStopChunkingInFlightRef.current,
         hasPendingWork: hasPendingUploadWork,
+      });
+      console.log('GC_BACKGROUND_CALL_START_RESULT', {
+        site: 'startRecording',
+        ok: bgStarted,
       });
 
       const token = tokenRef.current;
@@ -3261,6 +3305,13 @@ export default function Index() {
     const sessionId = sessionIdRef.current;
 
     setIsStopping(true);
+    // Cover the entire post-stop window for the foreground-service
+    // lifecycle predicate. Cleared in the finally below. Set BEFORE we
+    // null the recorder refs so there is no observable instant where
+    // both `isRecordingActive` and `hasPendingWork` are simultaneously
+    // false-but-temporarily — which is what was killing the service
+    // mid-`chunkVideoFile` for video sessions.
+    postStopChunkingInFlightRef.current = true;
     let preMoveSize: number | null = null;
     let finalUri: string | null = null;
     try {
@@ -3406,6 +3457,14 @@ export default function Index() {
       if (stopMode === 'video') {
         await getController().stop();
         videoEmittedCount = await getController().chunkVideoFile(finalUri!);
+        // Diagnostic: confirms post-stop chunking finished and how many
+        // chunks landed in the queue. Read by the operator alongside
+        // GC_BACKGROUND_SERVICE_KEEPALIVE to verify the predicate sees
+        // pending work right after this point.
+        console.log('VIDEO_CHUNKS_ENQUEUED', {
+          sessionId,
+          count: videoEmittedCount,
+        });
       } else {
         await stopChunkerForSession(sessionId, finalUri!);
         await getController().stop();
@@ -3449,6 +3508,13 @@ export default function Index() {
       sessionIdRef.current = null;
       recordingModeRef.current = null;
       setIsStopping(false);
+      // Post-stop chunking is now done (either successfully or via the
+      // catch). Drop the flag so the service-lifecycle predicate falls
+      // back to its real signals: recorder refs (null by now) and the
+      // queue. Chunks emitted by chunkVideoFile are already enqueued at
+      // this point, so `hasPendingWork()` will correctly return true
+      // and the service stays alive on KEEPALIVE 'pending_uploads'.
+      postStopChunkingInFlightRef.current = false;
       // Conditional service shutdown. The foreground service must NOT
       // unconditionally stop on rec stop — chunks may still be queued
       // and the user could minimise immediately. Only stop NOW if both
@@ -3461,7 +3527,8 @@ export default function Index() {
         try {
           const stillRecording =
             recordingRef.current !== null ||
-            videoRecordPromiseRef.current !== null;
+            videoRecordPromiseRef.current !== null ||
+            postStopChunkingInFlightRef.current;
           const pending = await hasPendingUploadWork();
           if (!stillRecording && !pending) {
             await stopBackgroundProtection('rec_stopped_no_pending_work');
