@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Alert, View, Text, Pressable } from 'react-native';
+import { Alert, AppState, View, Text, Pressable } from 'react-native';
 import { Audio } from 'expo-av';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import * as FileSystem from 'expo-file-system';
@@ -1849,6 +1849,26 @@ async function stopChunkerForSession(
  * `byteOffset`/`byteLength`). Everything downstream of `emitChunk` —
  * dedup, drain wakeup, hash semantics — is identical.
  */
+/**
+ * Background-emission observability log. Fires only when a chunk was
+ * produced while the app was NOT in the 'active' AppState. Lets the
+ * operator confirm Tier 2 (foreground service) is keeping the chunker
+ * alive in background. Pure side-channel — adds nothing to the queue,
+ * gates nothing, never throws.
+ */
+function logBackgroundChunkEmittedIfApplicable(
+  sessionId: string,
+  chunkIndex: number,
+): void {
+  if (AppState.currentState !== 'active') {
+    console.log('GC_BACKGROUND_CHUNK_EMITTED', {
+      sessionId,
+      chunk_index: chunkIndex,
+      app_state: AppState.currentState,
+    });
+  }
+}
+
 async function runChunkerTick(
   sessionId: string,
   fileUri: string,
@@ -2033,6 +2053,7 @@ async function emitChunk(
     size: bytes.length,
     hash_short: hash.substring(0, 12),
   });
+  logBackgroundChunkEmittedIfApplicable(sessionId, chunk_index);
   // Wake the worker (single-flight; no-op if already draining).
   // The .catch keeps unhandled rejections from being silently swallowed
   // — that pattern was exactly the failure mode we just debugged. Log is
@@ -2110,6 +2131,7 @@ async function emitVideoChunk(
     byteLength,
     hash_short: hash.substring(0, 12),
   });
+  logBackgroundChunkEmittedIfApplicable(sessionId, chunk_index);
   uploadDrainLoop().catch(err => {
     if (DEBUG_QUEUE) {
       console.log('GC_DEBUG drain rejected (from emitVideoChunk)', {
@@ -2191,6 +2213,7 @@ async function videoChunkSink(payload: ChunkPayload): Promise<void> {
     local_uri,
     isFinal: payload.isFinal === true,
   });
+  logBackgroundChunkEmittedIfApplicable(payload.sessionId, payload.chunk_index);
   uploadDrainLoop().catch(err => {
     if (DEBUG_QUEUE) {
       console.log('GC_DEBUG drain rejected (from videoChunkSink)', {
@@ -2912,6 +2935,13 @@ export default function Index() {
       await Audio.setAudioModeAsync({
         allowsRecordingIOS: true,
         playsInSilentModeIOS: true,
+        // Keep the audio session alive across activity backgrounding.
+        // Without this flag both iOS and Android would treat a minimised
+        // app as "stop capturing". With it, the OS-level audio session
+        // continues; combined with the foreground service installed in
+        // Tier 2, the recorder keeps writing samples while the user has
+        // the app off-screen.
+        staysActiveInBackground: true,
       });
       setTestStatus('REC MODE SET');
       await new Promise(r => setTimeout(r, 50));
@@ -3480,6 +3510,52 @@ export default function Index() {
       cancelled = true;
       clearInterval(id);
     };
+  }, []);
+
+  // ----- Background lifecycle observability -----
+  //
+  // Pure observation + a single corrective action: when the app returns
+  // to foreground, kick the upload worker explicitly so any backlog the
+  // OS may have left behind starts draining immediately. The listener
+  // does NOT stop the foreground service: that lifecycle is owned by
+  // `backgroundService.ts` and gated on real work (recording active or
+  // pending uploads), NOT on app foreground/background transitions.
+  // Stopping the service here would break the
+  //   start → minimise → restore → minimise
+  // pattern: the second minimise would have no protection at all.
+  //
+  // Logs:
+  //   GC_BACKGROUND_STATE_CHANGE       — every transition
+  //   GC_BACKGROUND_RECORDING_CONTINUE — going to bg with recorder live
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', nextState => {
+      const wasRecording =
+        recordingRef.current !== null ||
+        videoRecordPromiseRef.current !== null;
+      console.log('GC_BACKGROUND_STATE_CHANGE', {
+        next: nextState,
+        recording: wasRecording,
+      });
+      if (nextState !== 'active' && wasRecording) {
+        console.log('GC_BACKGROUND_RECORDING_CONTINUE', {
+          mode: recordingModeRef.current,
+          session_id: sessionIdRef.current,
+        });
+      }
+      if (nextState === 'active') {
+        // Foreground kick: drain anything that piled up while we were
+        // paused. uploadDrainLoop is single-flight, so a redundant call
+        // while already draining is a harmless no-op.
+        uploadDrainLoop().catch(err => {
+          if (DEBUG_QUEUE) {
+            console.log('GC_DEBUG drain rejected (foreground kick)', {
+              err: err instanceof Error ? err.message : String(err),
+            });
+          }
+        });
+      }
+    });
+    return () => sub.remove();
   }, []);
 
   const isBusy = isStarting || isStopping || isRecovering;
