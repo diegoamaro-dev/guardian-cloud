@@ -38,7 +38,7 @@
  * runtime alive in the same way Android can.
  */
 
-import { Platform } from 'react-native';
+import { PermissionsAndroid, Platform } from 'react-native';
 import BackgroundActions, {
   type BackgroundTaskOptions,
 } from 'react-native-background-actions';
@@ -154,9 +154,86 @@ const baseOptions: BackgroundTaskOptions = {
 };
 
 /**
+ * Request the Android 13+ POST_NOTIFICATIONS runtime permission.
+ *
+ * Why this MUST run before `BackgroundActions.start()`:
+ *
+ * On Android 13 (API 33) and above, `POST_NOTIFICATIONS` is a runtime
+ * permission. The `<uses-permission>` line in the manifest is necessary
+ * but NOT sufficient — the OS silently drops the foreground-service
+ * notification if the user has not explicitly granted it. The service
+ * still starts (so the JS runtime stays alive) but the persistent
+ * "Guardian Cloud está protegiendo tu evidencia" notification never
+ * appears. From the user's point of view, "background protection isn't
+ * working".
+ *
+ * On Android 12 and below this permission does not exist; calling
+ * PermissionsAndroid.check / request would resolve to 'never_ask_again'
+ * style behaviour, so we short-circuit. Same on iOS.
+ *
+ * Returns the granted state (true if granted OR not applicable on this
+ * OS version). Failure to grant is logged but NOT fatal — the service
+ * is still attempted; only its visibility is at stake.
+ */
+async function ensureNotificationPermission(): Promise<boolean> {
+  if (Platform.OS !== 'android') return true;
+  // Platform.Version is `number` on Android. Pre-33 has no concept of
+  // POST_NOTIFICATIONS as a runtime permission.
+  if (typeof Platform.Version !== 'number' || Platform.Version < 33) {
+    return true;
+  }
+  // PermissionsAndroid.PERMISSIONS is a typed const; the
+  // POST_NOTIFICATIONS key only exists on RN versions shipped with
+  // Android 13 awareness. Cast through a permissive lookup so older
+  // RN type defs do not break the build, then re-cast back to the
+  // typed Permission shape that check / request expect.
+  type AndroidPermission = Parameters<typeof PermissionsAndroid.check>[0];
+  const permsAny = PermissionsAndroid.PERMISSIONS as unknown as Record<
+    string,
+    AndroidPermission | undefined
+  >;
+  const perm = permsAny.POST_NOTIFICATIONS;
+  if (!perm) {
+    // Older react-native that doesn't surface the constant — surface
+    // a log so the operator can see why we skipped, then optimistically
+    // proceed.
+    console.log('GC_BACKGROUND_UPLOAD_ERROR', {
+      phase: 'notif_permission_constant_missing',
+    });
+    return true;
+  }
+  try {
+    const already = await PermissionsAndroid.check(perm);
+    if (already) return true;
+    const result = await PermissionsAndroid.request(perm);
+    const granted = result === PermissionsAndroid.RESULTS.GRANTED;
+    console.log('GC_BACKGROUND_NOTIF_PERMISSION', {
+      requested: true,
+      result,
+      granted,
+    });
+    return granted;
+  } catch (err) {
+    console.log('GC_BACKGROUND_UPLOAD_ERROR', {
+      phase: 'notif_permission_request',
+      err: err instanceof Error ? err.message : String(err),
+    });
+    return false;
+  }
+}
+
+/**
  * Start the foreground service. Idempotent — calling twice is a no-op.
  * Recording flow MUST NOT abort on a false return: the foreground app
  * stays functional, the user just loses background lifetime.
+ *
+ * Order of operations:
+ *   1. Request POST_NOTIFICATIONS (Android 13+) so the persistent
+ *      notification is actually visible. If the user denies, we still
+ *      attempt to start the service — the OS may show a minimal system
+ *      indicator instead.
+ *   2. Call BackgroundActions.start with the typed foreground service.
+ *   3. Log the outcome.
  */
 export async function startBackgroundProtection(
   cb: BackgroundProtectionCallbacks,
@@ -165,18 +242,25 @@ export async function startBackgroundProtection(
     console.log('GC_BACKGROUND_UPLOAD_START', { skipped: 'already_running' });
     return true;
   }
+  const notifGranted = await ensureNotificationPermission();
   console.log('GC_BACKGROUND_UPLOAD_START', {
     platform: Platform.OS,
     interval_ms: TICK_INTERVAL_MS,
+    notif_permission_granted: notifGranted,
   });
   try {
     await BackgroundActions.start(makeTaskBody(cb), baseOptions);
     isRunning = true;
+    console.log('GC_BACKGROUND_UPLOAD_STARTED', {
+      ok: true,
+      lib_isRunning: BackgroundActions.isRunning(),
+    });
     return true;
   } catch (err) {
     console.log('GC_BACKGROUND_UPLOAD_ERROR', {
       phase: 'start',
       err: err instanceof Error ? err.message : String(err),
+      stack: err instanceof Error ? err.stack : undefined,
     });
     return false;
   }
