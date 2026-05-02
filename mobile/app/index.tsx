@@ -20,6 +20,10 @@ import { hardResetAppState } from '@/dev/reset';
 import type { ChunkPayload } from '@/recording/chunkProducer';
 import { RecordingController } from '@/recording/recordingController';
 import { deriveGuardianStatus } from '@/recording/deriveGuardianStatus';
+import {
+  startBackgroundProtection,
+  stopBackgroundProtection,
+} from '@/recording/backgroundService';
 
 /**
  * Real-audio + real-network-failure recovery test.
@@ -580,6 +584,32 @@ async function queueMutate<T>(
 
 async function queueRead(): Promise<PendingQueueEntry[]> {
   return queueMutate(q => q.map(entry => ({ ...entry })));
+}
+
+/**
+ * Read-only predicate for the foreground-service lifecycle gate.
+ *
+ * Returns true when ANY queued entry has at least one chunk in
+ * `pending` or `uploading` state — i.e. there is work the upload
+ * worker still needs to do. `failed` chunks do NOT count: they are
+ * terminal and will not transition further on their own. Sessions
+ * whose chunks are all `uploaded` also don't count: the worker reaps
+ * those entries on the next drain tick.
+ *
+ * Used by the foreground service tick to decide whether to keep the
+ * notification alive; also called from `stopRecording`'s finally to
+ * decide whether to stop the service immediately or let the tick
+ * handle it. Pure read — no mutations, no setItem, no schema knowledge
+ * beyond the existing PendingQueueEntry shape.
+ */
+async function hasPendingUploadWork(): Promise<boolean> {
+  const q = await queueRead();
+  for (const entry of q) {
+    for (const c of entry.chunks) {
+      if (c.status === 'pending' || c.status === 'uploading') return true;
+    }
+  }
+  return false;
 }
 
 async function queueAppendNewSession(
@@ -2882,6 +2912,27 @@ export default function Index() {
               });
             }
           });
+
+          // Boot-time foreground service start: if the cold boot found
+          // a non-empty queue with actual pending work (chunks in
+          // pending/uploading), arm the service so a subsequent
+          // minimise keeps the drain alive. The service's own tick will
+          // stop it via 'no_pending_work' once the queue empties.
+          // Idempotent and decoupled from the recording lifecycle.
+          if (pendingChunks > 0) {
+            startBackgroundProtection({
+              drain: () => uploadDrainLoop(),
+              isRecordingActive: () =>
+                recordingRef.current !== null ||
+                videoRecordPromiseRef.current !== null,
+              hasPendingWork: hasPendingUploadWork,
+            }).catch(err => {
+              console.log('GC_BACKGROUND_UPLOAD_ERROR', {
+                phase: 'boot_recovery',
+                err: err instanceof Error ? err.message : String(err),
+              });
+            });
+          }
         }
 
         // No pending state — ready for a manual Phase 1 trigger.
@@ -2945,6 +2996,26 @@ export default function Index() {
       });
       setTestStatus('REC MODE SET');
       await new Promise(r => setTimeout(r, 50));
+
+      // Start the foreground service. Keeps the JS runtime alive in
+      // background. Predicate-driven lifecycle: the service stays up
+      // while EITHER the recorder is active OR the queue still has
+      // chunks in `pending` / `uploading` (see `hasPendingUploadWork`).
+      // It does NOT depend on app foreground/background — that decoupling
+      // is what lets minimise → restore → minimise keep working without
+      // re-arming. Stop is delegated to either:
+      //   - the tick body itself (when both predicates go false), or
+      //   - `stopRecording`'s finally if it observes both false right
+      //     after the recorder ends.
+      // Idempotent; non-fatal if it fails (foreground recording carries
+      // on, only background lifetime is lost).
+      await startBackgroundProtection({
+        drain: () => uploadDrainLoop(),
+        isRecordingActive: () =>
+          recordingRef.current !== null ||
+          videoRecordPromiseRef.current !== null,
+        hasPendingWork: hasPendingUploadWork,
+      });
 
       const token = tokenRef.current;
       if (!token) throw new Error('TOKEN_MISSING_AT_START');
@@ -3378,6 +3449,33 @@ export default function Index() {
       sessionIdRef.current = null;
       recordingModeRef.current = null;
       setIsStopping(false);
+      // Conditional service shutdown. The foreground service must NOT
+      // unconditionally stop on rec stop — chunks may still be queued
+      // and the user could minimise immediately. Only stop NOW if both
+      // predicates are already clean (recording inactive and queue has
+      // nothing pending). Otherwise leave the service running and let
+      // its own tick body stop it once the queue drains. The recorder
+      // refs are nulled inside the try block above before this finally
+      // runs, so isRecordingActive correctly reads false here.
+      (async () => {
+        try {
+          const stillRecording =
+            recordingRef.current !== null ||
+            videoRecordPromiseRef.current !== null;
+          const pending = await hasPendingUploadWork();
+          if (!stillRecording && !pending) {
+            await stopBackgroundProtection('rec_stopped_no_pending_work');
+          }
+          // else: tick body keeps the service alive on KEEPALIVE
+          // 'pending_uploads' until the queue drains, then stops with
+          // 'no_pending_work'. No action needed here.
+        } catch (err) {
+          console.log('GC_BACKGROUND_UPLOAD_ERROR', {
+            phase: 'stop_in_finally',
+            err: err instanceof Error ? err.message : String(err),
+          });
+        }
+      })();
     }
   }
 
