@@ -436,6 +436,53 @@ function ResultBlock({ result }: { result: ExportResult }) {
       ? 'full'
       : 'partial';
 
+  // Video-partial UX. When the exported file is an MP4 with any
+  // integrity gap, the file cannot be played back end-to-end (the
+  // moov atom + mdat continuity both require every chunk_index in
+  // 0..lastIndex). Replace the previous red "no reproducible" warning
+  // and the surrounding result card with a calm yellow card that
+  // confirms partial evidence was saved and hides the share button.
+  // No error tone, no technical detail, no "archivo inválido". Pure
+  // UI early-return — the existing 'complete' / 'partial' / 'failed'
+  // branches below stay byte-identical for all other code paths
+  // (audio of any status, complete video with full integrity, failed
+  // export with no MP4 written).
+  const isMp4File = result.filePath?.endsWith('.mp4') ?? false;
+  if (isMp4File && integrityStatus !== 'full') {
+    return (
+      <View
+        style={{
+          marginTop: 4,
+          padding: 14,
+          borderWidth: 1,
+          borderColor: '#d29922',
+          borderRadius: 6,
+          backgroundColor: '#2d1f06',
+        }}
+      >
+        <Text style={{ color: '#e3b341', fontSize: 15, fontWeight: '700' }}>
+          🟡 Evidencia parcial protegida
+        </Text>
+        <Text
+          style={{
+            color: '#c9d1d9',
+            fontSize: 13,
+            marginTop: 8,
+            lineHeight: 18,
+          }}
+        >
+          Se han guardado fragmentos de la grabación.{'\n'}
+          Faltan partes para generar un vídeo completo.
+        </Text>
+        {result.totalChunks > 0 ? (
+          <Text style={{ color: '#8b949e', fontSize: 12, marginTop: 10 }}>
+            Fragmentos disponibles: {result.validChunks} / {result.totalChunks}
+          </Text>
+        ) : null}
+      </View>
+    );
+  }
+
   if (result.status === 'complete') {
     return (
       <View
