@@ -2831,6 +2831,35 @@ export default function Index() {
         // there is actually pending work; a short await with the worker
         // running in the background is acceptable so the screen renders
         // "RECOVERING N chunks" while it drains the obvious cases.
+        console.log('GC_BOOT_RECOVERY_START', { ts: Date.now() });
+        // Pre-normalisation snapshot of the persisted queue. Captures
+        // the state Android left behind after the kill — the
+        // `uploading` count here is the number of chunks that were
+        // mid-flight when the app died and that the stuck-reset step
+        // below will flip back to `pending`.
+        try {
+          const qBoot = await queueRead();
+          let bootPending = 0;
+          let bootUploading = 0;
+          let bootFailed = 0;
+          for (const e of qBoot) {
+            for (const c of e.chunks) {
+              if (c.status === 'pending') bootPending += 1;
+              else if (c.status === 'uploading') bootUploading += 1;
+              else if (c.status === 'failed') bootFailed += 1;
+            }
+          }
+          console.log('GC_BOOT_QUEUE_PENDING', {
+            entries: qBoot.length,
+            pending: bootPending,
+            uploading: bootUploading,
+            failed: bootFailed,
+          });
+        } catch (err) {
+          console.log('GC_BOOT_QUEUE_PENDING', {
+            err: err instanceof Error ? err.message : String(err),
+          });
+        }
         try {
           await migrateLegacyPendingState();
         } catch (err) {
@@ -2890,6 +2919,13 @@ export default function Index() {
               entries_marked_closed: entriesClosed,
             });
           }
+          // Canonical recovery log: stuck-uploading count after reset.
+          // Always emitted (including 0) so the operator can confirm
+          // the reset step ran on this boot.
+          console.log('GC_BOOT_STUCK_UPLOAD_RESET', {
+            count: stuckUploading,
+            entries_marked_closed: entriesClosed,
+          });
         } catch (err) {
           console.log('GC_QUEUE recovery finalize-prep failed', err);
         }
@@ -2910,6 +2946,7 @@ export default function Index() {
         // Local-first recovery: re-fire the pending-registration loop in
         // case the previous app instance died with sessions still
         // unregistered remotely. Idempotent — empty list is a no-op.
+        console.log('GC_BOOT_PENDING_SESSION_REGISTRATION_START');
         runPendingRegistrationLoop().catch(err => {
           console.log('GC_LOCAL_FIRST register loop rejected (boot)', err);
         });
@@ -2939,6 +2976,10 @@ export default function Index() {
           );
           // Fire the worker. It self-terminates when all entries are
           // either reaped (closed + completed) or are still recording.
+          console.log('GC_BOOT_UPLOAD_DRAIN_START', {
+            entries: queueAtBoot.length,
+            pending_chunks: pendingChunks,
+          });
           uploadDrainLoop().catch(err => {
             if (DEBUG_QUEUE) {
               console.log('GC_DEBUG drain rejected (from recovery)', {
@@ -2954,6 +2995,9 @@ export default function Index() {
           // stop it via 'no_pending_work' once the queue empties.
           // Idempotent and decoupled from the recording lifecycle.
           if (pendingChunks > 0) {
+            console.log('GC_BOOT_BACKGROUND_SERVICE_START', {
+              pending_chunks: pendingChunks,
+            });
             startBackgroundProtection({
               drain: () => uploadDrainLoop(),
               isRecordingActive: () =>
