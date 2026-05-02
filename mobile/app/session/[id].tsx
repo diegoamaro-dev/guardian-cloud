@@ -170,6 +170,17 @@ export default function SessionDetailScreen() {
   const [fragmentsPhase, setFragmentsPhase] = useState<FragmentsPhase>({
     kind: 'idle',
   });
+  // Live "uploaded chunks" count, refreshed every time the user taps
+  // "Exportar paquete técnico" (handleDownloadFragments re-fetches the
+  // chunk listing). Drives the visible "Fragmentos disponibles: X / Y"
+  // counter so it stays in sync with chunks that finished uploading
+  // AFTER the export verdict was rendered. Null until the first refresh
+  // — falls back to `result.validChunks` (the snapshot at export time).
+  // UI only — never feeds into integrity calc, missing-chunk detection,
+  // or any other derived state.
+  const [availableFragmentCount, setAvailableFragmentCount] = useState<
+    number | null
+  >(null);
 
   // Fetch real status on mount and after every successful export (the
   // export itself can change perceived state — e.g. it confirms what
@@ -396,6 +407,11 @@ export default function SessionDetailScreen() {
     const uploaded = chunks
       .filter((c) => c.status === 'uploaded' && !!c.remote_reference)
       .sort((a, b) => a.chunk_index - b.chunk_index);
+    // Sync the visible counter with the freshly-listed uploaded count.
+    // Pure UI sync — does not affect download flow, integrity calc, or
+    // expectedLocalChunks. Updated even when the count is 0 so a session
+    // that just lost its only chunk reflects reality.
+    setAvailableFragmentCount(uploaded.length);
 
     if (uploaded.length === 0) {
       setFragmentsPhase({
@@ -594,6 +610,7 @@ export default function SessionDetailScreen() {
         <ResultBlock
           result={phase.result}
           expectedLocalChunks={expectedLocalChunks}
+          availableFragmentCount={availableFragmentCount}
           fragmentsPhase={fragmentsPhase}
           onDownloadFragments={handleDownloadFragments}
         />
@@ -723,11 +740,13 @@ function LocalFallbackBlock({ filePath }: { filePath: string }) {
 function ResultBlock({
   result,
   expectedLocalChunks,
+  availableFragmentCount,
   fragmentsPhase,
   onDownloadFragments,
 }: {
   result: ExportResult;
   expectedLocalChunks: number | null;
+  availableFragmentCount: number | null;
   fragmentsPhase: FragmentsPhase;
   onDownloadFragments: () => void;
 }) {
@@ -808,7 +827,8 @@ function ResultBlock({
         </Text>
         {realTotal > 0 ? (
           <Text style={{ color: '#8b949e', fontSize: 12, marginTop: 10 }}>
-            Fragmentos disponibles: {result.validChunks} / {realTotal}
+            Fragmentos disponibles:{' '}
+            {availableFragmentCount ?? result.validChunks} / {realTotal}
           </Text>
         ) : null}
         <PartialFragmentsBlock
@@ -1098,23 +1118,34 @@ function PartialFragmentsBlock({
 }) {
   if (phase.kind === 'idle') {
     return (
-      <Pressable
-        onPress={onDownload}
-        style={{
-          marginTop: 12,
-          paddingVertical: 10,
-          paddingHorizontal: 14,
-          borderWidth: 1,
-          borderColor: '#30363d',
-          borderRadius: 6,
-          backgroundColor: '#161b22',
-          alignItems: 'center',
-        }}
-      >
-        <Text style={{ color: '#c9d1d9', fontSize: 13, fontWeight: '500' }}>
-          Descargar fragmentos disponibles
+      <View style={{ marginTop: 12 }}>
+        <Pressable
+          onPress={onDownload}
+          style={{
+            paddingVertical: 10,
+            paddingHorizontal: 14,
+            borderWidth: 1,
+            borderColor: '#30363d',
+            borderRadius: 6,
+            backgroundColor: '#161b22',
+            alignItems: 'center',
+          }}
+        >
+          <Text style={{ color: '#c9d1d9', fontSize: 13, fontWeight: '500' }}>
+            Exportar paquete técnico
+          </Text>
+        </Pressable>
+        <Text
+          style={{
+            color: '#8b949e',
+            fontSize: 11,
+            marginTop: 6,
+            fontStyle: 'italic',
+          }}
+        >
+          Contiene fragmentos técnicos no reproducibles directamente
         </Text>
-      </Pressable>
+      </View>
     );
   }
 
@@ -1229,26 +1260,6 @@ function PartialFragmentsBlock({
           Compartir índice (manifest.txt)
         </Text>
       </Pressable>
-      {phase.files.map((f) => (
-        <Pressable
-          key={f.index}
-          onPress={() => handleShare(f.path)}
-          style={{
-            marginTop: 6,
-            paddingVertical: 8,
-            paddingHorizontal: 12,
-            borderWidth: 1,
-            borderColor: '#30363d',
-            borderRadius: 6,
-            backgroundColor: '#0d1117',
-            alignItems: 'center',
-          }}
-        >
-          <Text style={{ color: '#c9d1d9', fontSize: 12 }}>
-            Compartir fragmento #{String(f.index).padStart(4, '0')}
-          </Text>
-        </Pressable>
-      ))}
     </View>
   );
 }
