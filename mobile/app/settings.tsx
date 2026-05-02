@@ -58,6 +58,11 @@ const LAST_SESSION_ID_KEY = 'export.last_session_id';
 
 const OAUTH_REDIRECT_PATH = 'oauth/drive';
 
+// External URL for the optional "support the creator" affordance shown
+// at the bottom of this screen. Opened via `Linking.openURL`. Pure UI —
+// touches no auth, no Drive flow, no queue.
+const CREATOR_COFFEE_URL = 'https://app.guardiancloud.app/';
+
 type Screen =
   | { kind: 'loading' }
   | { kind: 'signed-out' }
@@ -367,42 +372,6 @@ export default function SettingsScreen() {
         </View>
       )}
 
-      {/* TODO(export-history): sustituir esta opción temporal por Historial real */}
-      {lastSessionId && (
-        <View style={{ marginTop: 28 }}>
-          <Text
-            style={{
-              color: '#8b949e',
-              fontSize: 12,
-              letterSpacing: 1,
-              marginBottom: 8,
-            }}
-          >
-            EVIDENCIA
-          </Text>
-          <Pressable
-            onPress={() => router.push(`/session/${lastSessionId}`)}
-            style={{
-              backgroundColor: '#161b22',
-              borderWidth: 1,
-              borderColor: '#30363d',
-              borderRadius: 6,
-              padding: 14,
-            }}
-          >
-            <Text style={{ color: '#c9d1d9', fontWeight: '600' }}>
-              Exportar última sesión
-            </Text>
-            <Text
-              selectable
-              style={{ color: '#6e7681', fontSize: 11, marginTop: 4 }}
-            >
-              {lastSessionId}
-            </Text>
-          </Pressable>
-        </View>
-      )}
-
       <Text
         style={{
           color: '#6e7681',
@@ -418,10 +387,30 @@ export default function SettingsScreen() {
         cuenta de Google.
       </Text>
 
-      {/* DEV-only block. __DEV__ is true on Expo dev/Metro builds and false
-          on release. Wipes Guardian Cloud queue + last-session pointer in
-          AsyncStorage; auth tokens / Drive connection remain intact. */}
-      {__DEV__ && <DevQueueWipeBlock />}
+      <Pressable
+        onPress={() => {
+          // Best-effort external open — no auth, no queue, no Drive flow.
+          // A rejection (no browser available, malformed URL on a custom
+          // ROM, etc.) is silenced so we never trip an unhandled-promise
+          // warning; the user can simply tap again.
+          Linking.openURL(CREATOR_COFFEE_URL).catch(() => {
+            /* ignore */
+          });
+        }}
+        style={{
+          marginTop: 24,
+          backgroundColor: '#161b22',
+          borderWidth: 1,
+          borderColor: '#30363d',
+          borderRadius: 6,
+          padding: 14,
+          alignItems: 'center',
+        }}
+      >
+        <Text style={{ color: '#c9d1d9', fontSize: 13, fontWeight: '500' }}>
+          Invitar al creador a un café ☕
+        </Text>
+      </Pressable>
     </ScrollView>
   );
 }
