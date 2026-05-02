@@ -37,7 +37,10 @@ import {
   deriveSessionStatus,
   readHistory,
 } from '@/api/history';
-import { findLocalRecordingUri } from '@/recording/localEvidence';
+import {
+  findLocalRecordingUri,
+  findLocalExpectedChunkCount,
+} from '@/recording/localEvidence';
 
 // Single-flight lock for `Sharing.shareAsync`. Native iOS/Android
 // rejects a second share request while one is mid-flight with
@@ -87,6 +90,14 @@ export default function SessionDetailScreen() {
   const [localRecordingUri, setLocalRecordingUri] = useState<string | null>(
     null,
   );
+  // Authoritative emitted-chunk count for this session, read from the
+  // persisted queue. Used to detect the "backend says 7/7 but the local
+  // chunker emitted 32" false-positive integrity verdict. Null when the
+  // queue entry is gone (already reaped after a fully successful upload),
+  // in which case the backend's view is reliable on its own.
+  const [expectedLocalChunks, setExpectedLocalChunks] = useState<number | null>(
+    null,
+  );
 
   // Fetch real status on mount and after every successful export (the
   // export itself can change perceived state — e.g. it confirms what
@@ -118,6 +129,22 @@ export default function SessionDetailScreen() {
     (async () => {
       const uri = await findLocalRecordingUri(sessionId);
       if (!cancelled) setLocalRecordingUri(uri);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId, phase.kind === 'done']);
+
+  // Independent local emitted-chunk-count lookup. Same persistence
+  // source as the URI lookup, same lifetime guarantees. Drives the
+  // integrity recompute in ResultBlock so backend's partial chunk list
+  // cannot pass as "Completa".
+  useEffect(() => {
+    if (!sessionId) return;
+    let cancelled = false;
+    (async () => {
+      const expected = await findLocalExpectedChunkCount(sessionId);
+      if (!cancelled) setExpectedLocalChunks(expected);
     })();
     return () => {
       cancelled = true;
@@ -301,7 +328,12 @@ export default function SessionDetailScreen() {
       {phase.kind === 'localFallback' && (
         <LocalFallbackBlock filePath={phase.filePath} />
       )}
-      {phase.kind === 'done' && <ResultBlock result={phase.result} />}
+      {phase.kind === 'done' && (
+        <ResultBlock
+          result={phase.result}
+          expectedLocalChunks={expectedLocalChunks}
+        />
+      )}
       {phase.kind === 'error' && <ErrorBlock message={phase.message} />}
 
       <Text
@@ -424,15 +456,47 @@ function LocalFallbackBlock({ filePath }: { filePath: string }) {
   );
 }
 
-function ResultBlock({ result }: { result: ExportResult }) {
+function ResultBlock({
+  result,
+  expectedLocalChunks,
+}: {
+  result: ExportResult;
+  expectedLocalChunks: number | null;
+}) {
+  // Real expected total. Backend-derived `result.totalChunks` is only
+  // truthful when EVERY emitted chunk made it server-side. When uploads
+  // are still pending, backend sees a prefix (e.g. 7) while the local
+  // chunker emitted more (e.g. 32). The persisted queue entry remembers
+  // the local emission count via `next_chunk_index` (or `chunks.length`
+  // as fallback); we read that into `expectedLocalChunks`.
+  //
+  // Use the larger of the two — guards against edge cases where backend
+  // somehow knows about a chunk we never emitted (shouldn't happen, but
+  // avoids `realTotal < result.totalChunks` falsely shrinking the gap).
+  const realTotal = Math.max(
+    result.totalChunks,
+    expectedLocalChunks ?? 0,
+  );
+  // Real "missing" count vs the local emission truth. Includes both the
+  // chunks the backend has marked as `pending`/`failed` AND the chunks
+  // the backend doesn't know about at all (uploads still in flight).
+  // `result.missingIndexes` only covers the first category — that is
+  // the source of the false-positive bug.
+  const realMissing = Math.max(
+    0,
+    realTotal - result.validChunks - result.corruptIndexes.length,
+  );
   // Post-export integrity verdict. Computed from the data the export
-  // pipeline already produced (missingIndexes / corruptIndexes) — no
-  // new state, no new fetch. Decoupled from `summary.status` on
-  // purpose: the session can be `Cerrada` (backend lifecycle terminal)
+  // pipeline already produced (missingIndexes / corruptIndexes) PLUS
+  // the local emission truth — no new state, no new fetch beyond the
+  // already-loaded `expectedLocalChunks`. Decoupled from `summary.status`
+  // on purpose: the session can be `Cerrada` (backend lifecycle terminal)
   // and STILL have an integrity gap if the completion gate let some
   // chunk through as failed. UI must never conflate the two.
   const integrityStatus: 'full' | 'partial' =
-    result.missingIndexes.length === 0 && result.corruptIndexes.length === 0
+    result.missingIndexes.length === 0 &&
+    result.corruptIndexes.length === 0 &&
+    realMissing === 0
       ? 'full'
       : 'partial';
 
@@ -474,9 +538,9 @@ function ResultBlock({ result }: { result: ExportResult }) {
           Se han guardado fragmentos de la grabación.{'\n'}
           Faltan partes para generar un vídeo completo.
         </Text>
-        {result.totalChunks > 0 ? (
+        {realTotal > 0 ? (
           <Text style={{ color: '#8b949e', fontSize: 12, marginTop: 10 }}>
-            Fragmentos disponibles: {result.validChunks} / {result.totalChunks}
+            Fragmentos disponibles: {result.validChunks} / {realTotal}
           </Text>
         ) : null}
       </View>
