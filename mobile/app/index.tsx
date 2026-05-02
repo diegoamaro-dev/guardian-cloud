@@ -3540,7 +3540,7 @@ export default function Index() {
     guardianStatus === 'grabando'
       ? 'Grabando'
       : guardianStatus === 'subiendo'
-        ? `Subiendo evidencia (${uploadedCount} / ${totalCount})`
+        ? `Guardando evidencia (${uploadedCount} / ${totalCount})`
         : guardianStatus === 'recuperando'
           ? 'Recuperando'
           : guardianStatus === 'protegido'
@@ -3678,7 +3678,6 @@ export default function Index() {
         // `deriveGuardianStatus`.
         <View
           style={{
-            flexDirection: 'row',
             alignItems: 'center',
             justifyContent: 'center',
             paddingVertical: 14,
@@ -3699,7 +3698,17 @@ export default function Index() {
               letterSpacing: 0.5,
             }}
           >
-            Evidencia protegida ✅
+            🟢 Evidencia protegida
+          </Text>
+          <Text
+            style={{
+              color: '#8ee6a8',
+              fontSize: 13,
+              fontWeight: '400',
+              marginTop: 4,
+            }}
+          >
+            Guardada fuera de tu móvil
           </Text>
         </View>
       ) : null}
@@ -3744,9 +3753,9 @@ export default function Index() {
             marginBottom: 16,
           }}
         >
-          +{bgActiveSessions}{' '}
-          {bgActiveSessions === 1 ? 'sesión' : 'sesiones'} subiendo (
-          {bgUploaded} / {bgTotal})
+          {bgActiveSessions === 1
+            ? `Otra evidencia guardándose (${bgUploaded} / ${bgTotal})`
+            : `+${bgActiveSessions} evidencias guardándose (${bgUploaded} / ${bgTotal})`}
         </Text>
       ) : backgroundSessions > 0 ? (
         <Text
@@ -3757,8 +3766,9 @@ export default function Index() {
             marginBottom: 16,
           }}
         >
-          +{backgroundSessions}{' '}
-          {backgroundSessions === 1 ? 'sesión' : 'sesiones'} en segundo plano
+          {backgroundSessions === 1
+            ? 'Otra evidencia guardándose'
+            : `+${backgroundSessions} evidencias guardándose`}
         </Text>
       ) : null}
 
@@ -3805,6 +3815,23 @@ export default function Index() {
           {buttonLabel}
         </Text>
       </Pressable>
+
+      {/* Reassurance line shown only while actively recording — same
+          guardianStatus value the dot/label above already reads. No new
+          state, no new derivation. */}
+      {guardianStatus === 'grabando' ? (
+        <Text
+          style={{
+            color: '#8b949e',
+            fontSize: 13,
+            marginTop: -12,
+            marginBottom: 16,
+            textAlign: 'center',
+          }}
+        >
+          Se está guardando automáticamente
+        </Text>
+      ) : null}
 
       {!hasDrive && !driveCheckLoading && !showStop && (
         <Text
@@ -3865,11 +3892,11 @@ function DestinationIndicator({
   loading: boolean;
 }) {
   const dotColor = loading ? '#8b949e' : drive ? '#3ddc84' : '#f85149';
-  const label = loading
-    ? 'Comprobando destino…'
-    : drive
-      ? `Destino: Google Drive${drive.account_email ? ` · ${drive.account_email}` : ''}`
-      : 'Sin destino conectado';
+  // Connected case is rendered as two stacked lines (main + email);
+  // loading / not-connected keep the original single-line shape. Same
+  // data sources as before — `drive.account_email` is still read straight
+  // from the destination row, no logic change.
+  const fallbackLabel = loading ? 'Comprobando destino…' : 'Sin destino conectado';
 
   return (
     <View
@@ -3894,9 +3921,22 @@ function DestinationIndicator({
           marginRight: 8,
         }}
       />
-      <Text style={{ color: '#c9d1d9', fontSize: 12 }} numberOfLines={1}>
-        {label}
-      </Text>
+      {drive && !loading ? (
+        <View style={{ flexShrink: 1 }}>
+          <Text style={{ color: '#c9d1d9', fontSize: 12, fontWeight: '600' }} numberOfLines={1}>
+            🔒 Guardado en tu Google Drive
+          </Text>
+          {drive.account_email ? (
+            <Text style={{ color: '#8b949e', fontSize: 11, marginTop: 2 }} numberOfLines={1}>
+              {drive.account_email}
+            </Text>
+          ) : null}
+        </View>
+      ) : (
+        <Text style={{ color: '#c9d1d9', fontSize: 12 }} numberOfLines={1}>
+          {fallbackLabel}
+        </Text>
+      )}
     </View>
   );
 }
