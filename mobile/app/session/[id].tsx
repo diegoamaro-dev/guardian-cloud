@@ -24,6 +24,8 @@ import {
 } from 'react-native';
 import { router, useLocalSearchParams } from 'expo-router';
 import * as Sharing from 'expo-sharing';
+import * as FileSystem from 'expo-file-system';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 
 import {
   exportSession,
@@ -37,6 +39,59 @@ import {
   deriveSessionStatus,
   readHistory,
 } from '@/api/history';
+
+/**
+ * Local-export fallback helper.
+ *
+ * MUST mirror the same AsyncStorage key the queue uses in app/index.tsx
+ * (`PENDING_RETRY_KEY = 'test.pending_retry'`). The key is duplicated
+ * here on purpose: the rule is "do not modify GC_QUEUE", so we read
+ * its persisted shape WITHOUT importing or touching the queue helpers.
+ * This is a read-only side-channel — no mutation, no setItem, no schema
+ * coupling beyond `{ session_id: string, uri: string }`.
+ *
+ * Lifecycle: a queue entry's `uri` points at a durable file under
+ * `documentDirectory/guardian_recording_<ts><ext>` from `stopRecording`.
+ * The entry is reaped (and the file deleted) only AFTER all chunks
+ * upload AND `completeSession` succeeds — i.e. exactly when the cloud
+ * export already works. If we are in this fallback path the entry has
+ * not been reaped yet, so the file is still on disk.
+ *
+ * Returns null on:
+ *  - no queue / parse error
+ *  - no entry for this session_id
+ *  - entry has no `uri` or it does not exist on disk anymore
+ */
+const PENDING_RETRY_KEY = 'test.pending_retry';
+
+async function findLocalRecordingUri(
+  sessionId: string,
+): Promise<string | null> {
+  try {
+    const raw = await AsyncStorage.getItem(PENDING_RETRY_KEY);
+    if (!raw) return null;
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return null;
+    for (const entry of parsed) {
+      if (
+        !entry ||
+        typeof entry !== 'object' ||
+        (entry as { session_id?: unknown }).session_id !== sessionId
+      ) {
+        continue;
+      }
+      const uri = (entry as { uri?: unknown }).uri;
+      if (typeof uri !== 'string' || uri.length === 0) continue;
+      const info = await FileSystem.getInfoAsync(uri);
+      if (info.exists) return uri;
+      return null;
+    }
+    return null;
+  } catch (err) {
+    console.log('LOCAL EXPORT lookup failed', err);
+    return null;
+  }
+}
 
 // Single-flight lock for `Sharing.shareAsync`. Native iOS/Android
 // rejects a second share request while one is mid-flight with
@@ -61,6 +116,8 @@ async function handleShare(filePath: string) {
 type Phase =
   | { kind: 'idle' }
   | { kind: 'running'; progress: ExportProgress | null }
+  | { kind: 'localExport' }
+  | { kind: 'localFallback'; filePath: string }
   | { kind: 'done'; result: ExportResult }
   | { kind: 'error'; message: string };
 
@@ -75,6 +132,15 @@ export default function SessionDetailScreen() {
   // we never offer "Exportar" for a session with zero uploaded chunks.
   const [statusSummary, setStatusSummary] =
     useState<SessionStatusSummary | null>(null);
+  // Local-recording URI lookup, independent of the cloud status fetch.
+  // Populated from the persisted queue (read-only) at mount and after
+  // any phase transition that could have reaped the entry. Used both
+  // to enable the export button when cloud is unavailable AND as the
+  // fallback target inside `handleExport`. State only — never mutated
+  // by anything outside this screen, never persisted.
+  const [localRecordingUri, setLocalRecordingUri] = useState<string | null>(
+    null,
+  );
 
   // Fetch real status on mount and after every successful export (the
   // export itself can change perceived state — e.g. it confirms what
@@ -96,18 +162,77 @@ export default function SessionDetailScreen() {
     };
   }, [sessionId, phase.kind === 'done']);
 
-  // Export is disabled while running, while the id is missing, while
-  // status is still loading, OR when the live status proves there is
-  // nothing useful to export (zero uploaded chunks). The latter rule
-  // is what the spec calls "export option only if enough data exists".
+  // Independent local-recording lookup. Runs on mount AND after the
+  // cloud export finishes (the queue entry — and the file — may have
+  // been reaped by the worker after a successful upload). Read-only;
+  // never writes to AsyncStorage or the queue.
+  useEffect(() => {
+    if (!sessionId) return;
+    let cancelled = false;
+    (async () => {
+      const uri = await findLocalRecordingUri(sessionId);
+      if (!cancelled) setLocalRecordingUri(uri);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId, phase.kind === 'done']);
+
+  // Two independent enablers for the button. The user only needs ONE
+  // to be true:
+  //   - cloud has chunks → existing cloud export path is viable
+  //   - localRecordingUri is set → offline / no-cloud-chunks fallback
+  //                                 has a usable local file
+  // Without the local OR-branch, an offline launch (where the network
+  // call inside the cloud-status effect fails into uploaded=0) leaves
+  // the button permanently disabled — exactly the bug being fixed.
+  const canExportCloud =
+    statusSummary !== null && statusSummary.uploaded > 0;
+  const canExportLocal = localRecordingUri !== null;
   const exportDisabled =
     phase.kind === 'running' ||
     sessionId.length === 0 ||
-    statusSummary === null ||
-    statusSummary.uploaded === 0;
+    (!canExportCloud && !canExportLocal);
 
   async function handleExport() {
     if (!sessionId) return;
+
+    // Local-only path. When cloud has nothing to give (offline at boot
+    // or the session never had any chunk uploaded) we skip the cloud
+    // attempt entirely and serve the local file. Re-verify the URI
+    // here in case the file was reaped between the mount-time lookup
+    // and this tap.
+    if (!canExportCloud && canExportLocal) {
+      setPhase({ kind: 'localExport' });
+      const verifiedUri = await findLocalRecordingUri(sessionId);
+      if (verifiedUri) {
+        console.log('LOCAL EXPORT direct (no cloud)', {
+          sessionId,
+          localUri: verifiedUri,
+        });
+        setPhase({ kind: 'localFallback', filePath: verifiedUri });
+        return;
+      }
+      // The file disappeared between mount and tap. Drop the local
+      // hint and fall through to the failed UI.
+      setLocalRecordingUri(null);
+      setPhase({
+        kind: 'done',
+        result: {
+          status: 'failed',
+          filePath: null,
+          totalChunks: 0,
+          validChunks: 0,
+          missingIndexes: [],
+          corruptIndexes: [],
+        },
+      });
+      return;
+    }
+
+    // Cloud-first path with the original local fallback when cloud
+    // export collapses to failed/0 (offline mid-flight, no uploaded
+    // chunks server-side, etc.).
     setPhase({ kind: 'running', progress: null });
     try {
       // Look up this session's recording mode from the local history
@@ -130,6 +255,32 @@ export default function SessionDetailScreen() {
         },
         mode,
       );
+
+      // Local-export fallback. `exportSession` collapses every failure
+      // path into `status='failed'` + `validChunks === 0`: that covers
+      // the offline case (`listSessionChunks` threw NETWORK_ERROR) AND
+      // the "no chunks uploaded yet" case. In both situations the
+      // recording's local file is likely still on disk (the queue
+      // entry has not been reaped because uploads never finished). If
+      // we can find that local URI, surface it as the result instead
+      // of the empty failure block. The cloud export logic is NOT
+      // modified — we only react to its output.
+      if (result.status === 'failed' && result.validChunks === 0) {
+        setPhase({ kind: 'localExport' });
+        const localUri =
+          localRecordingUri ?? (await findLocalRecordingUri(sessionId));
+        if (localUri) {
+          console.log('LOCAL EXPORT fallback used', {
+            sessionId,
+            localUri,
+          });
+          setPhase({ kind: 'localFallback', filePath: localUri });
+          return;
+        }
+        // No local file available either — fall through to the
+        // existing failed UI which renders the cloud result.
+      }
+
       setPhase({ kind: 'done', result });
     } catch (err) {
       // `exportSession` is supposed to never throw, but we defend in
@@ -200,6 +351,10 @@ export default function SessionDetailScreen() {
       </Pressable>
 
       {phase.kind === 'running' && <ProgressBlock progress={phase.progress} />}
+      {phase.kind === 'localExport' && <LocalExportBlock />}
+      {phase.kind === 'localFallback' && (
+        <LocalFallbackBlock filePath={phase.filePath} />
+      )}
       {phase.kind === 'done' && <ResultBlock result={phase.result} />}
       {phase.kind === 'error' && <ErrorBlock message={phase.message} />}
 
@@ -245,6 +400,80 @@ function ProgressBlock({ progress }: { progress: ExportProgress | null }) {
       <Text style={{ color: '#c9d1d9', marginLeft: 10, fontSize: 13 }}>
         {label}
       </Text>
+    </View>
+  );
+}
+
+/**
+ * Brief loader shown while we look up the local recording URI after a
+ * cloud export failure. Same shape as ProgressBlock for visual
+ * continuity. The lookup itself is fast (one AsyncStorage read + one
+ * filesystem stat) so this is on screen for a tick or two.
+ */
+function LocalExportBlock() {
+  return (
+    <View
+      style={{
+        flexDirection: 'row',
+        alignItems: 'center',
+        backgroundColor: '#161b22',
+        borderWidth: 1,
+        borderColor: '#30363d',
+        borderRadius: 6,
+        padding: 12,
+        marginTop: 4,
+      }}
+    >
+      <ActivityIndicator color="#c9d1d9" />
+      <Text style={{ color: '#c9d1d9', marginLeft: 10, fontSize: 13 }}>
+        Exportando desde el dispositivo…
+      </Text>
+    </View>
+  );
+}
+
+/**
+ * Result block for the local-export fallback path. Reuses the same
+ * visual shape as the "complete" cloud result so the user sees a
+ * familiar success affordance, but with explicit copy that this came
+ * from the device (no Drive verification, no chunk concat). Shares the
+ * file via `expo-sharing`, identical to the cloud success path.
+ */
+function LocalFallbackBlock({ filePath }: { filePath: string }) {
+  return (
+    <View
+      style={{
+        marginTop: 4,
+        padding: 12,
+        borderWidth: 1,
+        borderColor: '#238636',
+        borderRadius: 6,
+        backgroundColor: '#0a2a14',
+      }}
+    >
+      <Text style={{ color: '#56d364', fontSize: 13, fontWeight: '600' }}>
+        Evidencia local lista
+      </Text>
+      <Text style={{ color: '#c9d1d9', fontSize: 12, marginTop: 6 }}>
+        Sin conexión: se ha exportado directamente desde el dispositivo.
+      </Text>
+      <Pressable
+        onPress={() => handleShare(filePath)}
+        style={{
+          marginTop: 10,
+          paddingVertical: 10,
+          paddingHorizontal: 14,
+          borderWidth: 1,
+          borderColor: '#30363d',
+          borderRadius: 6,
+          backgroundColor: '#161b22',
+          alignItems: 'center',
+        }}
+      >
+        <Text style={{ color: '#c9d1d9', fontSize: 13, fontWeight: '500' }}>
+          Compartir archivo
+        </Text>
+      </Pressable>
     </View>
   );
 }
