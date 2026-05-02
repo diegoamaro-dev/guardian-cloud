@@ -61,7 +61,7 @@ const OAUTH_REDIRECT_PATH = 'oauth/drive';
 // External URL for the optional "support the creator" affordance shown
 // at the bottom of this screen. Opened via `Linking.openURL`. Pure UI —
 // touches no auth, no Drive flow, no queue.
-const CREATOR_COFFEE_URL = 'https://app.guardiancloud.app/';
+const CREATOR_COFFEE_URL = 'https://app.guardiancloud.app/cafe.html';
 
 type Screen =
   | { kind: 'loading' }
@@ -399,15 +399,13 @@ export default function SettingsScreen() {
         }}
         style={{
           marginTop: 24,
-          backgroundColor: '#161b22',
-          borderWidth: 1,
-          borderColor: '#30363d',
+          backgroundColor: '#9e7c2a',
           borderRadius: 6,
           padding: 14,
           alignItems: 'center',
         }}
       >
-        <Text style={{ color: '#c9d1d9', fontSize: 13, fontWeight: '500' }}>
+        <Text style={{ color: '#0d1117', fontSize: 13, fontWeight: '600' }}>
           Invitar al creador a un café ☕
         </Text>
       </Pressable>
