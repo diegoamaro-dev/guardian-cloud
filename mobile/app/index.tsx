@@ -4,6 +4,7 @@ import { Audio } from 'expo-av';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import * as FileSystem from 'expo-file-system';
 import * as Crypto from 'expo-crypto';
+import * as Haptics from 'expo-haptics';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { router, Stack, useLocalSearchParams } from 'expo-router';
 import { supabase } from '@/auth/supabase';
@@ -19,7 +20,10 @@ import { appendHistoryEntry, type SessionMode } from '@/api/history';
 import { hardResetAppState } from '@/dev/reset';
 import type { ChunkPayload } from '@/recording/chunkProducer';
 import { RecordingController } from '@/recording/recordingController';
-import { deriveGuardianStatus } from '@/recording/deriveGuardianStatus';
+import {
+  deriveGuardianStatus,
+  type GuardianStatus,
+} from '@/recording/deriveGuardianStatus';
 import {
   startBackgroundProtection,
   stopBackgroundProtection,
@@ -1099,6 +1103,33 @@ export function shapeError(
 
 function sleep(ms: number): Promise<void> {
   return new Promise(r => setTimeout(r, ms));
+}
+
+/**
+ * User-facing label for a `GuardianStatus`. Pure read-only mapping —
+ * does NOT compute the status itself (that is the sole job of
+ * `deriveGuardianStatus`). Lives here so the home screen can render
+ * the human text above the main button without duplicating the
+ * status precedence logic.
+ *
+ * Returns the literal copy specified by the UX spec for each branch.
+ */
+function getStatusLabel(status: GuardianStatus): string {
+  switch (status) {
+    case 'grabando':
+      return 'Protegiendo evidencia';
+    case 'subiendo':
+      return 'Subiendo evidencia';
+    case 'protegido':
+      return 'Evidencia protegida';
+    case 'recuperando':
+      return 'Recuperando evidencia';
+    case 'error':
+      return 'Error en evidencia';
+    case 'listo':
+    default:
+      return 'Listo';
+  }
 }
 
 // ----- pending remote-session registrations (offline-first) -----
@@ -3089,6 +3120,12 @@ export default function Index() {
       console.log('REC START ignored — already starting or recording');
       return;
     }
+    // Haptic feedback at the moment the user commits to start. Heavy
+    // impact = decisive "now" feel. Fire-and-forget; we never want
+    // a vibrator stub error to block the recording flow.
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy).catch(() => {
+      /* haptics not available — ignore */
+    });
     isStartingRef.current = true;
     setIsStarting(true);
     resetProgress();
@@ -3400,6 +3437,13 @@ export default function Index() {
       console.log('ERROR REC: no active recording on stop');
       return;
     }
+    // Success-tone haptic at the instant the user commits to stop.
+    // Fire-and-forget; harmless if vibrator unavailable.
+    Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(
+      () => {
+        /* haptics not available — ignore */
+      },
+    );
     const sessionId = sessionIdRef.current;
 
     setIsStopping(true);
