@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Static Android app shortcuts (Android 7.1+, API 25).
+
+  Long-pressing the launcher icon surfaces this shortcut as a quick
+  entry point straight into Guardian Cloud's home screen with the
+  panic-flow primed:
+
+    intent → guardiancloud:///?panic=1
+
+  The home screen reads `?panic=1` from the deep link via Expo Router's
+  `useLocalSearchParams` and renders the "Listo para grabar" affordance.
+  It does NOT auto-start a recording — Play Store policy and the
+  project's "no hidden recording" rule require an explicit user tap.
+
+  The intent re-uses the existing custom-scheme handler the activity
+  already declares for OAuth redirects (`guardiancloud://`), so no new
+  intent-filter is needed in the manifest.
+-->
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+  <shortcut
+    android:shortcutId="grabar_evidencia"
+    android:enabled="true"
+    android:icon="@mipmap/ic_launcher"
+    android:shortcutShortLabel="@string/shortcut_grabar_short_label"
+    android:shortcutLongLabel="@string/shortcut_grabar_long_label"
+    android:shortcutDisabledMessage="@string/shortcut_grabar_disabled_message">
+    <intent
+      android:action="android.intent.action.VIEW"
+      android:targetPackage="com.guardiancloud.app"
+      android:targetClass="com.guardiancloud.app.MainActivity"
+      android:data="guardiancloud:///?panic=1" />
+    <categories android:name="android.shortcut.conversation" />
+  </shortcut>
+</shortcuts>

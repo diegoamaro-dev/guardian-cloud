@@ -5,7 +5,7 @@ import { CameraView, useCameraPermissions } from 'expo-camera';
 import * as FileSystem from 'expo-file-system';
 import * as Crypto from 'expo-crypto';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { router, Stack } from 'expo-router';
+import { router, Stack, useLocalSearchParams } from 'expo-router';
 import { supabase } from '@/auth/supabase';
 import { env } from '@/config/env';
 import {
@@ -2654,6 +2654,23 @@ export default function Index() {
   const [mode, setMode] = useState<SessionMode>('audio');
 
   /**
+   * Deep-link / launcher-shortcut params.
+   *
+   * The Android app shortcut (long-press launcher → "Grabar evidencia")
+   * fires `guardiancloud:///?panic=1` which lands here as
+   * `params.panic === '1'`. We use it ONLY to render a small "Listo
+   * para grabar" line — the user must still tap the GRABAR AHORA
+   * button. Critically, this hook is read-only: nothing in this file
+   * calls `startRecording` based on the param. Play Store policy +
+   * project rule: no auto-record, no hidden capture.
+   *
+   * `useLocalSearchParams` re-runs when the URL changes, so a warm
+   * launch via the shortcut also flips this on without remounting.
+   */
+  const params = useLocalSearchParams<{ panic?: string }>();
+  const panicLaunch = params.panic === '1';
+
+  /**
    * Destination gate state.
    *
    * `null`          → still checking (or check failed transiently)
@@ -4163,6 +4180,25 @@ export default function Index() {
             Inicio rápido activado
           </Text>
         </View>
+      ) : null}
+
+      {/* Launcher-shortcut affordance. Shown when the app was opened
+          via the Android app shortcut ("Grabar evidencia") so the user
+          knows the panic flow is one tap away. Strictly cosmetic — does
+          not call into any recording flow. */}
+      {!showStop && !buttonDisabled && panicLaunch ? (
+        <Text
+          style={{
+            color: '#3ddc84',
+            fontSize: 13,
+            fontWeight: '600',
+            marginTop: 6,
+            marginBottom: -4,
+            textAlign: 'center',
+          }}
+        >
+          Listo para grabar
+        </Text>
       ) : null}
 
       <Pressable

@@ -35,6 +35,13 @@
         <data android:scheme="guardiancloud"/>
         <data android:scheme="exp+guardian-cloud"/>
       </intent-filter>
+      <!-- Static Android app shortcut. Long-press the launcher icon →
+           "Grabar evidencia" entry. Opens MainActivity via the existing
+           guardiancloud:// scheme with ?panic=1 so the home screen can
+           render its panic-flow affordance. NEVER auto-records. -->
+      <meta-data
+        android:name="android.app.shortcuts"
+        android:resource="@xml/shortcuts"/>
     </activity>
   </application>
 </manifest>

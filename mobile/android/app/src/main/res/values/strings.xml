@@ -1,3 +1,9 @@
 <resources>
   <string name="app_name">Guardian Cloud</string>
+  <!-- App-shortcut labels (long-press the launcher icon → menu).
+       The shortcut opens the app on Home with ?panic=1; nothing
+       records automatically — the user still has to tap the button. -->
+  <string name="shortcut_grabar_short_label">Grabar</string>
+  <string name="shortcut_grabar_long_label">Grabar evidencia</string>
+  <string name="shortcut_grabar_disabled_message">Guardian Cloud no está disponible</string>
 </resources>
