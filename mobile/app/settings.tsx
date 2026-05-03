@@ -29,6 +29,11 @@ import { clearGuardianQueueDev } from '.';
 // or recovered. See index.tsx LAST_SESSION_ID_KEY. Kept as a literal on
 // purpose — introducing a shared module just for this would be premature.
 const LAST_SESSION_ID_KEY = 'export.last_session_id';
+// Mirror of the panic-mode preference key in app/index.tsx
+// (QUICK_START_KEY). Same duplication policy as LAST_SESSION_ID_KEY:
+// one literal in two files is cheaper than a shared module for one
+// const. Both files MUST stay in sync.
+const QUICK_START_KEY = 'guardian.quick_start';
 
 /**
  * Settings screen — destination management.
@@ -95,6 +100,11 @@ export default function SettingsScreen() {
   const [lastUploadRef, setLastUploadRef] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [lastSessionId, setLastSessionId] = useState<string | null>(null);
+  // Persisted "Inicio rápido" panic-mode preference. Pure UI flag: the
+  // home screen renders an "Inicio rápido activado" pill when true.
+  // Never auto-records — Play Store policy + project rule.
+  const [quickStartEnabled, setQuickStartEnabled] = useState(false);
+  const [quickStartBusy, setQuickStartBusy] = useState(false);
 
   // Guard against double-exchange: if a deep link fires twice or we pick
   // up the same URL via both `getInitialURL` and the `url` listener, the
@@ -138,6 +148,33 @@ export default function SettingsScreen() {
         /* ignore — shortcut simply stays hidden */
       });
   }, []);
+
+  // Hydrate the Inicio-rápido toggle on mount. '1' means ON; anything
+  // else (including null) means OFF. Defaults to OFF on first run so
+  // the user opts in explicitly.
+  useEffect(() => {
+    AsyncStorage.getItem(QUICK_START_KEY)
+      .then(raw => setQuickStartEnabled(raw === '1'))
+      .catch(() => {
+        /* default false, ignore */
+      });
+  }, []);
+
+  async function toggleQuickStart() {
+    const next = !quickStartEnabled;
+    setQuickStartBusy(true);
+    setQuickStartEnabled(next); // optimistic — revert on persistence error
+    try {
+      await AsyncStorage.setItem(QUICK_START_KEY, next ? '1' : '0');
+    } catch (err) {
+      // Persistence failed — roll back the toggle so what the UI shows
+      // matches what the home screen will read on next mount.
+      setQuickStartEnabled(!next);
+      console.log('QUICK_START toggle persist failed', err);
+    } finally {
+      setQuickStartBusy(false);
+    }
+  }
 
   // --- Deep-link handling for the OAuth redirect.
   useEffect(() => {
@@ -386,6 +423,69 @@ export default function SettingsScreen() {
         revocar el permiso en cualquier momento desde la configuración de tu
         cuenta de Google.
       </Text>
+
+      {/* Modo pánico — UI-only preference. NEVER auto-records. The home
+          screen reads this flag at mount and renders an "Inicio rápido
+          activado" pill near the GRABAR AHORA button so the user can
+          confirm at a glance the panic flow is armed. */}
+      <Text
+        style={{
+          color: '#8b949e',
+          fontSize: 12,
+          letterSpacing: 1,
+          marginTop: 28,
+          marginBottom: 8,
+        }}
+      >
+        MODO PÁNICO
+      </Text>
+      <Pressable
+        onPress={toggleQuickStart}
+        disabled={quickStartBusy}
+        style={{
+          flexDirection: 'row',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          padding: 14,
+          borderWidth: 1,
+          borderColor: quickStartEnabled ? '#3ddc84' : '#30363d',
+          borderRadius: 8,
+          backgroundColor: '#161b22',
+          opacity: quickStartBusy ? 0.6 : 1,
+        }}
+      >
+        <View style={{ flexShrink: 1, paddingRight: 12 }}>
+          <Text style={{ color: '#c9d1d9', fontSize: 14, fontWeight: '600' }}>
+            Inicio rápido
+          </Text>
+          <Text
+            style={{ color: '#6e7681', fontSize: 11, marginTop: 4, lineHeight: 15 }}
+          >
+            Resalta el botón principal para que puedas iniciar la grabación
+            de inmediato. La app NUNCA graba sin que pulses.
+          </Text>
+        </View>
+        <View
+          style={{
+            width: 44,
+            height: 26,
+            borderRadius: 13,
+            backgroundColor: quickStartEnabled ? '#3ddc84' : '#30363d',
+            justifyContent: 'center',
+            paddingHorizontal: 3,
+          }}
+        >
+          <View
+            style={{
+              width: 20,
+              height: 20,
+              borderRadius: 10,
+              backgroundColor: '#fff',
+              alignSelf: quickStartEnabled ? 'flex-end' : 'flex-start',
+            }}
+          />
+        </View>
+      </Pressable>
 
       <Pressable
         onPress={() => {

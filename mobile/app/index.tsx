@@ -64,6 +64,22 @@ export const PENDING_RETRY_KEY = 'test.pending_retry';
  */
 const LAST_SESSION_ID_KEY = 'export.last_session_id';
 /**
+ * Persisted UI preference for "Inicio rápido" (panic mode prep).
+ *
+ * Pure UI affordance: when true, the home screen surfaces the
+ * "Inicio rápido activado" pill near the GRABAR button. The toggle
+ * lives in the Settings screen. Critically, this flag does NOT
+ * auto-start a recording — the user must always tap the button.
+ * Play Store policy and the project's "no hidden recording" rule
+ * forbid background-initiated capture without explicit consent.
+ *
+ * Lives in AsyncStorage alongside `LAST_SESSION_ID_KEY`. Same
+ * literal duplicated verbatim in `app/settings.tsx` (precedent: the
+ * existing LAST_SESSION_ID_KEY is duplicated the same way to avoid
+ * a shared module for one constant).
+ */
+const QUICK_START_KEY = 'guardian.quick_start';
+/**
  * DEBUG-only toggle for the multi-chunk recovery test.
  *
  *   true  → after chunk 0 uploads, chunk 1 is SIMULATED as failed (no real
@@ -2738,6 +2754,27 @@ export default function Index() {
    * The single source of truth for the system stays `guardianStatus`.
    */
   const [protectedShownAt, setProtectedShownAt] = useState<number | null>(null);
+  /**
+   * Persisted UI preference: "Inicio rápido" (panic mode prep). UI-only.
+   * When true the home screen renders a small "Inicio rápido activado"
+   * pill near the main button so the user knows the panic flow is
+   * armed. NEVER auto-records — the user must always tap.
+   */
+  const [quickStartEnabled, setQuickStartEnabled] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    AsyncStorage.getItem(QUICK_START_KEY)
+      .then(raw => {
+        if (cancelled) return;
+        setQuickStartEnabled(raw === '1');
+      })
+      .catch(() => {
+        /* default false, ignore */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   function resetProgress() {
     setUploadedCount(0);
@@ -3860,7 +3897,10 @@ export default function Index() {
   const buttonDisabled = showStop
     ? isStopping
     : isStarting || isBusy || driveConfirmedMissing;
-  const buttonLabel = showStop ? 'PARAR' : 'GRABAR';
+  // "GRABAR AHORA" replaces the prior "GRABAR" copy: the panic-flow
+  // language reduces friction at start by signalling immediacy. The
+  // underlying handler is unchanged — same `startRecording` path.
+  const buttonLabel = showStop ? 'PARAR' : 'GRABAR AHORA';
   const buttonBg = showStop ? '#d73a49' : '#1f6feb';
 
   return (
@@ -4073,6 +4113,58 @@ export default function Index() {
         disabled={isRecording || isStarting || isStopping}
       />
 
+      {/* Panic-flow reassurance line. Visible only when the button is
+          armed for a fresh recording (not while stopping, not while
+          disabled). Pure copy — does not call into any flow. */}
+      {!showStop && !buttonDisabled ? (
+        <Text
+          style={{
+            color: '#c9d1d9',
+            fontSize: 14,
+            fontWeight: '500',
+            marginTop: 24,
+            marginBottom: -8,
+            textAlign: 'center',
+          }}
+        >
+          Pulsa para proteger evidencia
+        </Text>
+      ) : null}
+
+      {/* Discreet "Inicio rápido activado" pill. Surfaces the panic
+          preference so the user can confirm at a glance that the home
+          screen is primed. UI-only — the toggle in Settings is the
+          ONLY mutator; this just reflects state. */}
+      {!showStop && quickStartEnabled ? (
+        <View
+          style={{
+            flexDirection: 'row',
+            alignItems: 'center',
+            paddingHorizontal: 10,
+            paddingVertical: 4,
+            borderWidth: 1,
+            borderColor: '#3ddc84',
+            borderRadius: 999,
+            marginTop: 8,
+            marginBottom: -4,
+            backgroundColor: '#0a2a14',
+          }}
+        >
+          <View
+            style={{
+              width: 6,
+              height: 6,
+              borderRadius: 3,
+              backgroundColor: '#3ddc84',
+              marginRight: 6,
+            }}
+          />
+          <Text style={{ color: '#3ddc84', fontSize: 11, fontWeight: '600' }}>
+            Inicio rápido activado
+          </Text>
+        </View>
+      ) : null}
+
       <Pressable
         onPress={showStop ? stopRecording : startRecording}
         disabled={buttonDisabled}
@@ -4092,9 +4184,11 @@ export default function Index() {
         <Text
           style={{
             color: '#fff',
-            fontSize: 28,
+            fontSize: 24,
             fontWeight: '700',
             letterSpacing: 2,
+            textAlign: 'center',
+            paddingHorizontal: 4,
           }}
         >
           {buttonLabel}
