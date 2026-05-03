@@ -19,11 +19,24 @@ Responsabilidades:
 - subir
 - reintentar
 - recuperar estado tras fallo
+- mantener subida activa con la app minimizada (Android foreground service)
 
-Tecnologías previstas:
-- React Native / Expo
-- SQLite local
-- sistema de archivos local
+Tecnologías reales (MVP actual):
+- React Native / Expo (Dev Client, prebuild)
+- AsyncStorage (`@react-native-async-storage/async-storage`) como cola
+  persistente. Una sola clave `test.pending_retry` guarda un array de
+  entries `PendingQueueEntry` (sesión + chunks + status). Lectura/escritura
+  serializada con un `writeChain` para evitar carreras.
+- expo-file-system para los archivos de grabación y los chunks en disco
+- expo-av (audio) y expo-camera (vídeo)
+- react-native-background-actions para el foreground service Android
+  (notificación persistente "Guardian Cloud está protegiendo tu evidencia")
+
+> SQLite NO se usa. Se evaluó al inicio y se descartó: AsyncStorage cubre
+> el volumen real (chunks por sesión cuentan en decenas o cientos, no
+> miles), elimina una dependencia nativa, y la cola es array-of-array sin
+> joins. Si en el futuro el volumen exige SQLite la migración es local —
+> el resto de la arquitectura no la nota.
 
 ## 2. Backend
 
@@ -55,10 +68,17 @@ Tecnología:
 
 ## 4. Almacenamiento final
 
-Destinos iniciales:
-- Google Drive
-- futuro NAS
-- futuros conectores
+Destino del MVP actual:
+- Google Drive (vía OAuth `drive.file`, carpeta `/GuardianCloud`)
+
+Destinos futuros (NO en MVP):
+- NAS del usuario (WebDAV sobre HTTPS — ver `NAS_DESTINATION_PLAN.md`)
+- otros conectores cloud
+
+> El MVP actual entrega Google Drive completo: subida proxied por el
+> backend, dedup en dos capas (DB + nombre de archivo determinista),
+> recovery tras kill, export por descarga inversa. NAS y otros destinos
+> son una segunda iteración, no parte de v0.3.
 
 ## Flujo de datos
 
