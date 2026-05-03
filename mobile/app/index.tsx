@@ -4174,24 +4174,6 @@ export default function Index() {
         disabled={isRecording || isStarting || isStopping}
       />
 
-      {/* Panic-flow reassurance line. Visible only when the button is
-          armed for a fresh recording (not while stopping, not while
-          disabled). Pure copy — does not call into any flow. */}
-      {!showStop && !buttonDisabled ? (
-        <Text
-          style={{
-            color: '#c9d1d9',
-            fontSize: 14,
-            fontWeight: '500',
-            marginTop: 24,
-            marginBottom: -8,
-            textAlign: 'center',
-          }}
-        >
-          Pulsa para proteger evidencia
-        </Text>
-      ) : null}
-
       {/* Discreet "Inicio rápido activado" pill. Surfaces the panic
           preference so the user can confirm at a glance that the home
           screen is primed. UI-only — the toggle in Settings is the
