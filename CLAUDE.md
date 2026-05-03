@@ -11,7 +11,7 @@ Tu trabajo es implementar el sistema respetando estrictamente la documentación.
 ## 2. Fuente de verdad
 
 SIEMPRE debes basarte en los archivos dentro de /docs/:
-
+VALUE_PROPOSITION.md
 - START_HERE.md
 - GUARDIAN_CLOUD_MASTER_SPEC.md
 - ARCHITECTURE.md
@@ -25,6 +25,7 @@ SIEMPRE debes basarte en los archivos dentro de /docs/:
 -TEST_RESULTS.md
 -IMPLEMENTATION_STATUS.md
 -KNOWN_DEBT.md
+STATE_v0.2_BACKGROUND_RECOVERY.md
 Si hay conflicto:
 > gana la documentación, no tu criterio
 
