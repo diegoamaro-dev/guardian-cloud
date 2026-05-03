@@ -78,3 +78,65 @@ Estado básico del backend.
 - la API v1 no debe ser enorme
 - primero debe ser estable
 - la fuente de verdad crítica es el estado de sesión y chunk
+
+## Evidence Manifest (futuro)
+
+### GET /sessions/:id/manifest
+
+Devuelve el manifest de reconstrucción de una sesión.
+
+Response:
+
+```json
+{
+  "session_id": "...",
+  "mode": "audio",
+  "format": "m4a",
+  "chunks": [
+    {
+      "index": 0,
+      "hash": "...",
+      "size": 16384,
+      "remote_reference": "drive_file_id"
+    }
+  ]
+}
+```
+
+---
+
+### Notas
+
+* NO es necesario para el MVP
+* se basa en datos ya existentes (`chunks`)
+* no introduce nueva lógica de negocio
+* permite reconstrucción externa sin app
+
+---
+
+### Decisión
+
+> El manifest es una vista derivada, no una entidad nueva
+
+Se genera a partir de:
+
+* tabla de chunks
+* metadata de sesión
+
+---
+
+### Motivación
+
+Permitir:
+
+* reconstrucción manual
+* uso forense
+* independencia del cliente
+
+---
+
+### Restricciones
+
+* debe ser idempotente
+* no duplicar datos
+* no introducir estado adicional

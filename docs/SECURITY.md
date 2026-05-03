@@ -106,6 +106,92 @@ Deben:
 - validar integridad básica
 
 ---
+### 7.1 Integridad de evidencia (extensión)
+
+Guardian Cloud introduce una capa básica de integridad para aumentar la trazabilidad de la evidencia sin comprometer el rendimiento del sistema.
+
+---
+
+### Nivel 1 — Integridad actual (MVP)
+
+* cada chunk incluye:
+
+  * `index`
+  * `hash`
+  * `size`
+
+* el hash permite:
+
+  * detectar corrupción
+  * validar consistencia durante subida y export
+
+---
+
+### Nivel 2 — Cadena de chunks (pendiente)
+
+Cada chunk podrá incluir:
+
+* `prev_hash`
+
+Esto permite:
+
+* detectar reordenación
+* detectar eliminación de chunks
+* aumentar la trazabilidad de la secuencia
+
+---
+
+### Nivel 3 — Hash de sesión (pendiente)
+
+Al completar la sesión:
+
+* se genera un `session_hash` a partir de todos los chunks
+
+Esto permite:
+
+* verificar consistencia global
+* comparar reconstrucciones
+
+---
+
+### Nivel 4 — Metadata exportable (pendiente)
+
+El sistema podrá generar un archivo adicional:
+
+* `evidence_metadata.json`
+
+Incluye:
+
+* `session_id`
+* `session_hash`
+* lista de chunks
+* timestamps básicos
+
+---
+
+### Decisión clave
+
+> Estas capas NO forman parte del MVP inicial
+
+Motivo:
+
+* no deben afectar la subida
+* no deben introducir latencia
+* no deben complicar recovery
+
+---
+
+### Regla crítica
+
+> La integridad nunca debe comprometer la subida de evidencia
+
+Si existe conflicto entre:
+
+* integridad avanzada
+* fiabilidad del sistema
+
+👉 gana siempre la fiabilidad
+
 
 ## 8. Autenticación
 

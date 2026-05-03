@@ -101,3 +101,97 @@ Destinos futuros (NO en MVP):
 ## Decisión clave
 
 > El homelab aloja lógica y control, no el peso del almacenamiento.
+
+## 5. Evidence Export & Reconstruction
+
+### Objetivo
+
+Permitir que la evidencia generada por el sistema pueda ser utilizada fuera de la app, sin depender de Guardian Cloud.
+
+---
+
+### Nivel 1 — Export (MVP actual)
+
+El cliente es responsable de reconstruir la evidencia final:
+
+* descarga chunks desde el destino (Drive)
+* verifica integridad (hash)
+* ordena por `chunk_index`
+* concatena en orden
+* genera archivo final (`.m4a` / `.mp4`)
+
+Este flujo está implementado en cliente y forma parte del MVP validado.
+
+---
+
+### Nivel 2 — Forensic Reconstruction (futuro)
+
+Se introduce un modo de reconstrucción externa basado en:
+
+#### Manifest
+
+Archivo `manifest.json` asociado a cada sesión:
+
+* lista de chunks
+* orden (`index`)
+* hash
+* tamaño
+* metadata básica (modo, formato)
+
+#### Chunks
+
+Archivos binarios independientes:
+
+* no reproducibles individualmente
+* diseñados para supervivencia, no reproducción
+
+---
+
+### Herramienta externa
+
+Se definirá una CLI externa:
+
+```bash
+guardian-rebuild ./folder
+```
+
+Responsabilidades:
+
+* leer manifest
+* validar hashes
+* ordenar chunks
+* concatenar
+* generar archivo final reproducible
+
+---
+
+### Decisión arquitectónica clave
+
+> Los chunks NO son archivos reproducibles por diseño.
+
+Motivo:
+
+* priorizar resiliencia
+* permitir subida incremental
+* tolerar pérdida parcial
+
+---
+
+### Implicaciones
+
+* la reproducción siempre pasa por reconstrucción
+* el sistema es tolerante a pérdida de chunks
+* el archivo final puede ser parcial en escenarios extremos
+
+---
+
+### Limitaciones conocidas
+
+* vídeo parcial puede no ser reproducible (estructura MP4)
+* export actual carga en memoria (mejora futura: streaming incremental)
+
+---
+
+### Regla de diseño
+
+> La evidencia debe poder usarse fuera del sistema, aunque el dispositivo original no exista
