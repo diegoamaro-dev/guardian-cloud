@@ -51,7 +51,7 @@ import {
  * by contrast, is manual: the app does nothing on its own.
  */
 
-const PENDING_RETRY_KEY = 'test.pending_retry';
+export const PENDING_RETRY_KEY = 'test.pending_retry';
 
 /**
  * Last known session_id on this device. Persisted as a side observation
@@ -414,9 +414,9 @@ interface PendingState {
 //   today is O(N) re-serialization of the whole queue. Mandatory cleanup.
 // =============================================================================
 
-type ChunkStatus = 'pending' | 'uploading' | 'uploaded' | 'failed';
+export type ChunkStatus = 'pending' | 'uploading' | 'uploaded' | 'failed';
 
-interface QueueChunk {
+export interface QueueChunk {
   chunk_index: number;
   hash: string;
   size: number;
@@ -481,7 +481,7 @@ interface QueueChunk {
   last_error?: { status: number; code?: string; message: string } | undefined;
 }
 
-interface PendingQueueEntry {
+export interface PendingQueueEntry {
   session_id: string;
   /**
    * Absolute filesystem URI of the recording. During recording this
@@ -503,7 +503,7 @@ interface PendingQueueEntry {
 
 const CHUNK_TICK_MS = 1500;
 /** Cap retries for completeSession so a permanently-broken session does not hold a queue entry forever. */
-const MAX_COMPLETE_ATTEMPTS = 5;
+export const MAX_COMPLETE_ATTEMPTS = 5;
 /**
  * Outer per-chunk upload timeout. `uploadChunkBytes` already has a 30s
  * AbortController internally, but a chunk can stuck in 'uploading' for
@@ -522,7 +522,7 @@ const CHUNK_UPLOAD_TIMEOUT_MS = 60_000;
 
 let writeChain: Promise<void> = Promise.resolve();
 
-async function queueMutate<T>(
+export async function queueMutate<T>(
   fn: (queue: PendingQueueEntry[]) => T | Promise<T>,
 ): Promise<T> {
   let result!: T;
@@ -582,7 +582,7 @@ async function queueMutate<T>(
   return result;
 }
 
-async function queueRead(): Promise<PendingQueueEntry[]> {
+export async function queueRead(): Promise<PendingQueueEntry[]> {
   return queueMutate(q => q.map(entry => ({ ...entry })));
 }
 
@@ -602,7 +602,7 @@ async function queueRead(): Promise<PendingQueueEntry[]> {
  * handle it. Pure read — no mutations, no setItem, no schema knowledge
  * beyond the existing PendingQueueEntry shape.
  */
-async function hasPendingUploadWork(): Promise<boolean> {
+export async function hasPendingUploadWork(): Promise<boolean> {
   const q = await queueRead();
   let pendingCount = 0;
   let uploadingCount = 0;
@@ -625,7 +625,7 @@ async function hasPendingUploadWork(): Promise<boolean> {
   return result;
 }
 
-async function queueAppendNewSession(
+export async function queueAppendNewSession(
   entry: PendingQueueEntry,
 ): Promise<void> {
   await queueMutate(q => {
@@ -635,7 +635,7 @@ async function queueAppendNewSession(
   });
 }
 
-async function queueAppendChunk(
+export async function queueAppendChunk(
   sessionId: string,
   chunk: QueueChunk,
   /**
@@ -673,7 +673,7 @@ async function queueAppendChunk(
   });
 }
 
-async function queueUpdateChunk(
+export async function queueUpdateChunk(
   sessionId: string,
   chunk_index: number,
   patch: Partial<QueueChunk>,
@@ -712,7 +712,7 @@ async function queueUpdateChunk(
   });
 }
 
-async function queueMarkRecordingClosed(
+export async function queueMarkRecordingClosed(
   sessionId: string,
   finalUri: string,
   emittedBase64Length: number,
@@ -728,7 +728,7 @@ async function queueMarkRecordingClosed(
   });
 }
 
-async function queueMarkSessionCompleted(sessionId: string): Promise<void> {
+export async function queueMarkSessionCompleted(sessionId: string): Promise<void> {
   await queueMutate(q => {
     const e = q.find(x => x.session_id === sessionId);
     if (!e) return;
@@ -736,7 +736,7 @@ async function queueMarkSessionCompleted(sessionId: string): Promise<void> {
   });
 }
 
-async function queueBumpCompleteAttempts(sessionId: string): Promise<number> {
+export async function queueBumpCompleteAttempts(sessionId: string): Promise<number> {
   return queueMutate(q => {
     const e = q.find(x => x.session_id === sessionId);
     if (!e) return 0;
@@ -745,7 +745,7 @@ async function queueBumpCompleteAttempts(sessionId: string): Promise<number> {
   });
 }
 
-async function queueDropEntry(sessionId: string): Promise<void> {
+export async function queueDropEntry(sessionId: string): Promise<void> {
   await queueMutate(q => {
     const i = q.findIndex(x => x.session_id === sessionId);
     if (i >= 0) q.splice(i, 1);
@@ -761,7 +761,7 @@ async function queueDropEntry(sessionId: string): Promise<void> {
  * with `recording_closed: true` (legacy state was always written after
  * STOP) and the worker rehydrates the slice from `uri` on first need.
  */
-async function migrateLegacyPendingState(): Promise<void> {
+export async function migrateLegacyPendingState(): Promise<void> {
   await queueMutate(q => {
     // queueMutate already lifted a legacy object into [obj]. Detect that
     // case by the presence of the legacy `remaining` field on entries.
@@ -795,7 +795,7 @@ async function migrateLegacyPendingState(): Promise<void> {
   });
 }
 
-interface NormalizationReport {
+export interface NormalizationReport {
   /** Multiple queue entries sharing one session_id were merged into one. */
   entries_collapsed: number;
   /** Exact (same chunk_index AND same hash) duplicate chunks dropped. */
@@ -826,7 +826,7 @@ interface NormalizationReport {
  * The report is logged once at boot so the operator can see whether the
  * queue arrived in a healthy state or was patched up.
  */
-async function normalizeQueueOnRecovery(): Promise<NormalizationReport> {
+export async function normalizeQueueOnRecovery(): Promise<NormalizationReport> {
   return queueMutate(q => {
     const report: NormalizationReport = {
       entries_collapsed: 0,
@@ -1003,7 +1003,7 @@ export async function clearGuardianQueueDev(): Promise<{
  * pending OR `session_completed=false`) are left untouched — the worker
  * is still the sole owner of those.
  */
-async function reapAlreadyDoneEntries(): Promise<{ reaped: number }> {
+export async function reapAlreadyDoneEntries(): Promise<{ reaped: number }> {
   const queue = await queueRead();
   let reaped = 0;
   for (const entry of queue) {
@@ -1022,7 +1022,7 @@ async function reapAlreadyDoneEntries(): Promise<{ reaped: number }> {
 
 // ----- error classification (HC: never retry 4xx forever) -----
 
-function classifyError(err: unknown): 'transient' | 'permanent' {
+export function classifyError(err: unknown): 'transient' | 'permanent' {
   if (err instanceof ApiError) {
     // Network / timeout / abort
     if (err.status === 0 || err.code === 'NETWORK_ERROR') return 'transient';
@@ -1060,7 +1060,7 @@ function classifyError(err: unknown): 'transient' | 'permanent' {
   return 'transient';
 }
 
-function shapeError(
+export function shapeError(
   err: unknown,
 ): { status: number; code?: string; message: string } {
   if (err instanceof ApiError) {
@@ -1583,7 +1583,7 @@ interface CompletionGateLogState {
 const completionGateLogState = new Map<string, CompletionGateLogState>();
 const COMPLETION_GATE_LOG_TTL_MS = 10_000;
 
-async function tryFinalizeReadySessions(): Promise<boolean> {
+export async function tryFinalizeReadySessions(): Promise<boolean> {
   const queue = await queueRead();
   let anyFinalized = false;
   for (const entry of queue) {
@@ -1720,7 +1720,7 @@ async function tryFinalizeReadySessions(): Promise<boolean> {
   return anyFinalized;
 }
 
-async function reapEntry(sessionId: string, uri: string): Promise<void> {
+export async function reapEntry(sessionId: string, uri: string): Promise<void> {
   await queueDropEntry(sessionId);
   rehydrationCache.delete(uri);
   completionGateLogState.delete(sessionId);

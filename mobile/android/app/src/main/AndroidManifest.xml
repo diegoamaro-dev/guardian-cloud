@@ -1,23 +1,16 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
   <uses-permission android:name="android.permission.CAMERA"/>
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE"/>
   <uses-permission android:name="android.permission.INTERNET"/>
   <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>
+  <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
   <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>
   <uses-permission android:name="android.permission.RECORD_AUDIO"/>
   <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
   <uses-permission android:name="android.permission.VIBRATE"/>
-  <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>
-  <!-- Foreground service for keeping the JS runtime alive while the app
-       is backgrounded so audio recording, chunking and the upload worker
-       continue without the OS suspending the process. The microphone
-       service type is required from Android 14 (API 34) onward whenever
-       the foreground service interacts with the mic. POST_NOTIFICATIONS
-       is required from Android 13 to show the persistent service
-       notification ("Guardian Cloud está protegiendo tu evidencia"). -->
-  <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
-  <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE"/>
-  <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
   <uses-permission android:name="android.permission.WAKE_LOCK"/>
+  <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>
   <queries>
     <intent>
       <action android:name="android.intent.action.VIEW"/>
@@ -29,6 +22,7 @@
     <meta-data android:name="expo.modules.updates.ENABLED" android:value="false"/>
     <meta-data android:name="expo.modules.updates.EXPO_UPDATES_CHECK_ON_LAUNCH" android:value="ALWAYS"/>
     <meta-data android:name="expo.modules.updates.EXPO_UPDATES_LAUNCH_WAIT_MS" android:value="0"/>
+    <service android:name="com.asterinet.react.bgactions.RNBackgroundActionsTask" android:foregroundServiceType="microphone"/>
     <activity android:name=".MainActivity" android:configChanges="keyboard|keyboardHidden|orientation|screenSize|screenLayout|uiMode" android:launchMode="singleTask" android:windowSoftInputMode="adjustResize" android:theme="@style/Theme.App.SplashScreen" android:exported="true" android:screenOrientation="portrait">
       <intent-filter>
         <action android:name="android.intent.action.MAIN"/>
@@ -42,14 +36,5 @@
         <data android:scheme="exp+guardian-cloud"/>
       </intent-filter>
     </activity>
-    <!-- react-native-background-actions service. The library ships the
-         class `RNBackgroundActionsTask`; we declare it here with the
-         microphone foreground service type so it is allowed to capture
-         audio in the background on Android 14+. Type MUST match the
-         use case: when video shipping later the type may need
-         expanding (out of scope for the audio-only Tier 2). -->
-    <service
-      android:name="com.asterinet.react.bgactions.RNBackgroundActionsTask"
-      android:foregroundServiceType="microphone"/>
   </application>
 </manifest>
