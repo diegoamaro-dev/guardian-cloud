@@ -95,6 +95,20 @@ vi.mock('expo-crypto', () => ({
   randomUUID: vi.fn(() => '00000000-0000-4000-8000-000000000000'),
 }));
 
+// expo-haptics → no-op stubs. We never assert on the vibrations (they
+// are fire-and-forget in production), so a minimal surface is enough.
+vi.mock('expo-haptics', () => ({
+  impactAsync: vi.fn(async () => undefined),
+  notificationAsync: vi.fn(async () => undefined),
+  selectionAsync: vi.fn(async () => undefined),
+  ImpactFeedbackStyle: { Light: 'Light', Medium: 'Medium', Heavy: 'Heavy' },
+  NotificationFeedbackType: {
+    Success: 'Success',
+    Warning: 'Warning',
+    Error: 'Error',
+  },
+}));
+
 vi.mock('expo-router', () => ({
   router: {
     push: vi.fn(),
