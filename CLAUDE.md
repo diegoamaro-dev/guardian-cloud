@@ -174,3 +174,107 @@ Si el sistema:
 
 Entonces:
 > el sistema es incorrecto, aunque el código sea bonito
+
+---
+
+## 13. Estado actual del proyecto
+
+El MVP CORE del sistema está validado:
+
+* chunking en tiempo real
+* subida resiliente
+* recovery tras kill
+* subida en background
+* export de evidencia funcional
+
+Esto implica:
+
+> el sistema ya no es un prototipo, es una base funcional
+
+---
+
+## 14. Fase actual
+
+El proyecto se encuentra en fase de:
+
+* consolidación del MVP
+* validación con usuarios reales
+* mejora de UX crítica (botón pánico, estados)
+* mejora de export
+
+---
+
+## 15. Reglas en fase post-MVP
+
+A partir de este punto:
+
+### PERMITIDO
+
+* mejorar UX sin romper flujo
+* mejorar export
+* añadir historial usable
+* preparar funcionalidades futuras (sin implementarlas)
+
+---
+
+### NO PERMITIDO
+
+* introducir complejidad en:
+
+  * chunking
+  * GC_QUEUE
+  * upload worker
+* añadir features no validadas
+* modificar arquitectura base sin justificación fuerte
+
+---
+
+## 16. Roadmap controlado
+
+El desarrollo futuro sigue este orden:
+
+1. consolidación (export + UX)
+2. valor real (modo kids, historial)
+3. escalado (multi-destino)
+4. avanzado (integridad, forense)
+
+Ver:
+
+* POST_MVP_ROADMAP.md
+
+---
+
+## 17. Regla crítica de evolución
+
+> No evolucionar el sistema sin validar uso real
+
+Si una funcionalidad:
+
+* no ha sido probada con usuarios
+* no responde a un problema real observado
+
+👉 NO se implementa
+
+---
+
+## 18. Nueva prioridad
+
+Orden actualizado:
+
+1. subida fiable
+2. resiliencia
+3. UX bajo estrés
+4. export usable
+5. nuevas funcionalidades
+
+---
+
+## 19. Regla final extendida
+
+El sistema es incorrecto si:
+
+* falla en condiciones reales
+* no es usable bajo estrés
+* el usuario no entiende si está protegido
+
+Aunque técnicamente funcione
