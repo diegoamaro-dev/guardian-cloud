@@ -199,3 +199,74 @@ HOME
 3. sobrevivir
 
 Todo lo demás es secundario
+
+## 2.1 Botón de pánico (crítico)
+
+El sistema debe permitir activación inmediata:
+
+* acceso desde:
+
+  * pantalla principal
+  * widget (futuro)
+  * shortcut Android
+
+Comportamiento:
+
+* 1 toque → grabación inmediata
+* sin confirmación
+* feedback instantáneo (vibración + estado)
+
+---
+
+## Regla
+
+> El usuario no debe pensar antes de grabar
+
+## 13. Reglas críticas de UX (bajo estrés)
+
+### Home
+
+* el botón principal debe dominar la pantalla
+* no mostrar opciones que ralenticen la acción
+* el usuario no debe tomar decisiones antes de grabar
+
+---
+
+### Grabación activa
+
+* el usuario debe saber siempre:
+
+  * que está grabando
+  * que está protegido
+
+* usar lenguaje humano:
+
+  * "Protegido"
+  * "Subiendo"
+
+* evitar términos técnicos:
+
+  * chunks
+  * sync
+  * procesos internos
+
+---
+
+### Historial
+
+* mostrar solo estados comprensibles:
+
+  * protegido
+  * parcial
+  * error
+
+* NO mostrar:
+
+  * número de chunks
+  * datos técnicos
+
+---
+
+### Regla global
+
+> Si el usuario tiene que pensar, la UI es incorrecta

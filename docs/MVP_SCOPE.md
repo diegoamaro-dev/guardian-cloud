@@ -31,3 +31,26 @@
 ## Métrica de éxito del MVP
 
 > empezar a grabar, perder el móvil poco después y comprobar que al menos parte de la evidencia ha sobrevivido fuera del dispositivo.
+
+## Aclaración
+
+El MVP incluye:
+
+* export básico de evidencia (reconstrucción desde chunks)
+
+No incluye:
+
+* exportación legal avanzada
+* herramientas forenses externas
+* validación jurídica
+## Aclaración
+
+El MVP incluye:
+
+* export básico de evidencia (reconstrucción desde chunks)
+
+No incluye:
+
+* exportación legal avanzada
+* herramientas forenses externas
+* validación jurídica

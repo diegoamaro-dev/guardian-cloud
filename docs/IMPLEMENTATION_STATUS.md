@@ -21,3 +21,32 @@ The MVP currently supports:
 ## Current validated criterion
 
 The system can record, generate chunks, upload them to Drive, recover pending chunks after failure, complete the session, clean local state, and export the session's evidence back as a single .m4a file from the recorded chunks.
+
+## Product status
+
+The system is no longer a prototype.
+
+It has been validated under:
+
+* app kill
+* network loss
+* background execution
+* recovery after restart
+
+This confirms:
+
+> Guardian Cloud fulfills its core promise: evidence survival under real conditions
+
+---
+
+## Current focus
+
+* usability under stress
+* fast activation
+* user validation
+
+Not:
+
+* new features
+* advanced security
+* system expansion

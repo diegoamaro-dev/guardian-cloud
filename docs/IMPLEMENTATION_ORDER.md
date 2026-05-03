@@ -1,27 +1,45 @@
 # Guardian Cloud — Implementation Order
 
-## Phase 1
-- Backend mínimo
-- Crear sesión
-- Subir chunk
-- Completar sesión
+## Fase completada (MVP Core)
 
-## Phase 2
-- App móvil básica
-- Grabación
-- Chunking
-- Cola persistente
+* backend mínimo
+* sesiones
+* chunking
+* cola persistente
+* subida resiliente
+* recovery tras kill
+* subida en background
+* integración con Drive
+* export básico
 
-## Phase 3
-- Integración Google Drive
-- Reintentos
-- Recuperación tras fallo
+---
 
-## Phase 4
-- Modo familiar / Kids
-- Alertas al padre
+## Fase actual (Consolidación)
 
-## Phase 5
-- Play Store release prep
-- Testing real
-- Pulido mínimo
+* botón pánico
+* UX bajo estrés
+* export robusto
+* test con usuarios reales
+
+---
+
+## Siguiente fase
+
+* historial usable
+* modo kids (alertas)
+* metadata básica
+
+---
+
+## Fase futura
+
+* múltiples destinos
+* redundancia
+* integridad avanzada
+* modo forense
+
+---
+
+## Regla
+
+> no avanzar de fase sin validación real

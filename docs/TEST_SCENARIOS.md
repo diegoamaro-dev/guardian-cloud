@@ -116,3 +116,38 @@ Resultado esperado:
 ## Criterio final
 
 Si pasa en demo pero falla con cierres, mala red o estrés, no está listo.
+
+## Escenario 15 — Uso bajo estrés (crítico)
+
+* dar la app a un usuario sin explicación
+* pedirle:
+  "imagina que pasa algo raro, usa la app"
+
+verificar:
+
+* tiempo de reacción
+* dudas
+* errores de uso
+* claridad del estado
+
+resultado esperado:
+
+> el usuario es capaz de grabar sin instrucciones
+
+---
+
+## Escenario 16 — Recuperación por usuario
+
+* el usuario graba una sesión
+* después se le pide:
+  "recupera la evidencia"
+
+verificar:
+
+* encuentra la sesión
+* entiende el estado
+* exporta sin ayuda
+
+resultado esperado:
+
+> el usuario puede usar el sistema completo sin asistencia

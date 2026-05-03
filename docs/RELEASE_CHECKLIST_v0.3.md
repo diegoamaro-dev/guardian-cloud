@@ -208,3 +208,19 @@ Si una métrica clave se rompe en producción:
 - Re-promote.
 
 NUNCA force-push a main.
+## 4.10 Test con usuarios reales (obligatorio)
+
+* [ ] 3 personas sin contexto técnico usan la app
+* [ ] No se les explica cómo funciona
+* [ ] Se les pide: "usa esto si te pasa algo raro"
+
+Verificar:
+
+* [ ] Tiempo hasta empezar a grabar < 2 segundos
+* [ ] No hay dudas durante grabación
+* [ ] El usuario entiende que está protegido
+* [ ] El usuario puede recuperar la evidencia sin ayuda
+
+Si falla:
+
+> NO lanzar release

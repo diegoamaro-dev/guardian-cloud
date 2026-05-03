@@ -184,3 +184,41 @@ Este proyecto puede fallar si:
 ## 16. Regla final
 
 > Si no funciona en una situación real, no funciona
+
+---
+
+## 17. Estado actual del sistema
+
+El MVP core del sistema está validado:
+
+* chunking en tiempo real
+* subida resiliente
+* recovery tras cierre de app
+* subida en background
+* export de evidencia funcional
+
+El sistema ya no es un prototipo.
+
+---
+
+## 18. Fase actual
+
+El proyecto está en fase de:
+
+* consolidación del MVP
+* mejora de UX (botón pánico, estados)
+* validación con usuarios reales
+
+---
+
+## 19. Prioridad actual
+
+1. facilitar activación rápida (botón pánico)
+2. garantizar export usable
+3. validar uso real
+
+---
+
+## 20. Regla de evolución
+
+> No añadir nuevas funcionalidades sin validar el uso real del sistema actual
