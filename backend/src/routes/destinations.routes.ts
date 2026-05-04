@@ -58,6 +58,7 @@ import {
   ROOT_FOLDER_NAME,
   uploadFile,
 } from '../services/drive.service.js';
+import { uploadChunk as webdavUploadChunk } from '../adapters/webdav.adapter.js';
 import {
   getDestinationForUser,
   getDestinationWithSecretForUser,
@@ -618,11 +619,214 @@ router.post(
   },
 );
 
+/**
+ * POST /destinations/nas/chunks — proxy upload of a single chunk's bytes
+ * to the user's WebDAV NAS server.
+ *
+ * Same contract as POST /destinations/drive/chunks.
+ *
+ * Headers:
+ *   Authorization:  Bearer <supabase-jwt>
+ *   Content-Type:   application/octet-stream
+ *   X-Session-Id:   uuid of an ACTIVE session owned by the caller
+ *   X-Chunk-Index:  non-negative integer
+ *   X-Hash:         lowercase hex sha256 of the body
+ * Body: raw bytes (<= 25 MB)
+ *
+ * Response 200: { remote_reference: string, dedup: 'db' | null }
+ *
+ * Credential columns (from NAS migration):
+ *   webdav_url                → WebDAV server base URL
+ *   webdav_username           → WebDAV username
+ *   webdav_password_encrypted → AES-256-GCM encrypted password
+ *   webdav_base_path          → optional path prefix on the server
+ *
+ * Idempotency:
+ *   Layer 1 (DB): if a chunks row for (session_id, chunk_index) with the same
+ *     hash already has a remote_reference, return it immediately.
+ *   Layer 2: WebDAV PUT is natively idempotent (overwrites with same bytes)
+ *     so a repeat PUT to the same deterministic URL is a no-op.
+ *
+ * This route does NOT create or update chunks rows. POST /chunks remains the
+ * only writer of that table.
+ */
+router.post(
+  '/nas/chunks',
+  authMiddleware,
+  userRateLimiter(600),
+  express.raw({ limit: RAW_CHUNK_LIMIT_BYTES, type: 'application/octet-stream' }),
+  async (req: Request, res: Response, next: NextFunction) => {
+    let phase: string = 'enter';
+    let sessionIdLog: string | undefined;
+    let chunkIndexLog: number | undefined;
+    try {
+      if (!req.user) throw new UnauthorizedError();
+
+      // --- 1) Headers
+      phase = 'validate_headers';
+      const sessionId = (req.header('x-session-id') ?? '').trim();
+      const chunkIndexRaw = (req.header('x-chunk-index') ?? '').trim();
+      const hash = (req.header('x-hash') ?? '').trim().toLowerCase();
+      sessionIdLog = sessionId;
+
+      logger.info(
+        {
+          op: 'nas.chunks.upload',
+          userId: req.user.id,
+          sessionId: sessionId || null,
+          chunkIndex: chunkIndexRaw || null,
+          contentLength: req.header('content-length') ?? null,
+        },
+        'NAS_CHUNK_UPLOAD_START',
+      );
+
+      if (!UUID_RE.test(sessionId)) {
+        throw new AppError(400, 'INVALID_HEADERS', 'X-Session-Id missing or not a UUID');
+      }
+      const chunkIndex = Number.parseInt(chunkIndexRaw, 10);
+      if (!Number.isInteger(chunkIndex) || chunkIndex < 0) {
+        throw new AppError(400, 'INVALID_HEADERS', 'X-Chunk-Index missing or invalid');
+      }
+      if (!HEX64_RE.test(hash)) {
+        throw new AppError(400, 'INVALID_HEADERS', 'X-Hash missing or invalid');
+      }
+      chunkIndexLog = chunkIndex;
+
+      // --- 2) Body
+      phase = 'validate_body';
+      const body = req.body;
+      if (!Buffer.isBuffer(body) || body.length === 0) {
+        throw new AppError(
+          400,
+          'EMPTY_BODY',
+          'Empty or non-binary body (Content-Type must be application/octet-stream)',
+        );
+      }
+      if (body.length > RAW_CHUNK_LIMIT_BYTES) {
+        throw new AppError(413, 'BODY_TOO_LARGE', 'Chunk body exceeds size limit');
+      }
+
+      // --- 3) Integrity guardrail
+      phase = 'verify_hash';
+      const actualHash = createHash('sha256').update(body).digest('hex');
+      if (actualHash !== hash) {
+        logger.warn(
+          {
+            op: 'nas.chunks.upload',
+            sessionId,
+            chunkIndex,
+            claimed: hash,
+            actual: actualHash,
+            size: body.length,
+          },
+          'X-Hash does not match body sha256',
+        );
+        throw new AppError(400, 'HASH_MISMATCH', 'Body sha256 does not match X-Hash');
+      }
+
+      // --- 4) Session ownership + active state
+      phase = 'session_ownership';
+      const session = await getOwnedSession(req.user.id, sessionId);
+      if (session.status !== 'active') {
+        throw new AppError(409, 'SESSION_NOT_ACTIVE', 'Session is not active');
+      }
+
+      // --- 5) Layer 1 dedup — DB already has the chunk row
+      phase = 'db_dedup_lookup';
+      const existingRef = await findExistingChunkRemoteReference(sessionId, chunkIndex, hash);
+      if (existingRef) {
+        logger.info(
+          { op: 'nas.chunks.upload', sessionId, chunkIndex, dedup: 'db' },
+          'chunk dedup via DB row',
+        );
+        res.status(200).json({ remote_reference: existingRef, dedup: 'db' });
+        return;
+      }
+
+      // --- 6) Load NAS destination
+      phase = 'destination_lookup';
+      const dest = await getDestinationWithSecretForUser(req.user.id, 'nas');
+      if (!dest) {
+        logger.warn(
+          { op: 'nas.chunks.upload', userId: req.user.id, sessionId, chunkIndex },
+          'NAS_CHUNK_NO_DESTINATION',
+        );
+        throw new AppError(409, 'NAS_NOT_CONFIGURED', 'No NAS destination configured for this user');
+      }
+      if (!dest.webdav_url || !dest.webdav_username || !dest.webdav_password_encrypted) {
+        logger.warn(
+          {
+            op: 'nas.chunks.upload',
+            userId: req.user.id,
+            sessionId,
+            chunkIndex,
+            hasUrl: Boolean(dest.webdav_url),
+            hasUser: Boolean(dest.webdav_username),
+            hasPass: Boolean(dest.webdav_password_encrypted),
+          },
+          'NAS_CHUNK_INCOMPLETE_CREDENTIALS',
+        );
+        throw new AppError(409, 'NAS_NOT_CONFIGURED', 'NAS destination is missing credentials');
+      }
+
+      // --- 7) Upload via WebDAV adapter
+      phase = 'nas_upload';
+      const result = await webdavUploadChunk({
+        sessionId,
+        chunkIndex,
+        buffer: body,
+        hash,
+        destination: {
+          host: dest.webdav_url,
+          username: dest.webdav_username,
+          encryptedPassword: dest.webdav_password_encrypted,
+          basePath: dest.webdav_base_path ?? '',
+        },
+      });
+
+      logger.info(
+        {
+          op: 'nas.chunks.upload',
+          sessionId,
+          chunkIndex,
+          size: body.length,
+          remote_reference: result.remote_reference,
+        },
+        'NAS_CHUNK_UPLOAD_SUCCESS',
+      );
+
+      res.status(200).json({ remote_reference: result.remote_reference, dedup: null });
+    } catch (err) {
+      const isAppErr = err instanceof AppError;
+      const failurePayload = {
+        op: 'nas.chunks.upload',
+        userId: req.user?.id,
+        sessionId: sessionIdLog ?? null,
+        chunkIndex: chunkIndexLog ?? null,
+        phase,
+        status: isAppErr ? err.status : 500,
+        code: isAppErr ? err.code : 'INTERNAL_ERROR',
+        message: err instanceof Error ? err.message : String(err),
+      };
+      if (phase === 'nas_upload') {
+        logger.warn(failurePayload, 'NAS_CHUNK_UPLOAD_ERROR');
+      }
+      logger.warn(failurePayload, 'NAS_CHUNK_UPLOAD_FAILED');
+      next(err);
+    }
+  },
+);
+
 // Defensive 404 for sibling drive sub-routes we haven't built yet, so a
 // typo on the client doesn't cascade into the generic 404 middleware
 // with misleading wording.
 router.all('/drive/:rest', (req: Request, _res: Response, next: NextFunction) => {
   next(new AppError(404, 'NOT_FOUND', `No such drive route: ${req.params.rest}`));
+});
+
+// Defensive 404 for unimplemented nas sub-routes.
+router.all('/nas/:rest', (req: Request, _res: Response, next: NextFunction) => {
+  next(new AppError(404, 'NOT_FOUND', `No such nas route: ${req.params['rest']}`));
 });
 
 // Swallow unexpected zod misuse at the router level rather than bubble

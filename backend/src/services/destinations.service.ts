@@ -16,7 +16,7 @@ import { AppError } from '../errors/AppError.js';
 import { logger } from '../utils/logger.js';
 import { supabase } from '../config/supabase.js';
 
-export type DestinationType = 'drive';
+export type DestinationType = 'drive' | 'nas';
 export type DestinationStatus = 'connected' | 'revoked' | 'error';
 
 export interface DestinationRow {
@@ -27,6 +27,11 @@ export interface DestinationRow {
   refresh_token: string | null;
   folder_id: string | null;
   account_email: string | null;
+  // NAS-specific columns (added in migration, null for drive rows)
+  webdav_url: string | null;
+  webdav_username: string | null;
+  webdav_password_encrypted: string | null;
+  webdav_base_path: string | null;
   created_at: string;
   updated_at: string;
 }
