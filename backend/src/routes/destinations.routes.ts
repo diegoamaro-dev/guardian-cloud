@@ -172,6 +172,72 @@ router.post(
 );
 
 /**
+ * POST /destinations/nas/test-upload — end-to-end NAS connectivity check.
+ *
+ * Uploads a tiny buffer to the user's WebDAV server using the stored
+ * credentials and returns the remote_reference on success.
+ *
+ * Does NOT create a session row or write to the chunks table.
+ * Uses a fixed test path so repeated calls overwrite the same file (idempotent).
+ * Path on the NAS: GuardianCloud/__nas_test__/0.chunk
+ */
+router.post(
+  '/nas/test-upload',
+  authMiddleware,
+  userRateLimiter(10),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      if (!req.user) throw new UnauthorizedError();
+
+      const dest = await getDestinationWithSecretForUser(req.user.id, 'nas');
+      if (!dest) {
+        throw new AppError(409, 'NAS_NOT_CONFIGURED', 'No NAS destination configured for this user');
+      }
+      if (!dest.webdav_url || !dest.webdav_username || !dest.webdav_password_encrypted) {
+        throw new AppError(409, 'NAS_NOT_CONFIGURED', 'NAS destination is missing credentials');
+      }
+
+      const payload = Buffer.from(
+        `Guardian Cloud NAS test\nuser_id=${req.user.id}\nts=${new Date().toISOString()}\n`,
+        'utf8',
+      );
+      const hash = createHash('sha256').update(payload).digest('hex');
+
+      const result = await webdavUploadChunk({
+        sessionId: '__nas_test__',
+        chunkIndex: 0,
+        buffer: payload,
+        hash,
+        destination: {
+          host: dest.webdav_url,
+          username: dest.webdav_username,
+          encryptedPassword: dest.webdav_password_encrypted,
+          basePath: dest.webdav_base_path ?? '',
+        },
+      });
+
+      logger.info(
+        { op: 'nas.test-upload', userId: req.user.id, remote_reference: result.remote_reference },
+        'NAS_TEST_UPLOAD_SUCCESS',
+      );
+
+      res.status(200).json({ ok: true, remote_reference: result.remote_reference });
+    } catch (err) {
+      logger.warn(
+        {
+          op: 'nas.test-upload',
+          userId: req.user?.id,
+          code: err instanceof AppError ? err.code : 'INTERNAL_ERROR',
+          message: err instanceof Error ? err.message : String(err),
+        },
+        'NAS_TEST_UPLOAD_FAILED',
+      );
+      next(err);
+    }
+  },
+);
+
+/**
  * POST /destinations/drive/connect — two-step OAuth.
  *
  * Step 1 (action=start):
