@@ -193,6 +193,20 @@ export default function SettingsScreen() {
         await refreshState();
         Alert.alert('Google Drive', 'Conexión completada correctamente.');
       } catch (err) {
+        // The oauth/drive screen may have consumed this code first (race:
+        // both screens receive the same deep-link URL). Google codes are
+        // single-use — whichever side called exchange second gets
+        // invalid_grant. If Drive is now connected the handshake succeeded
+        // on the other side; reflect that here instead of showing an error.
+        try {
+          const drive = await getConnectedDrive();
+          if (drive) {
+            await refreshState();
+            return;
+          }
+        } catch {
+          /* getConnectedDrive failed — fall through to real error */
+        }
         const msg = err instanceof Error ? err.message : String(err);
         setErrorMsg(`No se pudo completar la conexión: ${msg}`);
       } finally {
