@@ -19,7 +19,7 @@ import { env } from '@/config/env';
 import { getFreshAccessToken } from '@/auth/store';
 import { apiFetch, ApiError } from './client';
 
-export type DestinationType = 'drive';
+export type DestinationType = 'drive' | 'nas';
 export type DestinationStatus = 'connected' | 'revoked' | 'error';
 
 export interface PublicDestination {
@@ -166,9 +166,9 @@ function base64ToBytes(b64: string): Uint8Array {
 }
 
 /**
- * POST /destinations/drive/chunks — send one chunk's bytes to the
- * backend proxy, which forwards to Google Drive and returns the file_id
- * to use as `remote_reference` on the subsequent POST /chunks.
+ * POST /destinations/{drive|nas}/chunks — send one chunk's bytes to the
+ * backend proxy, which forwards to the user's active destination and returns
+ * the remote_reference to use on the subsequent POST /chunks.
  *
  * Why not `apiFetch`: apiFetch is JSON-only. The proxy speaks
  * application/octet-stream and expects the body to be the raw bytes
@@ -176,17 +176,15 @@ function base64ToBytes(b64: string): Uint8Array {
  * sha256 server-side and rejects on mismatch (HASH_MISMATCH).
  *
  * Arguments:
- *   sessionId    — uuid of the active session the chunk belongs to.
- *   chunkIndex   — 0-based index within that session.
- *   hash         — lowercase hex sha256 of the decoded bytes. MUST be
- *                  the same hash the client will pass to /chunks, so
- *                  both rows agree on the identity of the chunk. This
- *                  is the single source of truth for chunk identity —
- *                  `deriveChunksFromFile` hashes the decoded bytes too,
- *                  so PENDING_RETRY_KEY, /chunks, and X-Hash all
- *                  carry the same value.
- *   base64Slice  — the chunk's content as base64 (the form the client
- *                  already has, from FileSystem.readAsStringAsync).
+ *   sessionId       — uuid of the active session the chunk belongs to.
+ *   chunkIndex      — 0-based index within that session.
+ *   hash            — lowercase hex sha256 of the decoded bytes. MUST be
+ *                     the same hash the client will pass to /chunks, so
+ *                     both rows agree on the identity of the chunk.
+ *   base64Slice     — the chunk's content as base64 (the form the client
+ *                     already has, from FileSystem.readAsStringAsync).
+ *   destinationType — which backend proxy to use ('drive' | 'nas').
+ *                     Defaults to 'drive' to preserve existing behaviour.
  *
  * Returns { remote_reference, dedup } on success.
  *
@@ -198,6 +196,7 @@ export async function uploadChunkBytes(
   hash: string,
   base64Slice: string,
   timeoutMs = 30_000,
+  destinationType: DestinationType = 'drive',
 ): Promise<DriveChunkUploadResponse> {
   // Same reasoning as apiFetch: read the latest token from supabase-js
   // so an expired snapshot in the Zustand store doesn't send us into a
@@ -205,7 +204,7 @@ export async function uploadChunkBytes(
   // has expired.
   const token = await getFreshAccessToken();
   if (!token) {
-    console.log('AUTH MISSING', { path: '/destinations/drive/chunks' });
+    console.log('AUTH MISSING', { path: `/destinations/${destinationType}/chunks` });
     throw new ApiError(401, 'NO_TOKEN', 'No access token in store', null);
   }
 
@@ -214,7 +213,7 @@ export async function uploadChunkBytes(
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
-  const url = `${env.apiUrl}/destinations/drive/chunks`;
+  const url = `${env.apiUrl}/destinations/${destinationType}/chunks`;
   console.log('API CALL', { method: 'POST', url, authed: true });
   let response: Response;
   try {

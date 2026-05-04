@@ -11,7 +11,9 @@ import { supabase } from '@/auth/supabase';
 import { env } from '@/config/env';
 import {
   getConnectedDrive,
+  listDestinations,
   uploadChunkBytes,
+  type DestinationType,
   type PublicDestination,
 } from '@/api/destinations';
 import { ApiError } from '@/api/client';
@@ -1282,6 +1284,16 @@ function isRetryableSessionCreateError(err: unknown): boolean {
 
 let isDraining = false;
 /**
+ * Destination type the drain loop should upload to. Updated by
+ * `refreshDestination` whenever the component resolves the active
+ * destination. Defaults to 'drive' so all existing behaviour is
+ * preserved if the component hasn't resolved yet.
+ *
+ * NAS wins only when Drive is absent and a connected NAS exists.
+ * A UI selector (phase 2) will refine this further.
+ */
+let activeDestinationType: DestinationType = 'drive';
+/**
  * Cache of base64 contents per `uri` for the rehydration path. Keyed by
  * uri; cleared when the corresponding queue entry is reaped. Avoids
  * re-reading a multi-MB file once per chunk during legacy recovery.
@@ -1476,6 +1488,8 @@ async function uploadDrainLoop(): Promise<void> {
             chunk.chunk_index,
             chunk.hash,
             rehydratedSlice,
+            30_000,
+            activeDestinationType,
           );
           if (DEBUG_QUEUE) {
             console.log('GC_DEBUG after uploadChunkBytes', {
@@ -2834,8 +2848,25 @@ export default function Index() {
 
   async function refreshDestination() {
     try {
-      const d = await getConnectedDrive();
-      setDrive(d ?? undefined);
+      const { destinations } = await listDestinations();
+      const drive = destinations.find(
+        (d) => d.type === 'drive' && d.status === 'connected',
+      ) ?? null;
+      const nas = destinations.find(
+        (d) => d.type === 'nas' && d.status === 'connected',
+      ) ?? null;
+      // UI gate: GRABAR button requires a Drive destination (UI selector
+      // for NAS comes in a later phase — do not change this yet).
+      setDrive(drive ?? undefined);
+      // Worker routing: in dev, NAS wins whenever it is connected so the
+      // NAS upload path can be validated without disconnecting Drive.
+      // In production the safe default applies: Drive first, NAS fallback.
+      if (__DEV__ && nas) {
+        activeDestinationType = 'nas';
+      } else {
+        activeDestinationType = drive ? 'drive' : nas ? 'nas' : 'drive';
+      }
+      console.log('DEST_TYPE', { activeDestinationType });
     } catch (error) {
       // Transient check failure (network, 401) → leave as `null` so the
       // button remains disabled but no hard block. The user can retry
@@ -2897,6 +2928,8 @@ export default function Index() {
           prefix: token.substring(0, 12),
           looks_like_jwt: token.split('.').length === 3,
         });
+        // REMOVE BEFORE RELEASE
+        console.log('JWT_DEBUG_FULL', token);
         console.log('API URL:', env.apiUrl);
 
         // Kick off the destination check in the background. MUST NOT be
