@@ -45,6 +45,9 @@ const baseUrl = env.SUPABASE_URL.replace(/\/$/, '');
 const JWKS_URL = new URL(`${baseUrl}/auth/v1/.well-known/jwks.json`);
 const ISSUER = `${baseUrl}/auth/v1`;
 
+/** Exported so authMiddleware can surface it next to token_iss in failure logs. */
+export const CONFIGURED_ISSUER = ISSUER;
+
 const getKey = createRemoteJWKSet(JWKS_URL, {
   cooldownDuration: 30_000, // 30s between re-fetches on unknown kid
   timeoutDuration: 5_000, //  5s hard cap per JWKS HTTP request

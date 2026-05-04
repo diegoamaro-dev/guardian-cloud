@@ -22,7 +22,7 @@
 import type { NextFunction, Request, Response } from 'express';
 import { decodeJwt, decodeProtectedHeader } from 'jose';
 import { UnauthorizedError } from '../errors/AppError.js';
-import { verifySupabaseJwt } from '../utils/jwtVerifier.js';
+import { verifySupabaseJwt, CONFIGURED_ISSUER } from '../utils/jwtVerifier.js';
 import { logger } from '../utils/logger.js';
 
 /**
@@ -127,6 +127,9 @@ export async function authMiddleware(
         token_iss: iss,
         token_exp: exp,
         token_sub_prefix: subPrefix,
+        // diagnostic: compare these two to spot issuer or project mismatch
+        configured_issuer: CONFIGURED_ISSUER,
+        issuer_match: iss === CONFIGURED_ISSUER,
       },
       'REQ_AUTH_FAIL',
     );
