@@ -58,6 +58,7 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
         const requiredPerms = [
           'android.permission.FOREGROUND_SERVICE',
           'android.permission.FOREGROUND_SERVICE_MICROPHONE',
+          'android.permission.WAKE_LOCK',
         ];
         for (const perm of requiredPerms) {
           if (!existingPerms.includes(perm)) {
