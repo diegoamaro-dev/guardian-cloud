@@ -125,11 +125,22 @@ router.post(
  * Body: { webdav_url, webdav_username, webdav_password, webdav_base_path? }
  * Response 200: { destination: PublicDestination }
  */
+// In development we allow plain http so a local WebDAV test server (e.g.
+// http://192.168.x.x:8088) works without self-signed certs. Production
+// always requires https regardless of this flag.
+const _nasAllowHttp = env.NODE_ENV === 'development';
+
 const nasConfigSchema = z.object({
   webdav_url: z
     .string()
     .url('webdav_url must be a valid URL')
-    .refine((u) => new URL(u).protocol === 'https:', 'webdav_url must use https'),
+    .refine(
+      (u) => {
+        const proto = new URL(u).protocol;
+        return proto === 'https:' || (_nasAllowHttp && proto === 'http:');
+      },
+      'webdav_url must use https (http is only allowed in development)',
+    ),
   webdav_username: z.string().min(1, 'webdav_username is required'),
   webdav_password: z.string().min(1, 'webdav_password is required'),
   webdav_base_path: z.string().default(''),
