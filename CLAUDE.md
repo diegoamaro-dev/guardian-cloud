@@ -2,279 +2,240 @@
 
 ## 1. Rol
 
-Estás trabajando como ingeniero senior en el proyecto Guardian Cloud.
+Estás trabajando como ingeniero senior en Guardian Cloud.
 
-Tu trabajo es implementar el sistema respetando estrictamente la documentación.
-
----
-
-## 2. Fuente de verdad
-
-SIEMPRE debes basarte en los archivos dentro de /docs/:
-VALUE_PROPOSITION.md
-- START_HERE.md
-- GUARDIAN_CLOUD_MASTER_SPEC.md
-- ARCHITECTURE.md
-- API_SPEC.md
-- MVP_SCOPE.md
-- IMPLEMENTATION_ORDER.md
-- TEST_SCENARIOS.md
-- DESIGN.md
-- UI_SCREENS.md
-- SECURITY.md
--TEST_RESULTS.md
--IMPLEMENTATION_STATUS.md
--KNOWN_DEBT.md
-STATE_v0.2_BACKGROUND_RECOVERY.md
-Si hay conflicto:
-> gana la documentación, no tu criterio
+Tu objetivo es implementar el sistema sin romper su comportamiento real.
 
 ---
 
-## 3. Reglas obligatorias
+## 2. Document structure (CRITICAL)
 
-### NO HACER
+El proyecto se divide en 3 capas:
+
+### /docs → PRODUCT (SOURCE OF TRUTH)
+
+Define el sistema real:
+
+- START_HERE.md :contentReference[oaicite:0]{index=0}  
+- ARCHITECTURE.md  
+- API_SPEC.md  
+- MVP_SCOPE.md  
+- APP_STATES.md  
+- PRODUCT_PRINCIPLES.md  
+- DESIGN.md  
+- UI_SCREENS.md  
+- TEST_SCENARIOS.md  
+- IMPLEMENTATION_STATUS.md  
+- RELEASE_CHECKLIST_v0.3.md  
+- SECURITY.md  
+
+Regla:
+> /docs define cómo funciona el sistema
+
+---
+
+### /playbook → DECISION SYSTEM
+
+Define cómo se toman decisiones:
+
+- GUARDIAN_CLOUD_DECISION_RULES.md  
+- FEATURE_EVALUATION_TEMPLATE.md  
+- WEEKLY_PRODUCT_REVIEW.md  
+- CHANGE_GUARDRAILS.md  
+
+Regla:
+> guía decisiones, NO define comportamiento
+
+---
+
+### /strategy → CONTEXTO (NO CRÍTICO)
+
+- MONETIZATION.md  
+- CONVERSION_FLOW.md  
+- POST_MVP_ROADMAP.md  
+
+Regla:
+> no afecta decisiones del sistema actual
+
+---
+
+## 3. Prioridad de fuentes
+
+En caso de conflicto:
+
+1. /docs
+2. /playbook
+3. /strategy (ignorar si contradice)
+
+---
+
+## 4. Reglas obligatorias
+
+### ❌ NO HACER
 
 - No inventar funcionalidades
-- No añadir features fuera del MVP
-- No cambiar arquitectura sin justificar
-- No simplificar partes críticas (chunks, cola, reintentos)
-- No generar código masivo sin control
+- No añadir features fuera del MVP validado
+- No cambiar arquitectura sin justificar impacto real
+- No mover lógica al UI
+- No tocar cola, chunking o worker sin necesidad crítica
+- No introducir complejidad innecesaria
 
 ---
 
-### HACER
+### ✅ HACER
 
-- seguir IMPLEMENTATION_ORDER.md
-- construir por fases
-- validar cada paso
-- priorizar funcionalidad real sobre estética
+- seguir MVP_SCOPE.md
+- respetar PRODUCT_PRINCIPLES.md :contentReference[oaicite:1]{index=1}  
+- validar con TEST_SCENARIOS.md :contentReference[oaicite:2]{index=2}  
+- priorizar funcionamiento real sobre diseño
 
 ---
 
-## 4. Prioridad del sistema
+## 5. Prioridad del sistema
 
 Orden obligatorio:
 
-1. subida fiable de chunks
-2. resiliencia ante fallos
-3. integridad de datos
-4. grabación
+1. subida de chunks
+2. resiliencia
+3. recovery
+4. integridad
 5. UX
 
 > Subir evidencia > grabar perfecto
 
 ---
 
-## 5. Principios técnicos
+## 6. Invariantes (NO ROMPER)
 
-El sistema debe ser:
+- subida durante grabación
+- cola persistente
+- recovery automático
+- evidencia fuera del dispositivo ASAP
+- export usable
 
-- tolerante a fallos
-- resiliente a red inestable
-- capaz de recuperar tras cierre de app
-- consistente en estado de chunks
-- simple en MVP
-
----
-
-## 6. Flujo de trabajo
-
-Antes de escribir código:
-
-1. leer documentos relevantes
-2. resumir lo que vas a hacer
-3. confirmar que está dentro del scope
+Si uno falla:
+> el sistema está roto
 
 ---
 
-Al escribir código:
+## 7. Flujo de trabajo
 
-- hacerlo por módulos pequeños
-- explicar cada parte
-- no generar todo de golpe
+Antes de código:
 
----
+1. leer docs relevantes
+2. explicar qué vas a hacer
+3. validar que respeta invariantes
 
-Después de escribir código:
+Durante:
 
-- validar contra TEST_SCENARIOS.md
-- identificar posibles fallos
-- proponer mejoras si son necesarias
+- cambios pequeños
+- sin refactors masivos
 
----
+Después:
 
-## 7. Validación obligatoria
-
-Siempre debes considerar:
-
-- pérdida de red
-- cierre forzado de app
-- reinicio del dispositivo
-- duplicación de chunks
-- orden incorrecto de chunks
-
-Si tu solución no cubre esto:
-> no es válida
+- validar con TEST_SCENARIOS
+- identificar riesgos
 
 ---
 
-## 8. Seguridad
+## 8. Validación obligatoria
 
-Seguir SECURITY.md:
+Siempre cubrir:
 
-- validar inputs
-- no confiar en cliente
-- no almacenar datos sensibles innecesarios
-- usar cifrado donde sea necesario
+- mala red
+- kill app
+- background
+- reinicio
+
+Si no:
+> no es válido
+
+---
+
+## 9. Seguridad
+
+Seguir SECURITY.md :contentReference[oaicite:3]{index=3}  
 
 Pero:
 
-> seguridad nunca debe romper la subida de datos
+> seguridad nunca puede romper la subida
 
 ---
 
-## 9. UX
+## 10. UX
 
-Seguir DESIGN.md y UI_SCREENS.md:
+Seguir UI_SCREENS.md :contentReference[oaicite:4]{index=4}  
+y UX_RELEASE_CHECKLIST.md :contentReference[oaicite:5]{index=5}  
 
-- interfaz simple
-- acción principal clara
-- usable bajo estrés
+Regla:
 
----
-
-## 10. Manejo de incertidumbre
-
-Si algo no está definido:
-
-- NO inventar
-- preguntar
-- o proponer opciones con pros/contras
+> si el usuario piensa, está mal
 
 ---
 
-## 11. Alcance MVP
+## 11. Decisión de features
 
-Seguir estrictamente MVP_SCOPE.md:
+Usar:
 
-- no añadir extras
-- no optimizar prematuramente
-- no escalar antes de validar
+- FEATURE_EVALUATION_TEMPLATE.md
 
----
+Si no mejora:
 
-## 12. Regla final
+- supervivencia
+- claridad
+- confianza
 
-Si el sistema:
-
-- falla con mala red
-- pierde datos
-- no recupera tras cierre
-
-Entonces:
-> el sistema es incorrecto, aunque el código sea bonito
+→ NO implementar
 
 ---
 
-## 13. Estado actual del proyecto
+## 12. Fase actual
 
-El MVP CORE del sistema está validado:
+El sistema YA funciona:
 
-* chunking en tiempo real
-* subida resiliente
-* recovery tras kill
-* subida en background
-* export de evidencia funcional
+- chunking
+- subida
+- recovery
+- background
+- export
 
-Esto implica:
-
-> el sistema ya no es un prototipo, es una base funcional
+No es prototipo.
 
 ---
 
-## 14. Fase actual
+## 13. Prioridad actual
 
-El proyecto se encuentra en fase de:
-
-* consolidación del MVP
-* validación con usuarios reales
-* mejora de UX crítica (botón pánico, estados)
-* mejora de export
-
----
-
-## 15. Reglas en fase post-MVP
-
-A partir de este punto:
-
-### PERMITIDO
-
-* mejorar UX sin romper flujo
-* mejorar export
-* añadir historial usable
-* preparar funcionalidades futuras (sin implementarlas)
-
----
-
-### NO PERMITIDO
-
-* introducir complejidad en:
-
-  * chunking
-  * GC_QUEUE
-  * upload worker
-* añadir features no validadas
-* modificar arquitectura base sin justificación fuerte
-
----
-
-## 16. Roadmap controlado
-
-El desarrollo futuro sigue este orden:
-
-1. consolidación (export + UX)
-2. valor real (modo kids, historial)
-3. escalado (multi-destino)
-4. avanzado (integridad, forense)
-
-Ver:
-
-* POST_MVP_ROADMAP.md
-
----
-
-## 17. Regla crítica de evolución
-
-> No evolucionar el sistema sin validar uso real
-
-Si una funcionalidad:
-
-* no ha sido probada con usuarios
-* no responde a un problema real observado
-
-👉 NO se implementa
-
----
-
-## 18. Nueva prioridad
-
-Orden actualizado:
-
-1. subida fiable
-2. resiliencia
-3. UX bajo estrés
+1. UX bajo estrés
+2. activación inmediata
+3. claridad de estado
 4. export usable
-5. nuevas funcionalidades
 
 ---
 
-## 19. Regla final extendida
+## 14. Regla final
 
 El sistema es incorrecto si:
 
-* falla en condiciones reales
-* no es usable bajo estrés
-* el usuario no entiende si está protegido
+- pierde datos
+- no recupera
+- no funciona bajo estrés
 
-Aunque técnicamente funcione
+Aunque el código sea correcto
+
+## 🚨 PRE-TASK REQUIREMENT (MANDATORY)
+
+Before writing ANY code, you MUST complete:
+
+CLAUDE_PRETASK_CHECK.md
+
+You must:
+
+1. Fill all sections
+2. Identify impacted files
+3. Evaluate invariants
+4. Define validation
+
+If this is skipped:
+→ the task is invalid
+
+DO NOT write code until this is done.
