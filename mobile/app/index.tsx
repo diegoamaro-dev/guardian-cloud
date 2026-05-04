@@ -2969,16 +2969,11 @@ export default function Index() {
         });
         setTestStatus('ZZ_TOKEN_OK');
         await new Promise(r => setTimeout(r, 50));
-        // Never log the full JWT. Keep a size/prefix fingerprint so we can
-        // still tell "token present and looks like a JWT" from "token empty
-        // or wrong shape" without exposing the signing material.
+        // Safe fingerprint only — no content, no prefix, no signing material.
         console.log('TOKEN:', {
           length: token.length,
-          prefix: token.substring(0, 12),
           looks_like_jwt: token.split('.').length === 3,
         });
-        // REMOVE BEFORE RELEASE
-        console.log('JWT_DEBUG_FULL', token);
         console.log('API URL:', env.apiUrl);
 
         // Kick off the destination check in the background. MUST NOT be

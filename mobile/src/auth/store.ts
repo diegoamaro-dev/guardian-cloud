@@ -68,8 +68,6 @@ export const useAuthStore = create<AuthState>((set) => ({
       set({ status: 'signed-out', user: null, accessToken: null });
     } else {
       console.log('SESSION_LOAD_RESULT', data.session ? 'signed-in' : 'no session');
-      // REMOVE BEFORE RELEASE
-      console.log('JWT_DEBUG_FULL', data.session?.access_token ?? 'no session');
       set(applySession(data.session));
     }
 
