@@ -22,7 +22,7 @@ import { useRef, useState } from 'react';
 import { View, Text, Pressable, ScrollView } from 'react-native';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import { Audio } from 'expo-av';
-import * as FileSystem from 'expo-file-system';
+import * as FileSystem from 'expo-file-system/legacy';
 import { Stack } from 'expo-router';
 
 type LogLine = { t: number; line: string };

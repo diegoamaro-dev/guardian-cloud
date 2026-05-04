@@ -76,7 +76,7 @@ vi.mock('expo-camera', () => ({
   useCameraPermissions: () => [{ granted: true }, vi.fn(async () => ({ granted: true }))],
 }));
 
-vi.mock('expo-file-system', () => ({
+vi.mock('expo-file-system/legacy', () => ({
   documentDirectory: 'file:///doc/',
   cacheDirectory: 'file:///cache/',
   getInfoAsync: vi.fn(async () => ({ exists: false })),

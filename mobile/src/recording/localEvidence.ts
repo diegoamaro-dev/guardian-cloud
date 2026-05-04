@@ -26,7 +26,7 @@
  *   - zero `setItem`, zero mutation
  */
 
-import * as FileSystem from 'expo-file-system';
+import * as FileSystem from 'expo-file-system/legacy';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
 const PENDING_RETRY_KEY = 'test.pending_retry';

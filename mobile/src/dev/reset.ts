@@ -5,7 +5,7 @@
  *  Best-effort: per-step failures are logged and execution continues. */
 
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import * as FileSystem from 'expo-file-system';
+import * as FileSystem from 'expo-file-system/legacy';
 
 // Mirrors literals defined in:
 //   mobile/app/index.tsx       PENDING_RETRY_KEY      'test.pending_retry'
