@@ -222,3 +222,16 @@ El proyecto está en fase de:
 ## 20. Regla de evolución
 
 > No añadir nuevas funcionalidades sin validar el uso real del sistema actual
+
+## Jerarquía de documentación
+
+En caso de conflicto:
+
+1. PRODUCT_PRINCIPLES.md
+2. MVP_SCOPE.md
+3. ARCHITECTURE.md / API_SPEC.md
+4. UI / UX docs
+5. resto
+
+La validación final siempre se basa en:
+TEST_SCENARIOS.md
