@@ -48,10 +48,30 @@ export const useAuthStore = create<AuthState>((set) => ({
   accessToken: null,
 
   init: async () => {
+    console.log('SESSION_LOAD_START');
+
     // getSession() pulls whatever supabase-js has already hydrated from
     // AsyncStorage (or null if this is a fresh install / signed-out user).
-    const { data } = await supabase.auth.getSession();
-    set(applySession(data.session));
+    // Also read `error`: an AuthApiError here means the persisted refresh
+    // token is invalid (revoked, expired, or corrupted). In that case we
+    // must explicitly sign out so supabase-js wipes AsyncStorage — without
+    // this, every cold start retries the same bad token indefinitely.
+    const { data, error } = await supabase.auth.getSession();
+
+    if (error) {
+      console.log('SESSION_INVALID → forcing logout', error.message);
+      try {
+        await supabase.auth.signOut();
+      } catch {
+        // Ignore server-side error — we clear local state regardless.
+      }
+      set({ status: 'signed-out', user: null, accessToken: null });
+    } else {
+      console.log('SESSION_LOAD_RESULT', data.session ? 'signed-in' : 'no session');
+      // REMOVE BEFORE RELEASE
+      console.log('JWT_DEBUG_FULL', data.session?.access_token ?? 'no session');
+      set(applySession(data.session));
+    }
 
     if (!subscribed) {
       supabase.auth.onAuthStateChange((_event, session) => {
