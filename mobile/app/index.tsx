@@ -1293,6 +1293,26 @@ let isDraining = false;
  * A UI selector (phase 2) will refine this further.
  */
 let activeDestinationType: DestinationType = 'drive';
+
+/**
+ * Race guard: the drain loop must NOT route chunks until the active
+ * destination has been resolved at least once. Without this, on cold
+ * boot / recovery the worker happily picks up pending chunks and ships
+ * them to the default 'drive' endpoint before `refreshDestination()`
+ * has had a chance to switch the routing target — producing chunks
+ * uploaded to the wrong destination, which is a product-correctness
+ * bug, not just a perf hiccup.
+ *
+ * Set to true inside `refreshDestination()` once `activeDestinationType`
+ * has been assigned. Stays true for the rest of the process lifetime;
+ * subsequent destination changes only update `activeDestinationType`.
+ *
+ * Intentionally does NOT mark chunks as failed, mutate queue state, or
+ * trigger retries — it is a pure deferral. The drain loop will be
+ * re-kicked by the existing call sites the moment the destination
+ * resolves.
+ */
+let destinationResolved = false;
 /**
  * Cache of base64 contents per `uri` for the rehydration path. Keyed by
  * uri; cleared when the corresponding queue entry is reaped. Avoids
@@ -1413,6 +1433,18 @@ async function uploadDrainLoop(): Promise<void> {
   if (DEBUG_QUEUE) console.log('GC_DEBUG drain called', { isDraining });
   if (isDraining) {
     if (DEBUG_QUEUE) console.log('GC_DEBUG drain skipped — isDraining=true');
+    return;
+  }
+  // Hard race-guard: refuse to route any chunk until `refreshDestination`
+  // has resolved the active destination at least once. Without this,
+  // boot/recovery would happily drain pending chunks against the default
+  // 'drive' endpoint before NAS routing has been applied — uploading
+  // bytes to the wrong destination is a product-correctness bug. We
+  // intentionally do NOT mutate queue state, mark chunks failed, or
+  // bump retry counters — this is a pure deferral. `refreshDestination`
+  // re-kicks the drain after flipping the flag so no chunk is starved.
+  if (!destinationResolved) {
+    console.log('GC_QUEUE blocked: destination not resolved');
     return;
   }
   isDraining = true;
@@ -2866,7 +2898,24 @@ export default function Index() {
       } else {
         activeDestinationType = drive ? 'drive' : nas ? 'nas' : 'drive';
       }
-      console.log('DEST_TYPE', { activeDestinationType });
+      // Release the drain-loop race guard. Once true, the worker is free
+      // to route chunks; before this, it deferred every tick.
+      const wasBlocked = !destinationResolved;
+      destinationResolved = true;
+      console.log('DEST_TYPE', { activeDestinationType, destinationResolved });
+      // Re-kick the drain: any tick that early-returned while we were
+      // resolving needs a fresh entry point now that routing is known.
+      // uploadDrainLoop is single-flight (`isDraining`), so a redundant
+      // kick while already draining is a harmless no-op.
+      if (wasBlocked) {
+        uploadDrainLoop().catch((err) => {
+          if (DEBUG_QUEUE) {
+            console.log('GC_DEBUG drain rejected (from refreshDestination)', {
+              err: err instanceof Error ? err.message : String(err),
+            });
+          }
+        });
+      }
     } catch (error) {
       // Transient check failure (network, 401) → leave as `null` so the
       // button remains disabled but no hard block. The user can retry
