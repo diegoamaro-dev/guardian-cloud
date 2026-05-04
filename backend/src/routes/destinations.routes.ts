@@ -59,6 +59,7 @@ import {
   uploadFile,
 } from '../services/drive.service.js';
 import { uploadChunk as webdavUploadChunk } from '../adapters/webdav.adapter.js';
+import { encryptWebdavPassword } from '../security/webdavCredentials.js';
 import {
   getDestinationForUser,
   getDestinationWithSecretForUser,
@@ -109,6 +110,61 @@ router.post(
       });
 
       res.status(200).json({ destination: toPublic(updated) });
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+/**
+ * POST /destinations/nas — save NAS (WebDAV) connection config.
+ *
+ * Validates, encrypts the password, and upserts a `destinations` row with
+ * type='nas'. Drive rows are never touched.
+ *
+ * Body: { webdav_url, webdav_username, webdav_password, webdav_base_path? }
+ * Response 200: { destination: PublicDestination }
+ */
+const nasConfigSchema = z.object({
+  webdav_url: z
+    .string()
+    .url('webdav_url must be a valid URL')
+    .refine((u) => new URL(u).protocol === 'https:', 'webdav_url must use https'),
+  webdav_username: z.string().min(1, 'webdav_username is required'),
+  webdav_password: z.string().min(1, 'webdav_password is required'),
+  webdav_base_path: z.string().default(''),
+});
+
+router.post(
+  '/nas',
+  authMiddleware,
+  userRateLimiter(10),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      if (!req.user) throw new UnauthorizedError();
+
+      const parsed = nasConfigSchema.safeParse(req.body);
+      if (!parsed.success) {
+        throw new AppError(
+          400,
+          'INVALID_BODY',
+          parsed.error.issues[0]?.message ?? 'Invalid request body',
+        );
+      }
+
+      const { webdav_url, webdav_username, webdav_password, webdav_base_path } = parsed.data;
+
+      const webdav_password_encrypted = encryptWebdavPassword(webdav_password);
+
+      const saved = await upsertDestination(req.user.id, 'nas', {
+        status: 'connected',
+        webdav_url,
+        webdav_username,
+        webdav_password_encrypted,
+        webdav_base_path,
+      });
+
+      res.status(200).json({ destination: toPublic(saved) });
     } catch (err) {
       next(err);
     }

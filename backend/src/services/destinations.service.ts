@@ -134,6 +134,11 @@ export interface UpsertDestinationFields {
   refresh_token?: string | null;
   folder_id?: string | null;
   account_email?: string | null;
+  // NAS-specific fields
+  webdav_url?: string | null;
+  webdav_username?: string | null;
+  webdav_password_encrypted?: string | null;
+  webdav_base_path?: string | null;
 }
 
 /**
@@ -166,6 +171,22 @@ export async function upsertDestination(
       fields.account_email !== undefined
         ? fields.account_email
         : existing?.account_email ?? null,
+    webdav_url:
+      fields.webdav_url !== undefined
+        ? fields.webdav_url
+        : existing?.webdav_url ?? null,
+    webdav_username:
+      fields.webdav_username !== undefined
+        ? fields.webdav_username
+        : existing?.webdav_username ?? null,
+    webdav_password_encrypted:
+      fields.webdav_password_encrypted !== undefined
+        ? fields.webdav_password_encrypted
+        : existing?.webdav_password_encrypted ?? null,
+    webdav_base_path:
+      fields.webdav_base_path !== undefined
+        ? fields.webdav_base_path
+        : existing?.webdav_base_path ?? null,
   };
 
   const { data, error } = await supabase
