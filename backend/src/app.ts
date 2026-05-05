@@ -47,7 +47,7 @@ export function createApp(): express.Express {
   // --- DIAG: request-id + entry log. MUST be the first middleware so we
   // see every request regardless of what fails downstream. Log shape is
   // stable so we can grep for REQ_INCOMING / REQ_HEADERS in the terminal.
-  app.use((req: Request, _res: Response, next: NextFunction) => {
+  app.use((req: Request, res: Response, next: NextFunction) => {
     const reqId = randomUUID();
     req.reqId = reqId;
     logger.info(
@@ -67,6 +67,21 @@ export function createApp(): express.Express {
       },
       'REQ_HEADERS',
     );
+    // DIAG: companion log on response finish so we have a stable
+    // method+path+status triple to grep. Pino's pino-http already logs
+    // res, but `pinoHttp` runs further down the chain so its output can
+    // be missed when 404 happens BEFORE it. This log fires regardless.
+    res.on('finish', () => {
+      logger.info(
+        {
+          reqId,
+          method: req.method,
+          path: req.path,
+          statusCode: res.statusCode,
+        },
+        'REQ_DONE',
+      );
+    });
     next();
   });
 

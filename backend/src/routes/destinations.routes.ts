@@ -262,6 +262,22 @@ router.post(
  */
 router.post(
   '/drive/connect',
+  // DIAG: route-entry log fired BEFORE auth/rate-limit/validate so we can
+  // distinguish "request reached the route" from "request died upstream".
+  // No logic change — single line, sync, then `next()`.
+  (req: Request, _res: Response, next: NextFunction) => {
+    logger.info(
+      {
+        reqId: req.reqId,
+        op: 'drive.connect',
+        method: req.method,
+        path: req.path,
+        contentType: req.header('content-type') ?? null,
+      },
+      'DRIVE_CONNECT_ROUTE_ENTERED',
+    );
+    next();
+  },
   authMiddleware,
   userRateLimiter(10),
   validateBody(driveConnectSchema),

@@ -93,7 +93,22 @@ export async function apiFetch<T = unknown>(
   }
 
   const url = `${env.apiUrl}${path}`;
-  console.log('API CALL', { method, url, authed: auth });
+  // `authed` reflects the INTENT (auth was requested for this call).
+  // `auth_header_set` reflects the OUTCOME (the header was actually
+  // composed onto the outgoing request). Both must be true for the
+  // request to reach the backend with a Bearer; if `authed=true` but
+  // `auth_header_set=false` we'd have aborted with AUTH MISSING above
+  // and never reached this log line — so they should always agree at
+  // this point. Keeping both makes diagnostics in `adb logcat` trivial:
+  // a backend `authorization_present:false` paired with a client
+  // `auth_header_set:true` proves the bytes were dropped between
+  // device and server (proxy, ngrok, stale APK), not in the client.
+  console.log('API CALL', {
+    method,
+    url,
+    authed: auth,
+    auth_header_set: 'Authorization' in headers,
+  });
   let response: Response;
   try {
     response = await fetch(url, requestInit);
