@@ -167,19 +167,17 @@ export default function SessionDetailScreen() {
   // fragment extension picker.
   const [sessionMode, setSessionMode] = useState<SessionMode | null>(null);
   // Per-session upload destination, fetched once on mount via
-  // GET /sessions/:id (which the backend already exposes; no new
-  // endpoint). Drives the export gating below: NAS sessions cannot
-  // currently round-trip via the per-chunk Drive download endpoint
-  // — that path would 404 with "Drive file not found" for every
-  // chunk and fold the result to `no_valid_chunks`, which is both
-  // misleading (the chunks are NOT corrupt) and noisy in logcat.
+  // GET /sessions/:id (no new endpoint). Cached so future copy /
+  // diagnostics can branch on it without a second fetch. The export
+  // pipeline itself is destination-agnostic — the backend's
+  // `/chunks/:index/download` route now bifurcates by
+  // `sessions.destination_type` server-side, so the client does not
+  // need to do anything different for NAS vs Drive sessions.
   //
-  //   'drive'  → existing export flow runs unchanged
-  //   'nas'    → export is hidden + a clear "pendiente" notice replaces
-  //              the button; defense-in-depth in `handleExport` also
-  //              short-circuits before any /chunks/:index/download call
-  //   null     → unknown (legacy session, fetch failure, etc.) — falls
-  //              through to the existing Drive flow exactly as before
+  //   'drive'  → existing export flow runs (Drive proxy)
+  //   'nas'    → existing export flow runs (NAS proxy via WebDAV)
+  //   null     → unknown (fetch failure / legacy session) — the export
+  //              still runs; the backend will pick a branch on its own
   const [sessionDestination, setSessionDestination] = useState<
     'drive' | 'nas' | null
   >(null);
@@ -253,11 +251,13 @@ export default function SessionDetailScreen() {
   }, [sessionId, phase.kind === 'done']);
 
   // One-shot session-destination lookup via GET /sessions/:id. Fires
-  // once per sessionId; failures fold to `null` so the existing Drive
+  // once per sessionId; failures fold to `null` so the existing export
   // flow still runs (we never gate the user on a transient network
-  // hiccup). Logs `EXPORT_BLOCKED_NAS_NOT_IMPLEMENTED` the first time
-  // we observe a NAS session so logcat shows clearly WHY the export
-  // button vanished — easier to diagnose than a missing affordance.
+  // hiccup). Cached in `sessionDestination` for future copy / badge
+  // use. The log key `SESSION_DETAIL_FOR_EXPORT` is intentionally kept
+  // while NAS export is being validated end-to-end — once both
+  // branches (Drive + NAS) are confirmed in production, both temp
+  // logs (this and `SESSION_DETAIL_FETCH_FAILED`) can be removed.
   useEffect(() => {
     if (!sessionId) return;
     let cancelled = false;
@@ -265,23 +265,15 @@ export default function SessionDetailScreen() {
       try {
         const detail = await getSessionDetail(sessionId);
         // TEMP DIAGNOSTIC: confirm what GET /sessions/:id actually
-        // returns at runtime. To remove once the destination-tracking
-        // bug is fixed.
+        // returns at runtime. To remove once NAS export is validated
+        // end-to-end across both branches.
         console.log('SESSION_DETAIL_FOR_EXPORT', {
           sessionId,
           destination_type: detail.destination_type,
           detail,
         });
         if (cancelled) return;
-        const dt = detail.destination_type ?? null;
-        setSessionDestination(dt);
-        if (dt === 'nas') {
-          console.log('EXPORT_BLOCKED_NAS_NOT_IMPLEMENTED', {
-            sessionId,
-            reason: 'nas_export_not_implemented_yet',
-            phase: 'mount_lookup',
-          });
-        }
+        setSessionDestination(detail.destination_type ?? null);
       } catch (err) {
         // TEMP DIAGNOSTIC: surface fetch failures so a silent network
         // error does not look like a "destination=drive" verdict.
@@ -338,20 +330,6 @@ export default function SessionDetailScreen() {
 
   async function handleExport() {
     if (!sessionId) return;
-
-    // Defense-in-depth: even if the render guard below somehow lets the
-    // user trigger this for a NAS session (race between the destination
-    // fetch and a tap), bail BEFORE touching `exportSession`. Mirrors
-    // the same log key emitted on mount so the operator sees both
-    // observations correlated by sessionId.
-    if (sessionDestination === 'nas') {
-      console.log('EXPORT_BLOCKED_NAS_NOT_IMPLEMENTED', {
-        sessionId,
-        reason: 'nas_export_not_implemented_yet',
-        phase: 'handle_export_guard',
-      });
-      return;
-    }
 
     // Local-only path. When cloud has nothing to give (offline at boot
     // or the session never had any chunk uploaded) we skip the cloud
@@ -663,33 +641,22 @@ export default function SessionDetailScreen() {
           chunks list returned by the backend — never optimistic. */}
       <StatusHeader summary={statusSummary} />
 
-      {/* Export gating by per-session destination. The "Exportar
-          evidencia" button is intentionally HIDDEN for NAS sessions
-          (rather than disabled) because the broken affordance would
-          otherwise invite a tap that produces a misleading "chunks
-          corruptos" verdict in logcat — see `handleExport`'s guard
-          and the mount-time log. Drive sessions and unknown ones
-          (legacy / fetch failure) keep the existing button. */}
-      {sessionDestination === 'nas' ? (
-        <NasExportPendingBlock />
-      ) : (
-        <Pressable
-          onPress={handleExport}
-          disabled={exportDisabled}
-          style={{
-            backgroundColor: exportDisabled ? '#1f2a36' : '#1f6feb',
-            opacity: exportDisabled ? 0.7 : 1,
-            padding: 14,
-            borderRadius: 6,
-            alignItems: 'center',
-            marginBottom: 14,
-          }}
-        >
-          <Text style={{ color: '#fff', fontWeight: '700' }}>
-            Exportar evidencia
-          </Text>
-        </Pressable>
-      )}
+      <Pressable
+        onPress={handleExport}
+        disabled={exportDisabled}
+        style={{
+          backgroundColor: exportDisabled ? '#1f2a36' : '#1f6feb',
+          opacity: exportDisabled ? 0.7 : 1,
+          padding: 14,
+          borderRadius: 6,
+          alignItems: 'center',
+          marginBottom: 14,
+        }}
+      >
+        <Text style={{ color: '#fff', fontWeight: '700' }}>
+          Exportar evidencia
+        </Text>
+      </Pressable>
 
       {phase.kind === 'running' && <ProgressBlock progress={phase.progress} />}
       {phase.kind === 'localExport' && <LocalExportBlock />}
@@ -720,41 +687,6 @@ export default function SessionDetailScreen() {
         falta o está corrupto, el archivo se marca como parcial.
       </Text>
     </ScrollView>
-  );
-}
-
-/**
- * Replacement card shown instead of the export button when the
- * session was uploaded to NAS. The per-chunk download endpoint is
- * Drive-only today, so a NAS export would 404 every chunk and fold
- * to "no_valid_chunks" — misleading because the chunks ARE intact
- * on the NAS. Hiding the button is the honest interim state until
- * the WebDAV-side download is implemented (out of scope here).
- *
- * Pure presentation: takes no props, performs no I/O, never reads
- * back into any decision flow. The mount-time `useEffect` already
- * logged the block reason; this component never logs.
- */
-function NasExportPendingBlock() {
-  return (
-    <View
-      style={{
-        marginBottom: 14,
-        padding: 12,
-        borderWidth: 1,
-        borderColor: '#d29922',
-        borderRadius: 6,
-        backgroundColor: '#2d1f06',
-      }}
-    >
-      <Text style={{ color: '#e3b341', fontSize: 13, fontWeight: '700' }}>
-        Exportación desde NAS pendiente
-      </Text>
-      <Text style={{ color: '#c9d1d9', fontSize: 12, marginTop: 6 }}>
-        La evidencia está guardada en tu NAS, pero la reconstrucción
-        desde NAS aún no está implementada.
-      </Text>
-    </View>
   );
 }
 

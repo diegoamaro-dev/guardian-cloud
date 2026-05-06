@@ -199,3 +199,143 @@ export async function uploadChunk(params: WebDavUploadParams): Promise<WebDavUpl
 
   throw new AppError(502, 'NAS_UPLOAD_FAILED', `WebDAV PUT failed (${res.status})`);
 }
+
+/**
+ * Inputs for {@link downloadChunk}.
+ *
+ * `url` is the full `remote_reference` that {@link uploadChunk} returned at
+ * upload time (deterministic shape:
+ * `${host}${basePath}/GuardianCloud/${sessionId}/${chunkIndex}.chunk`).
+ * The CALLER is responsible for validating that this URL still belongs to
+ * the user's currently-connected NAS — see the prefix check in
+ * `routes/sessions.routes.ts`. This adapter intentionally does NOT
+ * re-validate: passing an unverified URL through this function would
+ * allow SSRF if the route layer ever forgot to check, so the contract
+ * is "url is already proven safe by the route".
+ */
+export interface WebDavDownloadParams {
+  url: string;
+  destination: {
+    username: string;
+    /** AES-256-GCM encrypted password (v1:iv:authTag:ciphertext) */
+    encryptedPassword: string;
+  };
+}
+
+export interface WebDavDownloadResult {
+  bytes: Buffer;
+}
+
+/**
+ * GET one chunk from a WebDAV server using HTTP Basic auth.
+ *
+ * Mirror of {@link uploadChunk}'s I/O contract:
+ *   - same timeout (`WEBDAV_TIMEOUT_MS`)
+ *   - same Basic-auth construction
+ *   - same credential-decrypt path (failure → 503 NAS_CREDENTIAL_ERROR)
+ *   - same error mapping shape (401/403 → 409 NAS_AUTH_FAILED, 5xx /
+ *     network → 502 NAS_DOWNLOAD_FAILED)
+ *
+ * Distinct error code for "not on the NAS": 404 NAS_FILE_NOT_FOUND, so
+ * the export client can treat it as a per-chunk download failure (and
+ * cut the partial export at that index) rather than as a hard failure
+ * for the whole session.
+ *
+ * Memory: holds the full chunk in memory as a Buffer. Chunks are
+ * ~16 KB in the MVP (audio) up to a few MB (video segments); the
+ * upload adapter holds them similarly. Streaming is out of scope.
+ *
+ * The password is decrypted in-process and never logged.
+ */
+export async function downloadChunk(
+  params: WebDavDownloadParams,
+): Promise<WebDavDownloadResult> {
+  const { url, destination } = params;
+
+  // --- 1) Decrypt credentials. Failure here is fatal (bad key / bad payload).
+  let password: string;
+  try {
+    password = decryptWebdavPassword(destination.encryptedPassword);
+  } catch (err) {
+    logger.error(
+      {
+        op: 'webdav.downloadChunk',
+        url,
+        reason: err instanceof Error ? err.message : String(err),
+      },
+      'NAS_CREDENTIAL_DECRYPT_FAILED',
+    );
+    throw new AppError(503, 'NAS_CREDENTIAL_ERROR', 'Failed to decrypt NAS credentials');
+  }
+
+  const authHeader = `Basic ${Buffer.from(`${destination.username}:${password}`).toString('base64')}`;
+
+  // --- 2) GET with timeout.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), WEBDAV_TIMEOUT_MS);
+
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: 'GET',
+      headers: { Authorization: authHeader },
+      signal: controller.signal,
+    });
+  } catch (err) {
+    clearTimeout(timer);
+    logger.warn(
+      {
+        op: 'webdav.downloadChunk',
+        url,
+        reason: err instanceof Error ? err.message : String(err),
+      },
+      'NAS_DOWNLOAD_NETWORK_ERROR',
+    );
+    throw new AppError(502, 'NAS_DOWNLOAD_FAILED', 'WebDAV GET failed: network error');
+  }
+  clearTimeout(timer);
+
+  // --- 3) Map HTTP status to AppError.
+  // WebDAV GET success: 200 (full body), 206 (partial — we don't request
+  // ranges so this should not happen, but accept it defensively).
+  if (res.status === 200 || res.status === 206) {
+    const ab = await res.arrayBuffer();
+    const bytes = Buffer.from(ab);
+    logger.info(
+      { op: 'webdav.downloadChunk', url, status: res.status, size: bytes.length },
+      'NAS_CHUNK_DOWNLOAD_SUCCESS',
+    );
+    return { bytes };
+  }
+
+  if (res.status === 401 || res.status === 403) {
+    logger.warn(
+      { op: 'webdav.downloadChunk', url, status: res.status },
+      'NAS_AUTH_FAILED',
+    );
+    throw new AppError(409, 'NAS_AUTH_FAILED', `WebDAV authentication failed (${res.status})`);
+  }
+
+  if (res.status === 404) {
+    // Distinct from a network error: the NAS spoke to us, the chunk
+    // simply isn't there. Mirrors DRIVE_FILE_NOT_FOUND so the route /
+    // client treat it as a per-chunk failure (partial export).
+    logger.warn(
+      { op: 'webdav.downloadChunk', url, status: res.status },
+      'NAS_FILE_NOT_FOUND',
+    );
+    throw new AppError(404, 'NAS_FILE_NOT_FOUND', 'NAS file not found for the given remote_reference');
+  }
+
+  const detail = await res.text().catch(() => '<no body>');
+  logger.warn(
+    {
+      op: 'webdav.downloadChunk',
+      url,
+      status: res.status,
+      detail: detail.substring(0, 200),
+    },
+    'NAS_CHUNK_DOWNLOAD_FAILED',
+  );
+  throw new AppError(502, 'NAS_DOWNLOAD_FAILED', `WebDAV GET failed (${res.status})`);
+}

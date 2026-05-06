@@ -25,10 +25,12 @@ import {
   createSession,
   completeSession,
   getOwnedSession,
+  type SessionRow,
 } from '../services/sessions.service.js';
 import { listChunksForSession } from '../services/chunks.service.js';
 import { getDestinationWithSecretForUser } from '../services/destinations.service.js';
 import { downloadFile, getAccessToken } from '../services/drive.service.js';
+import { downloadChunk as webdavDownloadChunk } from '../adapters/webdav.adapter.js';
 import { logger } from '../utils/logger.js';
 
 const router = Router();
@@ -156,6 +158,58 @@ const result = await completeSession(req.user.id, sessionId);
  * mobile/src/api/export.ts already expects (see `downloadChunk` there).
  * No content negotiation, no JSON envelope.
  */
+
+/**
+ * Reproduce the deterministic upload-side path so we can verify, at
+ * download time, that a NAS chunk's `remote_reference` still belongs to
+ * the user's CURRENTLY-connected NAS.
+ *
+ * Source of truth for the format: `webdav.adapter.ts:uploadChunk`
+ *   const url = `${dirSession}/${chunkIndex}.chunk`;
+ *   dirSession = `${base}/GuardianCloud/${sessionId}`
+ *   base       = `${host}${basePath}` (basePath optional, trailing `/`
+ *                  stripped on both)
+ *
+ * If a row's `remote_reference` does not begin with this exact prefix
+ * for the connected destination, refuse the download. That's the SSRF
+ * mitigation: we never fetch a URL outside the user's own NAS even if
+ * a row in `chunks` was tampered with.
+ *
+ * Trailing slash included so `prefix.startsWith` cannot be satisfied by
+ * a same-prefix-but-different-session URL.
+ */
+function buildExpectedNasPrefix(
+  dest: { webdav_url: string | null; webdav_base_path: string | null },
+  sessionId: string,
+): string {
+  // Caller MUST have already verified `webdav_url` is non-null (the
+  // route does this check before calling). The defensive `?? ''` keeps
+  // the function total: if some future caller forgets the check the
+  // result will be `/GuardianCloud/<id>/` which can never match a real
+  // remote_reference, so the prefix check would still refuse the
+  // download — fail-closed by construction.
+  const host = (dest.webdav_url ?? '').replace(/\/$/, '');
+  const base = dest.webdav_base_path
+    ? `${host}${dest.webdav_base_path.replace(/\/$/, '')}`
+    : host;
+  return `${base}/GuardianCloud/${sessionId}/`;
+}
+
+/**
+ * Defensive log helper: extract just the origin (scheme://host[:port])
+ * from a URL string. Used in `NAS_REF_PREFIX_MISMATCH` warnings so the
+ * operator can see WHERE a tampered reference points without dumping
+ * the full path. Falls back to '<unparseable>' on parse failure rather
+ * than throwing — logging must never break a request handler.
+ */
+function safeOriginOf(maybeUrl: string): string {
+  try {
+    return new URL(maybeUrl).origin;
+  } catch {
+    return '<unparseable>';
+  }
+}
+
 router.get(
   '/:id/chunks/:index/download',
   authMiddleware,
@@ -187,25 +241,99 @@ router.get(
         );
       }
 
-      // Drive handshake. Mirrors the upload route — same source of truth
-      // for the destination, same refresh flow.
-      const dest = await getDestinationWithSecretForUser(req.user.id, 'drive');
-      if (!dest || !dest.refresh_token) {
-        throw new AppError(
-          409,
-          'DRIVE_NOT_CONNECTED',
-          'No connected Google Drive destination for this user',
-        );
-      }
-      const accessToken = await getAccessToken(dest.refresh_token);
+      // Per-session destination is the canonical source of truth for
+      // WHICH backend proxy to use. We do an extra row read here (one
+      // .select on `sessions`) rather than encoding the decision in the
+      // chunk row, because:
+      //   - chunks.remote_reference is opaque ("Drive file id" vs
+      //     "WebDAV URL"); inferring the storage type from its shape
+      //     would be fragile.
+      //   - sessions.destination_type is set at GRABAR time (see the
+      //     mobile pinning fix) so it always matches where this
+      //     session's chunks were physically uploaded.
+      // `getOwnedSession` re-runs the ownership check; cheap and
+      // defensive even though `listChunksForSession` already did it.
+      const session: SessionRow = await getOwnedSession(req.user.id, sessionId);
 
-      const bytes = await downloadFile(accessToken, chunk.remote_reference);
+      let bytes: Buffer;
+      if (session.destination_type === 'nas') {
+        // === NAS branch (WebDAV proxy) ===
+        const dest = await getDestinationWithSecretForUser(req.user.id, 'nas');
+        if (
+          !dest ||
+          dest.status !== 'connected' ||
+          !dest.webdav_url ||
+          !dest.webdav_username ||
+          !dest.webdav_password_encrypted
+        ) {
+          throw new AppError(
+            409,
+            'NAS_NOT_CONNECTED',
+            'No connected NAS destination for this user',
+          );
+        }
+
+        // SSRF / DB-tampering guard. The upload adapter constructed
+        // remote_reference deterministically as
+        //   `${host}${basePath}/GuardianCloud/${sessionId}/{idx}.chunk`
+        // (see webdav.adapter.ts: ROOT_DIR + dirSession + url). If the
+        // current value does NOT begin with that prefix — derived live
+        // from the user's CURRENTLY-connected NAS — the row is either
+        // tampered with or points at a NAS the user has since
+        // disconnected. Either way: refuse rather than blindly fetch
+        // an arbitrary URL with the user's NAS credentials.
+        const expectedPrefix = buildExpectedNasPrefix(dest, sessionId);
+        if (!chunk.remote_reference.startsWith(expectedPrefix)) {
+          logger.warn(
+            {
+              op: 'sessions.chunks.download',
+              session_id: sessionId,
+              chunk_index: chunkIndex,
+              expected_prefix: expectedPrefix,
+              // Log the host portion of the reference only — never the
+              // full URL with any auth-bearing query (we don't use auth
+              // in URLs, but be conservative).
+              ref_origin: safeOriginOf(chunk.remote_reference),
+              reason: 'remote_reference_outside_expected_nas_base',
+            },
+            'NAS_REF_PREFIX_MISMATCH',
+          );
+          throw new AppError(
+            409,
+            'NAS_REF_PREFIX_MISMATCH',
+            'NAS chunk reference does not match the user\'s connected NAS',
+          );
+        }
+
+        const result = await webdavDownloadChunk({
+          url: chunk.remote_reference,
+          destination: {
+            username: dest.webdav_username,
+            encryptedPassword: dest.webdav_password_encrypted,
+          },
+        });
+        bytes = result.bytes;
+      } else {
+        // === Drive branch (legacy + 'drive'; behaviour byte-identical
+        // to the pre-NAS-export version of this handler) ===
+        const dest = await getDestinationWithSecretForUser(req.user.id, 'drive');
+        if (!dest || !dest.refresh_token) {
+          throw new AppError(
+            409,
+            'DRIVE_NOT_CONNECTED',
+            'No connected Google Drive destination for this user',
+          );
+        }
+        const accessToken = await getAccessToken(dest.refresh_token);
+        bytes = await downloadFile(accessToken, chunk.remote_reference);
+      }
 
       logger.info(
         {
           op: 'sessions.chunks.download',
           session_id: sessionId,
           chunk_index: chunkIndex,
+          destination_type: session.destination_type,
           size: bytes.length,
         },
         'chunk download served',
