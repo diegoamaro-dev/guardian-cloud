@@ -1,0 +1,5 @@
+[33m0407788[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m, [m[1;33mtag: [m[1;33mstable-nas-routing[m[33m, [m[1;31morigin/main[m[33m, [m[1;31morigin/HEAD[m[33m)[m fix: persist session destination for NAS export routing
+[33m7a10cae[m[33m ([m[1;33mtag: [m[1;33mstable-runtime-recovered[m[33m)[m fix: allow LAN Metro and remove stale Android bundle
+[33mfa255cc[m fix: show active upload destination in home card
+[33m39c21df[m fix: pin upload destination per recording session
+[33mbeb31eb[m fix: recover contiguous partial evidence exports
