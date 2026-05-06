@@ -4324,30 +4324,20 @@ export default function Index() {
         </Text>
       ) : null}
 
-      {/* Destination indicator. Shows the currently active destination so
-          the user never has to guess where evidence will land. No
-          destination → the indicator explains that recording is blocked
-          and offers a shortcut to the Settings screen. */}
-      <DestinationIndicator drive={drive} loading={driveCheckLoading} />
-
-      {/* Passive "Protegiendo en …" label. Pure read-out of the resolved
-          `activeDest`; the home screen never asks the user to decide
-          before recording — the choice (when both Drive and NAS are
-          connected) lives in Settings. Hidden entirely when no
-          destination is connected, so the user is never told we are
-          "protecting" them somewhere we cannot reach. */}
-      {(drive || hasNas) && (
-        <Text
-          style={{
-            color: '#8b949e',
-            fontSize: 12,
-            marginTop: 6,
-            alignSelf: 'flex-start',
-          }}
-        >
-          {`Protegiendo en: ${activeDest === 'nas' ? 'NAS' : 'Drive'}`}
-        </Text>
-      )}
+      {/* Destination indicator. Single source of truth for what the
+          home screen tells the user about evidence routing. Now reads
+          `activeDest` so the displayed destination matches the one the
+          worker will actually use for the next recording — Drive when
+          only Drive is connected, NAS when only NAS is connected, and
+          the user-selected target (Settings) when both are connected.
+          The previous separate "Protegiendo en …" line is gone — there
+          is only one place that says where evidence lands. */}
+      <DestinationIndicator
+        drive={drive}
+        hasNas={hasNas}
+        activeDest={activeDest}
+        loading={driveCheckLoading}
+      />
 
       {/* Audio / Video mode toggle. Cosmetic in step 2 — flipping the
           state has no effect on what gets recorded yet. Locked while a
@@ -4512,17 +4502,36 @@ export default function Index() {
 
 function DestinationIndicator({
   drive,
+  hasNas,
+  activeDest,
   loading,
 }: {
   drive: PublicDestination | null | undefined;
+  hasNas: boolean;
+  activeDest: DestinationType;
   loading: boolean;
 }) {
-  const dotColor = loading ? '#8b949e' : drive ? '#3ddc84' : '#f85149';
-  // Connected case is rendered as two stacked lines (main + email);
-  // loading / not-connected keep the original single-line shape. Same
-  // data sources as before — `drive.account_email` is still read straight
-  // from the destination row, no logic change.
-  const fallbackLabel = loading ? 'Comprobando destino…' : 'Sin destino conectado';
+  // Effective destination = the one the worker is actually going to
+  // hit for the next recording. Reflects activeDest when its target is
+  // connected, falls back to "drive" when activeDest='drive' or to
+  // "nas" when only NAS is connected, and to null when nothing is
+  // connected at all (fallback label below).
+  const showingNas = activeDest === 'nas' && hasNas;
+  const showingDrive = activeDest === 'drive' && Boolean(drive);
+  const anyConnected = Boolean(drive) || hasNas;
+  // Dot is green iff the active destination is actually connected;
+  // gray during the destination resolve roundtrip; red when nothing
+  // is reachable.
+  const dotColor = loading
+    ? '#8b949e'
+    : showingNas || showingDrive
+    ? '#3ddc84'
+    : '#f85149';
+  const fallbackLabel = loading
+    ? 'Comprobando destino…'
+    : anyConnected
+    ? 'Sin destino activo'
+    : 'Sin destino conectado';
 
   return (
     <View
@@ -4547,7 +4556,13 @@ function DestinationIndicator({
           marginRight: 8,
         }}
       />
-      {drive && !loading ? (
+      {!loading && showingNas ? (
+        <View style={{ flexShrink: 1 }}>
+          <Text style={{ color: '#c9d1d9', fontSize: 12, fontWeight: '600' }} numberOfLines={1}>
+            🔒 Guardado en tu NAS
+          </Text>
+        </View>
+      ) : !loading && showingDrive && drive ? (
         <View style={{ flexShrink: 1 }}>
           <Text style={{ color: '#c9d1d9', fontSize: 12, fontWeight: '600' }} numberOfLines={1}>
             🔒 Guardado en tu Google Drive
