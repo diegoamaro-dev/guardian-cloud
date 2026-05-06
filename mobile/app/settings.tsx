@@ -18,9 +18,15 @@ import {
   driveTestUpload,
   exchangeDriveCode,
   getConnectedDrive,
+  listDestinations,
   startDriveConnect,
+  type DestinationType,
   type PublicDestination,
 } from '@/api/destinations';
+import {
+  getPreferredDestinationType,
+  setPreferredDestinationType,
+} from '@/destinations/preference';
 // DEV-only queue wipe — surfaced as a button at the bottom of this screen.
 // Does NOT touch auth/Drive/anything else; only Guardian Cloud queue keys.
 import { clearGuardianQueueDev } from '.';
@@ -100,6 +106,20 @@ export default function SettingsScreen() {
   const [lastUploadRef, setLastUploadRef] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [lastSessionId, setLastSessionId] = useState<string | null>(null);
+  /**
+   * Connected NAS destination, if any. Filled alongside `drive` by
+   * `refreshState`. Used solely to decide whether to render the
+   * destination selector (selector is visible iff Drive AND NAS are
+   * both connected).
+   */
+  const [nas, setNas] = useState<PublicDestination | null>(null);
+  /**
+   * Persisted user preference for the upload destination. Loaded from
+   * AsyncStorage on mount and refreshed whenever the user picks an
+   * option in the selector. `null` = no explicit choice → the resolver
+   * in the home screen falls back to "Drive first, NAS second".
+   */
+  const [preferred, setPreferred] = useState<DestinationType | null>(null);
   // Persisted "Inicio rápido" panic-mode preference. Pure UI flag: the
   // home screen renders an "Inicio rápido activado" pill when true.
   // Never auto-records — Play Store policy + project rule.
@@ -125,10 +145,28 @@ export default function SettingsScreen() {
         user: data.session?.user ?? null,
         accessToken: token,
       });
-      const drive = await getConnectedDrive();
-      setScreen({ kind: 'ready', drive });
+      // One round-trip for both: same data already powers
+      // `getConnectedDrive`. Lets us also detect NAS without a second
+      // request, and keeps the existing home-screen contract intact.
+      const { destinations } = await listDestinations();
+      const driveDest = destinations.find(
+        (d) => d.type === 'drive' && d.status === 'connected',
+      ) ?? null;
+      const nasDest = destinations.find(
+        (d) => d.type === 'nas' && d.status === 'connected',
+      ) ?? null;
+      setNas(nasDest);
+      // Load the persisted preference. The selector is rendered only
+      // when both Drive and NAS are connected — for the single-
+      // destination cases the resolver in the home screen picks the
+      // only valid option automatically, so the preference is
+      // informational at most.
+      const pref = await getPreferredDestinationType();
+      setPreferred(pref);
+      setScreen({ kind: 'ready', drive: driveDest });
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : String(err));
+      setNas(null);
       setScreen({ kind: 'ready', drive: null });
     }
   }
@@ -227,6 +265,19 @@ export default function SettingsScreen() {
     });
     return () => sub.remove();
   }, []);
+
+  /**
+   * Persist the user's choice of upload destination. Only callable
+   * while both Drive and NAS are connected (the selector is hidden
+   * otherwise). The home screen reads the new value the next time it
+   * runs `refreshDestination` (mount / focus / OAuth return), so the
+   * effect on the worker is eventual rather than instant — by design,
+   * to avoid in-flight retargeting during an active recording.
+   */
+  async function handleSelectPreferred(type: DestinationType) {
+    setPreferred(type);
+    await setPreferredDestinationType(type);
+  }
 
   async function handleConnectDrive() {
     setErrorMsg(null);
@@ -363,6 +414,71 @@ export default function SettingsScreen() {
             Enviar archivo de prueba
           </Text>
         </Pressable>
+      )}
+
+      {/* Destination selector. Visible ONLY when both Drive and NAS are
+          connected — when only one is connected the resolver in the home
+          screen picks it automatically and the selector would just add
+          noise. The selected value is the persisted preference; an
+          unselected (null) preference defaults to Drive on the home
+          side, matching the "Drive first" fallback.
+
+          Pure UI: writing the preference does NOT touch GC_QUEUE, the
+          worker, recovery, or the backend. The home screen picks up
+          the new value on its next `refreshDestination` tick. */}
+      {screen.kind === 'ready' && screen.drive && nas && (
+        <View
+          style={{
+            marginBottom: 10,
+            padding: 12,
+            borderWidth: 1,
+            borderColor: '#30363d',
+            borderRadius: 6,
+            backgroundColor: '#161b22',
+          }}
+        >
+          <Text style={{ color: '#c9d1d9', fontSize: 13, fontWeight: '700' }}>
+            Destino activo
+          </Text>
+          <Text style={{ color: '#8b949e', fontSize: 11, marginTop: 4 }}>
+            Tienes ambos conectados. Elige a dónde se subirán las
+            grabaciones nuevas.
+          </Text>
+          <View style={{ flexDirection: 'row', marginTop: 10 }}>
+            {(['drive', 'nas'] as const).map((opt) => {
+              const selected =
+                preferred === opt ||
+                (preferred === null && opt === 'drive');
+              return (
+                <Pressable
+                  key={opt}
+                  onPress={() => handleSelectPreferred(opt)}
+                  style={{
+                    flex: 1,
+                    paddingVertical: 10,
+                    paddingHorizontal: 12,
+                    marginRight: opt === 'drive' ? 8 : 0,
+                    borderWidth: 1,
+                    borderColor: selected ? '#1f6feb' : '#30363d',
+                    borderRadius: 6,
+                    backgroundColor: selected ? '#0b2240' : '#0d1117',
+                    alignItems: 'center',
+                  }}
+                >
+                  <Text
+                    style={{
+                      color: selected ? '#58a6ff' : '#c9d1d9',
+                      fontSize: 13,
+                      fontWeight: '600',
+                    }}
+                  >
+                    {opt === 'drive' ? 'Google Drive' : 'NAS'}
+                  </Text>
+                </Pressable>
+              );
+            })}
+          </View>
+        </View>
       )}
 
       {busy && (

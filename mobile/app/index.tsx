@@ -16,6 +16,7 @@ import {
   type DestinationType,
   type PublicDestination,
 } from '@/api/destinations';
+import { getPreferredDestinationType } from '@/destinations/preference';
 import { ApiError } from '@/api/client';
 import { useAuthStore, getFreshAccessToken } from '@/auth/store';
 import { appendHistoryEntry, type SessionMode } from '@/api/history';
@@ -521,6 +522,25 @@ export interface PendingQueueEntry {
   emitted_base64_length: number;
   next_chunk_index: number;
   chunks: QueueChunk[];
+  /**
+   * Destination this session was bound to at the moment recording
+   * started. Snapshot of `activeDestinationType` taken inside
+   * `queueAppendNewSession`'s caller. Once set, it MUST NOT be mutated
+   * — every chunk of this session uploads to this destination, even if
+   * the user changes the preference in Settings while we are still
+   * draining. This is the rule that prevents "Drive-then-NAS" mixed
+   * sessions.
+   *
+   * Optional for backward compatibility: pre-existing queue entries
+   * (written before this field existed) will be missing it. The worker
+   * falls back to the current `activeDestinationType` so legacy
+   * recoveries still drain — the trade-off there is that a legacy
+   * session that crosses a preference change might mix destinations,
+   * but that window is bounded by the legacy entries on disk and
+   * disappears as they finalize. We do NOT migrate to backfill — the
+   * absence of the field is a meaningful "wasn't bound" signal.
+   */
+  destination_type?: DestinationType | undefined;
 }
 
 const CHUNK_TICK_MS = 1500;
@@ -1397,6 +1417,13 @@ interface NextPick {
   sessionId: string;
   chunk: QueueChunk;
   rehydratedSlice: string;
+  /**
+   * Destination this session was bound to when recording started.
+   * Undefined for legacy entries (no `destination_type`) — the worker
+   * then falls back to the current `activeDestinationType`. Carried
+   * here so the worker doesn't have to re-read the queue for routing.
+   */
+  destinationType?: DestinationType | undefined;
 }
 
 async function pickNext(queue: PendingQueueEntry[]): Promise<NextPick | null> {
@@ -1424,6 +1451,7 @@ async function pickNext(queue: PendingQueueEntry[]): Promise<NextPick | null> {
       sessionId: entry.session_id,
       chunk: candidate,
       rehydratedSlice: slice,
+      destinationType: entry.destination_type,
     };
   }
   return null;
@@ -1483,17 +1511,32 @@ async function uploadDrainLoop(): Promise<void> {
       }
 
       const { sessionId, chunk, rehydratedSlice } = pick;
+      // Per-session pinning: if this session was bound to a destination
+      // when recording started, ALL its chunks must use that
+      // destination. Settings changes during a recording only affect
+      // FUTURE sessions; in-flight sessions keep their original target.
+      // Legacy entries (no `destination_type`) fall back to the current
+      // `activeDestinationType` so existing pending uploads still drain.
+      const sessionDestinationType: DestinationType =
+        pick.destinationType ?? activeDestinationType;
       if (DEBUG_QUEUE) {
         console.log('GC_DEBUG drain pending found', {
           sessionId,
           chunk_index: chunk.chunk_index,
           slice_len: rehydratedSlice.length,
+          sessionDestinationType,
+          legacyFallback: pick.destinationType === undefined,
         });
       }
       await queueUpdateChunk(sessionId, chunk.chunk_index, { status: 'uploading' });
+      // Log the EFFECTIVE destination for this chunk (per-session value
+      // when present, global fallback otherwise) so logcat grep matches
+      // the actual outgoing endpoint.
       console.log('GC_QUEUE chunk uploading', {
         sessionId,
         chunk_index: chunk.chunk_index,
+        destinationType: sessionDestinationType,
+        pinned: pick.destinationType !== undefined,
       });
 
       // Outer per-chunk timeout. Wraps the entire upload attempt
@@ -1521,7 +1564,7 @@ async function uploadDrainLoop(): Promise<void> {
             chunk.hash,
             rehydratedSlice,
             30_000,
-            activeDestinationType,
+            sessionDestinationType,
           );
           if (DEBUG_QUEUE) {
             console.log('GC_DEBUG after uploadChunkBytes', {
@@ -2761,6 +2804,22 @@ export default function Index() {
    * only blocks NEW recordings (GRABAR button).
    */
   const [drive, setDrive] = useState<PublicDestination | null | undefined>(null);
+  /**
+   * Mirror of the module-level `activeDestinationType` so the home can
+   * render a passive "Protegiendo en: <destino>" label without taking
+   * any decision before recording. Updated only inside
+   * `refreshDestination`. The worker keeps reading the module-level
+   * variable — this state is purely cosmetic.
+   */
+  const [activeDest, setActiveDest] = useState<DestinationType>('drive');
+  /**
+   * True iff the user currently has a connected NAS destination. Used
+   * solely to gate the "Protegiendo en …" label so it stays empty when
+   * nothing is connected at all (avoids saying "Drive" while the user
+   * is actually unconfigured). Mirrors `refreshDestination`'s `nas` —
+   * no extra network call.
+   */
+  const [hasNas, setHasNas] = useState<boolean>(false);
 
   /**
    * X / N progress counter.
@@ -2890,14 +2949,33 @@ export default function Index() {
       // UI gate: GRABAR button requires a Drive destination (UI selector
       // for NAS comes in a later phase — do not change this yet).
       setDrive(drive ?? undefined);
-      // Worker routing: in dev, NAS wins whenever it is connected so the
-      // NAS upload path can be validated without disconnecting Drive.
-      // In production the safe default applies: Drive first, NAS fallback.
-      if (__DEV__ && nas) {
-        activeDestinationType = 'nas';
+      // Worker routing rules (Settings owns the choice, never `__DEV__`):
+      //   - Only Drive connected         → 'drive'
+      //   - Only NAS connected           → 'nas'
+      //   - Both connected               → user's persisted preference;
+      //                                    if none / stale, Drive wins
+      //   - Neither connected            → safe default 'drive' (the
+      //                                    drain-loop race-guard keeps
+      //                                    chunks pending until a real
+      //                                    destination is configured;
+      //                                    recovery is unaffected)
+      const preferred = await getPreferredDestinationType();
+      const preferredIsValid =
+        (preferred === 'drive' && drive) || (preferred === 'nas' && nas);
+      if (preferredIsValid && preferred) {
+        activeDestinationType = preferred;
       } else {
         activeDestinationType = drive ? 'drive' : nas ? 'nas' : 'drive';
       }
+      // Mirror the resolved value into a React state so the home can
+      // render "Protegiendo en: Drive/NAS" without re-resolving. The
+      // module-level `activeDestinationType` remains the source of truth
+      // for the worker.
+      setActiveDest(activeDestinationType);
+      // Mirror the per-type connection booleans for the home label so
+      // the "Protegiendo en …" line can hide itself when nothing is
+      // connected — same data already used above, no extra fetch.
+      setHasNas(Boolean(nas));
       // Release the drain-loop race guard. Once true, the worker is free
       // to route chunks; before this, it deferred every tick.
       const wasBlocked = !destinationResolved;
@@ -3435,6 +3513,16 @@ export default function Index() {
         }
       }
 
+      // Pin the destination at session-start time. Snapshot of the
+      // module-level resolver result; the worker reads this back for
+      // every chunk of this session, so a Settings change during the
+      // recording does NOT retarget chunks already enrolled. Logged
+      // here so the binding is observable from the very first chunk.
+      const pinnedDestinationType: DestinationType = activeDestinationType;
+      console.log('GC_QUEUE session destination pinned', {
+        sessionId,
+        destinationType: pinnedDestinationType,
+      });
       await queueAppendNewSession({
         session_id: sessionId,
         uri: cacheUri,
@@ -3444,6 +3532,7 @@ export default function Index() {
         emitted_base64_length: 0,
         next_chunk_index: 0,
         chunks: [],
+        destination_type: pinnedDestinationType,
       });
 
       // Capture the mode for stopRecording's dispatch. Stays in a ref
@@ -4240,6 +4329,25 @@ export default function Index() {
           destination → the indicator explains that recording is blocked
           and offers a shortcut to the Settings screen. */}
       <DestinationIndicator drive={drive} loading={driveCheckLoading} />
+
+      {/* Passive "Protegiendo en …" label. Pure read-out of the resolved
+          `activeDest`; the home screen never asks the user to decide
+          before recording — the choice (when both Drive and NAS are
+          connected) lives in Settings. Hidden entirely when no
+          destination is connected, so the user is never told we are
+          "protecting" them somewhere we cannot reach. */}
+      {(drive || hasNas) && (
+        <Text
+          style={{
+            color: '#8b949e',
+            fontSize: 12,
+            marginTop: 6,
+            alignSelf: 'flex-start',
+          }}
+        >
+          {`Protegiendo en: ${activeDest === 'nas' ? 'NAS' : 'Drive'}`}
+        </Text>
+      )}
 
       {/* Audio / Video mode toggle. Cosmetic in step 2 — flipping the
           state has no effect on what gets recorded yet. Locked while a
