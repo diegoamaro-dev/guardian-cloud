@@ -823,21 +823,33 @@ function ResultBlock({
           {integrityStatus === 'full' ? 'Reproducible: Sí' : 'Reproducible: No'}
         </Text>
         {integrityStatus !== 'full' && (
-          // Survival principle: even if a chunk failed sha256 or
-          // download during export, we still wrote the contiguous
-          // valid prefix. Surface that explicitly with a calm banner
-          // and keep the share affordance — never block a partial
-          // recovery the user might still need.
-          <Text
-            style={{
-              color: '#e3b341',
-              fontSize: 12,
-              fontWeight: '600',
-              marginTop: 10,
-            }}
-          >
-            Evidencia parcial recuperada
-          </Text>
+          // Survival principle + honesty: we wrote the contiguous
+          // valid prefix and let the user share it, but we DO NOT
+          // claim it is guaranteed playable. Some MP4 decoders need
+          // the trailing moov atom that a truncated export will not
+          // contain; an audio (.aac / .m4a) prefix usually plays but
+          // we still hedge so the user is not surprised. Yellow /
+          // neutral tone — never red, never gating share.
+          <View style={{ marginTop: 10 }}>
+            <Text
+              style={{
+                color: '#e3b341',
+                fontSize: 12,
+                fontWeight: '600',
+              }}
+            >
+              Evidencia parcial recuperada
+            </Text>
+            <Text
+              style={{
+                color: '#e3b341',
+                fontSize: 11,
+                marginTop: 2,
+              }}
+            >
+              Puede requerir revisión técnica.
+            </Text>
+          </View>
         )}
         {result.filePath && (
           <Pressable
@@ -894,25 +906,27 @@ function ResultBlock({
           Integridad: Parcial ⚠️
         </Text>
 
-        {/* Qualitative advisory: missing/corrupt chunk_index 0 means
-            the contiguous prefix is empty — there is nothing valid
-            from the start of the recording. The export pipeline will
-            have produced no playable bytes; we still allow share for
-            a forensic .bin if filePath exists, but warn explicitly. */}
+        {/* Qualitative advisory. Honesty without alarm: a partial
+            export — and especially one missing chunk_index 0 — may
+            not open in every player (MP4 needs the moov atom; some
+            decoders refuse a truncated stream). We DO NOT block the
+            share button; we just tell the user the file may need
+            technical review. Yellow / neutral styling matches the
+            "Evidencia parcial recuperada" frame so the user does not
+            read this as a hard error. */}
         {firstChunkAffected && (
           <View
             style={{
               marginTop: 10,
               padding: 10,
               borderWidth: 1,
-              borderColor: '#f85149',
+              borderColor: '#d29922',
               borderRadius: 4,
-              backgroundColor: '#3d1518',
+              backgroundColor: '#2d1f06',
             }}
           >
-            <Text style={{ color: '#f85149', fontSize: 12, fontWeight: '600' }}>
-              El primer fragmento está perdido o corrupto. El archivo
-              parcial puede no ser reproducible.
+            <Text style={{ color: '#e3b341', fontSize: 12, fontWeight: '600' }}>
+              Archivo parcial recuperado. Puede requerir revisión técnica.
             </Text>
           </View>
         )}
