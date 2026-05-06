@@ -787,57 +787,14 @@ function ResultBlock({
       ? 'full'
       : 'partial';
 
-  // Video-partial UX. When the exported file is an MP4 with any
-  // integrity gap, the file cannot be played back end-to-end (the
-  // moov atom + mdat continuity both require every chunk_index in
-  // 0..lastIndex). Replace the previous red "no reproducible" warning
-  // and the surrounding result card with a calm yellow card that
-  // confirms partial evidence was saved and hides the share button.
-  // No error tone, no technical detail, no "archivo inválido". Pure
-  // UI early-return — the existing 'complete' / 'partial' / 'failed'
-  // branches below stay byte-identical for all other code paths
-  // (audio of any status, complete video with full integrity, failed
-  // export with no MP4 written).
-  const isMp4File = result.filePath?.endsWith('.mp4') ?? false;
-  if (isMp4File && integrityStatus !== 'full') {
-    return (
-      <View
-        style={{
-          marginTop: 4,
-          padding: 14,
-          borderWidth: 1,
-          borderColor: '#d29922',
-          borderRadius: 6,
-          backgroundColor: '#2d1f06',
-        }}
-      >
-        <Text style={{ color: '#e3b341', fontSize: 15, fontWeight: '700' }}>
-          🟡 Evidencia parcial protegida
-        </Text>
-        <Text
-          style={{
-            color: '#c9d1d9',
-            fontSize: 13,
-            marginTop: 8,
-            lineHeight: 18,
-          }}
-        >
-          Se han guardado fragmentos de la grabación.{'\n'}
-          Faltan partes para generar un vídeo completo.
-        </Text>
-        {realTotal > 0 ? (
-          <Text style={{ color: '#8b949e', fontSize: 12, marginTop: 10 }}>
-            Fragmentos disponibles:{' '}
-            {availableFragmentCount ?? result.validChunks} / {realTotal}
-          </Text>
-        ) : null}
-        <PartialFragmentsBlock
-          phase={fragmentsPhase}
-          onDownload={onDownloadFragments}
-        />
-      </View>
-    );
-  }
+  // Survival principle ("subir evidencia > archivo perfecto"): we no
+  // longer early-return / hide share for partial MP4 exports. The
+  // export pipeline now always produces a contiguous valid prefix
+  // (cut at the first gap), and that prefix — even if not playable
+  // by every decoder — is forensically useful. The user MUST be able
+  // to share it. The standard 'complete' / 'partial' branches below
+  // own the rendering for every status; partial exports show a clear
+  // "Evidencia parcial recuperada" banner alongside the share button.
 
   if (result.status === 'complete') {
     return (
@@ -865,52 +822,43 @@ function ResultBlock({
         <Text style={{ color: '#c9d1d9', fontSize: 12, marginTop: 2 }}>
           {integrityStatus === 'full' ? 'Reproducible: Sí' : 'Reproducible: No'}
         </Text>
-        {integrityStatus === 'full' ? (
-          result.filePath && (
-            <Pressable
-              onPress={() => handleShare(result.filePath as string)}
-              style={{
-                marginTop: 10,
-                paddingVertical: 10,
-                paddingHorizontal: 14,
-                borderWidth: 1,
-                borderColor: '#30363d',
-                borderRadius: 6,
-                backgroundColor: '#161b22',
-                alignItems: 'center',
-              }}
-            >
-              <Text
-                style={{ color: '#c9d1d9', fontSize: 13, fontWeight: '500' }}
-              >
-                Compartir archivo
-              </Text>
-            </Pressable>
-          )
-        ) : (
-          // Safety guard: a session whose backend status is `complete`
-          // can still surface integrity gaps if a chunk was lost between
-          // upload and Drive (download/hash failure during export).
-          // Reuse the same red warning block as the partial-MP4 path so
-          // the user never gets a "share" button on a file that no
-          // player can open.
-          <View
+        {integrityStatus !== 'full' && (
+          // Survival principle: even if a chunk failed sha256 or
+          // download during export, we still wrote the contiguous
+          // valid prefix. Surface that explicitly with a calm banner
+          // and keep the share affordance — never block a partial
+          // recovery the user might still need.
+          <Text
+            style={{
+              color: '#e3b341',
+              fontSize: 12,
+              fontWeight: '600',
+              marginTop: 10,
+            }}
+          >
+            Evidencia parcial recuperada
+          </Text>
+        )}
+        {result.filePath && (
+          <Pressable
+            onPress={() => handleShare(result.filePath as string)}
             style={{
               marginTop: 10,
-              padding: 10,
+              paddingVertical: 10,
+              paddingHorizontal: 14,
               borderWidth: 1,
-              borderColor: '#f85149',
-              borderRadius: 4,
-              backgroundColor: '#3d1518',
+              borderColor: '#30363d',
+              borderRadius: 6,
+              backgroundColor: '#161b22',
+              alignItems: 'center',
             }}
           >
             <Text
-              style={{ color: '#f85149', fontSize: 12, fontWeight: '600' }}
+              style={{ color: '#c9d1d9', fontSize: 13, fontWeight: '500' }}
             >
-              Exportación parcial no reproducible. El vídeo tiene huecos y
-              ningún reproductor podrá abrirlo. No se ofrece compartir.
+              Compartir archivo
             </Text>
-          </View>
+          </Pressable>
         )}
       </View>
     );
@@ -923,16 +871,6 @@ function ResultBlock({
     const firstChunkAffected =
       result.missingIndexes.includes(0) || result.corruptIndexes.includes(0);
     const isBinFile = result.filePath?.endsWith('.bin') ?? false;
-    // Video MP4 with any gap is unplayable — the moov atom and the
-    // continuous mdat byte stream both require every chunk_index in
-    // 0..lastIndex. Block the share button in this case so the user
-    // does not hand over a file no media player can open. The audio
-    // (.aac / .m4a) and forensic (.bin) branches keep their existing
-    // share behaviour.
-    const isMp4File = result.filePath?.endsWith('.mp4') ?? false;
-    const hasGaps =
-      result.missingIndexes.length > 0 || result.corruptIndexes.length > 0;
-    const isPartialMp4 = isMp4File && hasGaps;
 
     return (
       <View
@@ -945,22 +883,22 @@ function ResultBlock({
           backgroundColor: '#2d1f06',
         }}
       >
-        <Text style={{ color: '#e3b341', fontSize: 13, fontWeight: '600' }}>
-          Evidencia parcial
+        <Text style={{ color: '#e3b341', fontSize: 13, fontWeight: '700' }}>
+          Evidencia parcial recuperada
         </Text>
         <Text style={{ color: '#c9d1d9', fontSize: 12, marginTop: 6 }}>
-          Algunos fragmentos no pudieron recuperarse.
+          Se ha guardado el tramo continuo válido. Faltan algunos
+          fragmentos posteriores; la parte recuperada es íntegra.
         </Text>
         <Text style={{ color: '#c9d1d9', fontSize: 12, marginTop: 6 }}>
           Integridad: Parcial ⚠️
         </Text>
-        <Text style={{ color: '#c9d1d9', fontSize: 12, marginTop: 2 }}>
-          Reproducible: No
-        </Text>
 
-        {/* Qualitative advisory: missing/corrupt chunk_index 0 makes
-            the AAC stream unplayable in most decoders. Kept because it
-            answers "can I use it?" — not a raw chunk count. */}
+        {/* Qualitative advisory: missing/corrupt chunk_index 0 means
+            the contiguous prefix is empty — there is nothing valid
+            from the start of the recording. The export pipeline will
+            have produced no playable bytes; we still allow share for
+            a forensic .bin if filePath exists, but warn explicitly. */}
         {firstChunkAffected && (
           <View
             style={{
@@ -979,46 +917,31 @@ function ResultBlock({
           </View>
         )}
 
-        {isPartialMp4 ? (
-          <View
+        {/* Survival principle: never block share if there is a file.
+            The pipeline now writes only the contiguous valid prefix —
+            sharing it gives the user the recoverable evidence even
+            when format-level reproducibility is uncertain (MP4 without
+            moov atom, .bin forensic dump, etc.). */}
+        {result.filePath && (
+          <Pressable
+            onPress={() => handleShare(result.filePath as string)}
             style={{
               marginTop: 10,
-              padding: 10,
+              paddingVertical: 10,
+              paddingHorizontal: 14,
               borderWidth: 1,
-              borderColor: '#f85149',
-              borderRadius: 4,
-              backgroundColor: '#3d1518',
+              borderColor: '#30363d',
+              borderRadius: 6,
+              backgroundColor: '#161b22',
+              alignItems: 'center',
             }}
           >
             <Text
-              style={{ color: '#f85149', fontSize: 12, fontWeight: '600' }}
+              style={{ color: '#c9d1d9', fontSize: 13, fontWeight: '500' }}
             >
-              Exportación parcial no reproducible. El vídeo tiene huecos y
-              ningún reproductor podrá abrirlo. No se ofrece compartir.
+              Compartir archivo
             </Text>
-          </View>
-        ) : (
-          result.filePath && (
-            <Pressable
-              onPress={() => handleShare(result.filePath as string)}
-              style={{
-                marginTop: 10,
-                paddingVertical: 10,
-                paddingHorizontal: 14,
-                borderWidth: 1,
-                borderColor: '#30363d',
-                borderRadius: 6,
-                backgroundColor: '#161b22',
-                alignItems: 'center',
-              }}
-            >
-              <Text
-                style={{ color: '#c9d1d9', fontSize: 13, fontWeight: '500' }}
-              >
-                Compartir archivo
-              </Text>
-            </Pressable>
-          )
+          </Pressable>
         )}
 
         {/* Qualitative advisory: extension sniff fell back to .bin —

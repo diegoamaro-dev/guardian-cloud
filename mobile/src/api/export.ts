@@ -332,57 +332,86 @@ export async function exportSession(
   const corruptIndexes: number[] = [];
   const accumulated: Uint8Array[] = [];
   let validChunks = 0;
+  // The chunk_index where we stopped concatenating (first gap, or
+  // -1 if we made it all the way through). Surfaced in logs so an
+  // operator can see exactly where the cut happened.
+  let stoppedAt = -1;
 
-  for (let i = 0; i < uploaded.length; i++) {
-    const meta = uploaded[i]!;
-    onProgress?.({
-      total: totalChunks,
-      done: i,
-      currentIndex: meta.chunk_index,
-    });
+  // Survival rule: the recoverable evidence is the LONGEST CONTIGUOUS
+  // PREFIX of valid chunks starting at chunk_index 0. A "hole" is any
+  // index that is either:
+  //   (a) missing from the backend listing (not yet 'uploaded'), or
+  //   (b) downloaded but failed sha256 verification, or
+  //   (c) failed to download (network / 4xx / 5xx).
+  // At the first hole we STOP the loop. We do NOT continue downloading
+  // chunks past the gap — those bytes would only contribute to a sparse
+  // file that no decoder can play, contradicting "subir evidencia >
+  // archivo perfecto". The skipped indexes remain visible in the result
+  // (`missingIndexes` was computed up-front; corrupt-at-cut goes into
+  // `corruptIndexes` so the integrity report stays honest).
+  const byIndex = new Map(uploaded.map((c) => [c.chunk_index, c]));
+  for (let idx = 0; idx < totalChunks; idx++) {
+    const meta = byIndex.get(idx);
+
+    // (a) Missing from the listing — stop. The exact set of missing
+    // indexes was already pre-populated in `missingIndexes` above;
+    // this is just the boundary observation.
+    if (!meta) {
+      stoppedAt = idx;
+      console.log('EXPORT STOPPED AT GAP', {
+        sessionId,
+        atIndex: idx,
+        reason: 'missing',
+      });
+      break;
+    }
+
+    onProgress?.({ total: totalChunks, done: idx, currentIndex: idx });
 
     try {
-      const { bytes, headerHash } = await downloadChunk(
-        sessionId,
-        meta.chunk_index,
-      );
+      const { bytes, headerHash } = await downloadChunk(sessionId, idx);
 
       // DEBUG-only corruption — see DEBUG_CORRUPT_EXPORT_CHUNK_INDEX.
-      // Flips byte 0 so verifyHash below trips and the chunk lands in
-      // corruptIndexes via the existing partial-export path. No side
-      // effects outside this loop iteration; a chunk we did NOT corrupt
-      // here flows through unchanged. Disabled when the constant is < 0.
+      // Flips byte 0 so verifyHash below trips and the chunk is treated
+      // as the cut point. Disabled when the constant is < 0.
       if (
         DEBUG_CORRUPT_EXPORT_CHUNK_INDEX >= 0 &&
-        meta.chunk_index === DEBUG_CORRUPT_EXPORT_CHUNK_INDEX &&
+        idx === DEBUG_CORRUPT_EXPORT_CHUNK_INDEX &&
         bytes.length > 0
       ) {
         bytes[0] = (bytes[0]! ^ 0xff) & 0xff;
         console.log('GC_EXPORT_DEBUG_CORRUPTED_CHUNK', {
           sessionId,
-          chunkIndex: meta.chunk_index,
+          chunkIndex: idx,
         });
       }
 
       const ok = await verifyHash(bytes, meta.hash);
 
+      // (b) Hash mismatch — record this index as corrupt and stop.
       if (!ok) {
         console.log('EXPORT CHUNK CORRUPT', {
           sessionId,
-          chunkIndex: meta.chunk_index,
+          chunkIndex: idx,
           expected: meta.hash,
           headerHash,
           reason: 'hash_mismatch',
         });
         console.log('GC_EXPORT_HASH_MISMATCH', {
           sessionId,
-          chunkIndex: meta.chunk_index,
+          chunkIndex: idx,
           expected: meta.hash,
           headerHash,
           size: bytes.length,
         });
-        corruptIndexes.push(meta.chunk_index);
-        continue;
+        corruptIndexes.push(idx);
+        stoppedAt = idx;
+        console.log('EXPORT STOPPED AT GAP', {
+          sessionId,
+          atIndex: idx,
+          reason: 'hash_mismatch',
+        });
+        break;
       }
 
       accumulated.push(bytes);
@@ -390,22 +419,38 @@ export async function exportSession(
 
       console.log('EXPORT CHUNK DOWNLOADED', {
         sessionId,
-        chunkIndex: meta.chunk_index,
+        chunkIndex: idx,
         size: bytes.length,
       });
     } catch (err) {
+      // (c) Download failure — record and stop.
       const msg = err instanceof Error ? err.message : String(err);
       console.log('EXPORT CHUNK CORRUPT', {
         sessionId,
-        chunkIndex: meta.chunk_index,
+        chunkIndex: idx,
         reason: 'download_failed',
         err: msg,
       });
-      corruptIndexes.push(meta.chunk_index);
+      corruptIndexes.push(idx);
+      stoppedAt = idx;
+      console.log('EXPORT STOPPED AT GAP', {
+        sessionId,
+        atIndex: idx,
+        reason: 'download_failed',
+      });
+      break;
     }
   }
 
-  onProgress?.({ total: totalChunks, done: uploaded.length, currentIndex: -1 });
+  onProgress?.({ total: totalChunks, done: validChunks, currentIndex: -1 });
+
+  console.log('EXPORT PREFIX SUMMARY', {
+    sessionId,
+    totalChunks,
+    validChunks,
+    stoppedAt,
+    contiguous: validChunks === totalChunks,
+  });
 
   if (validChunks === 0) {
     console.log('EXPORT ERROR', {
