@@ -36,6 +36,7 @@ const NETWORK_SECURITY_CONFIG_XML = `<?xml version="1.0" encoding="utf-8"?>
     </base-config>
     <domain-config cleartextTrafficPermitted="true">
         <domain includeSubdomains="false">192.168.178.79</domain>
+        <domain includeSubdomains="false">192.168.178.21</domain>
         <domain includeSubdomains="false">localhost</domain>
         <domain includeSubdomains="false">10.0.2.2</domain>
     </domain-config>

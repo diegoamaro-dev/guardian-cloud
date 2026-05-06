@@ -39,6 +39,13 @@ yarn-error.log*
 android/app/build/
 android/.gradle/
 android/local.properties
+# Pre-bundled JS for release builds. Regenerated on every release build by
+# the @react-native gradle plugin (`bundleReleaseJsAndAssets` task), so it
+# does NOT belong in source control. Committing it once ships a frozen JS
+# snapshot that the device will keep loading even after the source moves
+# on — observed when commit 2b3b8ab baked a Hello-World template bundle
+# that overrode the expo-router entry on every device boot.
+mobile/android/app/src/main/assets/index.android.bundle
 
 # iOS
 ios/Pods/
