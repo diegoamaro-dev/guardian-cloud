@@ -1174,6 +1174,14 @@ const PENDING_SESSIONS_RETRY_INTERVAL_MS = 5_000;
 interface PendingSessionRegistration {
   session_id: string;
   mode: SessionMode;
+  /**
+   * Per-session upload destination, captured at GRABAR time. Optional
+   * because entries persisted by builds before the destination-truth
+   * fix carry no value — those replay through the loop with the
+   * legacy `'drive'` default to preserve idempotency. New entries
+   * always carry the actual pinned destination.
+   */
+  destination_type?: DestinationType;
 }
 
 async function loadPendingRegistrations(): Promise<PendingSessionRegistration[]> {
@@ -1204,10 +1212,15 @@ async function savePendingRegistrations(
 async function addPendingRegistration(
   session_id: string,
   mode: SessionMode,
+  destination_type?: DestinationType,
 ): Promise<void> {
   const list = await loadPendingRegistrations();
   if (!list.find(p => p.session_id === session_id)) {
-    list.push({ session_id, mode });
+    list.push({
+      session_id,
+      mode,
+      ...(destination_type ? { destination_type } : {}),
+    });
     await savePendingRegistrations(list);
   }
 }
@@ -1242,10 +1255,25 @@ async function runPendingRegistrationLoop(): Promise<void> {
       if (token) {
         for (const item of list) {
           try {
-            await createSessionRequest(token, item.mode, item.session_id);
+            // `destination_type` is optional on legacy entries persisted
+            // before the destination-truth fix — those fall back to the
+            // historical `'drive'` default so the backend insert still
+            // succeeds (the schema accepts both). New entries always
+            // carry the actual pinned destination from GRABAR time, so
+            // the backend record matches where chunks physically went.
+            const destinationType: DestinationType =
+              item.destination_type ?? 'drive';
+            await createSessionRequest(
+              token,
+              item.mode,
+              item.session_id,
+              destinationType,
+            );
             console.log('GC_LOCAL_FIRST session registered', {
               session_id: item.session_id,
               mode: item.mode,
+              destination_type: destinationType,
+              legacyFallback: item.destination_type === undefined,
             });
             await removePendingRegistration(item.session_id);
           } catch (err) {
@@ -1271,8 +1299,9 @@ async function runPendingRegistrationLoop(): Promise<void> {
 async function schedulePendingSessionRegistration(
   session_id: string,
   mode: SessionMode,
+  destination_type?: DestinationType,
 ): Promise<void> {
-  await addPendingRegistration(session_id, mode);
+  await addPendingRegistration(session_id, mode, destination_type);
   // Fire-and-forget. The loop self-terminates when the list is empty.
   runPendingRegistrationLoop().catch(err => {
     console.log('GC_LOCAL_FIRST register loop rejected', err);
@@ -2638,11 +2667,31 @@ async function createSessionRequest(
    * be re-registered later under the same UUID it was emitted with.
    */
   clientId?: string,
+  /**
+   * Per-session upload destination, captured ONCE at GRABAR time from
+   * the module-level `activeDestinationType` resolver and passed in by
+   * the caller. The backend persists this value on the `sessions` row
+   * so downstream consumers (export gate, audit, future per-destination
+   * metrics) read the truth rather than a hardcoded 'drive'.
+   *
+   * Default 'drive' covers two cases:
+   *   1. Pre-pinning legacy entries replaying through the offline
+   *      retry loop (their persisted `PendingSessionRegistration`
+   *      shape may not carry destination_type yet).
+   *   2. Any future call site that has no destination context.
+   *
+   * The default is intentionally NOT taken from `activeDestinationType`
+   * here — that read must happen at the GRABAR call site so the value
+   * is stable across the createSession + queueAppendNewSession pair.
+   * Reading it here would risk a Settings-toggle race between the two
+   * calls and re-introduce the trace divergence this fix removes.
+   */
+  destinationType: DestinationType = 'drive',
 ): Promise<string> {
   const sessionBody = JSON.stringify({
     user_id: 'test_user',
     mode,
-    destination_type: 'drive',
+    destination_type: destinationType,
     ...(clientId ? { id: clientId } : {}),
   });
   const controller = new AbortController();
@@ -3374,17 +3423,34 @@ export default function Index() {
       await new Promise(r => setTimeout(r, 50));
       const localSessionId = Crypto.randomUUID();
       let sessionId: string = localSessionId;
+      // Single-source capture of the pinned destination for THIS session.
+      // Used by:
+      //   1. POST /sessions (so the backend `sessions.destination_type`
+      //      column reflects where chunks actually land)
+      //   2. queueAppendNewSession (so the worker pins per-session
+      //      routing — unchanged behaviour, same value)
+      //   3. schedulePendingSessionRegistration on the offline-deferred
+      //      branch (so the retry loop replays the SAME destination
+      //      we'd have sent on the synchronous path)
+      // The const is hoisted to startRecording's scope so the existing
+      // `GC_QUEUE session destination pinned` log site below can keep
+      // reading the same name without an extra capture — guaranteeing
+      // backend record and queue entry NEVER disagree even if a
+      // Settings toggle races between the two writes.
+      const pinnedDestinationType: DestinationType = activeDestinationType;
       try {
         sessionId = await createSessionRequest(
           token,
           recordingMode,
           localSessionId,
+          pinnedDestinationType,
         );
       } catch (err) {
         if (isRetryableSessionCreateError(err)) {
           await schedulePendingSessionRegistration(
             localSessionId,
             recordingMode,
+            pinnedDestinationType,
           );
           console.log('GC_LOCAL_FIRST session deferred', {
             session_id: localSessionId,
@@ -3513,12 +3579,12 @@ export default function Index() {
         }
       }
 
-      // Pin the destination at session-start time. Snapshot of the
-      // module-level resolver result; the worker reads this back for
-      // every chunk of this session, so a Settings change during the
-      // recording does NOT retarget chunks already enrolled. Logged
-      // here so the binding is observable from the very first chunk.
-      const pinnedDestinationType: DestinationType = activeDestinationType;
+      // Pinning log — `pinnedDestinationType` was captured ONCE earlier
+      // in this function (just before createSessionRequest) so the
+      // backend `sessions.destination_type` and the queue entry's
+      // `destination_type` cannot diverge under a Settings race. The
+      // log stays here so the binding is observable from the very
+      // first chunk emission, matching the existing logcat contract.
       console.log('GC_QUEUE session destination pinned', {
         sessionId,
         destinationType: pinnedDestinationType,

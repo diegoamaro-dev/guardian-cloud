@@ -37,6 +37,7 @@ import * as Crypto from 'expo-crypto';
 import { env } from '@/config/env';
 import { getFreshAccessToken } from '@/auth/store';
 import { apiFetch, ApiError } from './client';
+import { type DestinationType } from './destinations';
 import { type SessionMode } from './history';
 
 /**
@@ -141,6 +142,50 @@ export async function listSessionChunks(
     { method: 'GET', ...(signal ? { signal } : {}) },
   );
   return chunks;
+}
+
+/**
+ * Subset of GET /sessions/:id we actually consume on the client today.
+ *
+ * Backend returns the full session row (status, mode, created_at,
+ * completed_at, chunk_count, destination_type). We only declare the
+ * fields the export screen reads — `destination_type` is the one that
+ * matters here, because the per-chunk download endpoint is hardcoded
+ * to Drive and a NAS session would otherwise hit "Drive file not
+ * found" for every chunk and fold to `no_valid_chunks`.
+ *
+ * `destination_type` may legitimately be `null` for legacy sessions
+ * that pre-date the per-session pinning column. The export screen
+ * treats `null` as "unknown / try the existing Drive flow", same as
+ * the pre-pinning behaviour.
+ */
+export interface SessionDetail {
+  session_id: string;
+  destination_type: DestinationType | null;
+  mode?: SessionMode;
+  status?: string;
+  chunk_count?: number;
+}
+
+/**
+ * GET /sessions/:id — session metadata, including `destination_type`.
+ *
+ * Read-only side-channel for the export screen so it can decide WHICH
+ * download path is viable BEFORE iterating chunks. Does NOT touch the
+ * upload pipeline, the queue, or the chunk download endpoint.
+ *
+ * Throws ApiError on network / non-2xx — callers should fold the
+ * failure to "unknown destination" so a transient network blip does
+ * not gate the existing Drive export path.
+ */
+export async function getSessionDetail(
+  sessionId: string,
+  signal?: AbortSignal,
+): Promise<SessionDetail> {
+  return apiFetch<SessionDetail>(
+    `/sessions/${encodeURIComponent(sessionId)}`,
+    { method: 'GET', ...(signal ? { signal } : {}) },
+  );
 }
 
 /**
