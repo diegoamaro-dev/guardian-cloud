@@ -1922,11 +1922,33 @@ export async function tryFinalizeReadySessions(): Promise<boolean> {
       anyFinalized = true;
       console.log('GC_QUEUE session completed', { sessionId: entry.session_id });
     } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      // Defensive recognition of "already completed server-side": a
+      // previous attempt's response may have been lost (network blip,
+      // app kill between 200 OK and queueMarkSessionCompleted) so the
+      // backend now answers 409 SESSION_ALREADY_COMPLETED on retry.
+      // Same final state as a fresh 200 — mark + reap immediately
+      // rather than burning 5 retries before the give-up branch
+      // eventually reaps anyway. No invariant change: the entry still
+      // gets cleaned up; we just skip 5 round-trips of noise so beta
+      // logs stay readable under bad-network conditions.
+      if (
+        msg.includes('SESSION_ALREADY_COMPLETED') ||
+        msg.includes('HTTP 409')
+      ) {
+        console.log('GC_QUEUE session already completed (server) — reaping', {
+          sessionId: entry.session_id,
+        });
+        await queueMarkSessionCompleted(entry.session_id);
+        await reapEntry(entry.session_id, entry.uri);
+        anyFinalized = true;
+        continue;
+      }
       const attempts = await queueBumpCompleteAttempts(entry.session_id);
       console.log('GC_QUEUE session complete failed', {
         sessionId: entry.session_id,
         attempts,
-        err: err instanceof Error ? err.message : String(err),
+        err: msg,
       });
     }
   }
