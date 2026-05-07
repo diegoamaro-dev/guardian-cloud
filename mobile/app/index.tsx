@@ -936,20 +936,37 @@ export async function normalizeQueueOnRecovery(): Promise<NormalizationReport> {
       }
 
       if (entryCorrupt) {
-        // Mark every chunk failed with CORRUPT_HASH_DIVERGENCE. The
-        // worker's all-settled finaliser will then complete the session
-        // (with failed chunks) via the existing path. We do NOT delete
-        // the entry — chunks already uploaded remain server-side.
-        const failedChunks: QueueChunk[] = [];
+        // Mark divergent UNuploaded chunks failed with
+        // CORRUPT_HASH_DIVERGENCE so the worker's gate makes the
+        // missing-upload signal explicit. We do NOT delete the entry
+        // — chunks already uploaded remain server-side.
+        //
+        // Critical preservation rule: any chunk whose pre-normalize
+        // status was 'uploaded' AND carries a non-null
+        // remote_reference is kept verbatim. The backend has those
+        // bytes; downgrading them to 'failed' would force a re-upload
+        // attempt (worker can't anyway because failed is terminal) and
+        // — more importantly — would block the completion gate
+        // forever for evidence we could otherwise still export. The
+        // hash-divergence signal still gets surfaced via the
+        // sessions_marked_corrupt counter and the failed siblings.
+        const finalChunks: QueueChunk[] = [];
+        let failedAddedThisEntry = 0;
         for (const group of groups.values()) {
-          // Within a corrupt entry, still collapse exact-hash duplicates
-          // so we don't double-count failed chunks. Keep the canonical
-          // (first) hash per group; mark it failed.
+          const uploadedKept = group.find(
+            c => c.status === 'uploaded' && !!c.remote_reference,
+          );
+          if (uploadedKept) {
+            finalChunks.push(uploadedKept);
+            continue;
+          }
+          // No surviving upload for this chunk_index — mark divergent
+          // siblings failed so the gate sees them as missing.
           const seenHashes = new Set<string>();
           for (const c of group) {
             if (seenHashes.has(c.hash)) continue;
             seenHashes.add(c.hash);
-            failedChunks.push({
+            finalChunks.push({
               ...c,
               status: 'failed',
               base64Slice: undefined,
@@ -961,15 +978,15 @@ export async function normalizeQueueOnRecovery(): Promise<NormalizationReport> {
                   `in persisted queue; entire session marked corrupt`,
               },
             });
+            failedAddedThisEntry += 1;
           }
         }
-        failedChunks.sort((a, b) => a.chunk_index - b.chunk_index);
-        const droppedNow =
-          entry.chunks.length - failedChunks.length;
+        finalChunks.sort((a, b) => a.chunk_index - b.chunk_index);
+        const droppedNow = entry.chunks.length - finalChunks.length;
         if (droppedNow > 0) report.exact_duplicates_dropped += droppedNow;
-        entry.chunks = failedChunks;
+        entry.chunks = finalChunks;
         report.sessions_marked_corrupt++;
-        report.chunks_marked_failed += failedChunks.length;
+        report.chunks_marked_failed += failedAddedThisEntry;
         continue;
       }
 
@@ -1843,6 +1860,37 @@ export async function tryFinalizeReadySessions(): Promise<boolean> {
     }
 
     if (missingUploadedIndexes.length > 0) {
+      // Observability-only diagnostic — does NOT change behaviour.
+      // Detect the "stuck forever" shape: the missing indexes are NOT
+      // pending/uploading (worker cannot make progress on them) AND at
+      // least one chunk did upload. This is qualitatively different
+      // from "still uploading", and the operator needs to see it
+      // explicitly so beta logs distinguish "blocked by permanent
+      // failure" from "in flight".
+      //
+      // Throttled to the same shouldLog cadence as the gate log so we
+      // never flood logcat. The session stays in the queue (existing
+      // behaviour preserved); a future iteration may decide whether to
+      // give-up-and-reap based on these signals from the field.
+      if (shouldLog) {
+        const missingSet = new Set(missingUploadedIndexes);
+        const allFailedOrAbsent = missingUploadedIndexes.every(idx => {
+          const c = entry.chunks.find(x => x.chunk_index === idx);
+          // Absent = chunk_index expected but no entry at all.
+          // Failed  = terminal, worker won't retry.
+          // Both are "permanently stuck" from the worker's POV.
+          return !c || c.status === 'failed';
+        });
+        if (allFailedOrAbsent && uploadedIndexes.size > 0) {
+          console.log('GC_QUEUE_STUCK_PERMANENT_FAILURE', {
+            sessionId: entry.session_id,
+            expectedChunks,
+            uploadedCount: uploadedIndexes.size,
+            missingCount: missingSet.size,
+            missingIndexes: missingUploadedIndexes,
+          });
+        }
+      }
       // Do NOT call completeSession. Keeping the session row as `active`
       // on the backend is the correct outcome — anything else would
       // mark a session "complete" with permanent gaps.
@@ -4082,6 +4130,21 @@ export default function Index() {
         });
       }
       if (nextState === 'active') {
+        // Recovery-first: if the cold-boot destinations check failed
+        // (offline at app open) `destinationResolved` stays false and
+        // `uploadDrainLoop` short-circuits at its race-guard. Without
+        // a retry trigger, the only escapes are a full app restart or
+        // a Settings toggle (which fires the preference subscription).
+        // Foreground entry is the natural moment to re-attempt — the
+        // user is back on the device and the network is likely back
+        // too. `refreshDestination` is idempotent: a healthy boot
+        // makes this a cheap no-op (it just re-confirms the same
+        // value that's already resolved). When the retry succeeds it
+        // re-kicks the drain itself, so we still call drain below to
+        // cover the common already-resolved case in one branch.
+        if (!destinationResolved) {
+          refreshDestination();
+        }
         // Foreground kick: drain anything that piled up while we were
         // paused. uploadDrainLoop is single-flight, so a redundant call
         // while already draining is a harmless no-op.

@@ -238,9 +238,22 @@ async function ensureNotificationPermission(): Promise<boolean> {
 export async function startBackgroundProtection(
   cb: BackgroundProtectionCallbacks,
 ): Promise<boolean> {
-  if (isRunning) {
+  // Trust BOTH our local flag AND the library's view. If the OS
+  // killed the foreground service externally (force-stop, OEM
+  // aggressive killer, low-memory) our flag can stay `true` while
+  // `BackgroundActions.isRunning()` reads `false`. Without this
+  // cross-check, a future caller short-circuits at "already_running"
+  // and the next recording / pending-upload window has no background
+  // protection at all.
+  if (isRunning && BackgroundActions.isRunning()) {
     console.log('GC_BACKGROUND_UPLOAD_START', { skipped: 'already_running' });
     return true;
+  }
+  if (isRunning) {
+    // Drift detected — reset and fall through to a fresh start so
+    // background protection actually exists for the next tick.
+    console.log('GC_BACKGROUND_UPLOAD_START', { reset: 'flag_drift_detected' });
+    isRunning = false;
   }
   const notifGranted = await ensureNotificationPermission();
   console.log('GC_BACKGROUND_UPLOAD_START', {
