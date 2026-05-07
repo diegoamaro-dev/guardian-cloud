@@ -74,6 +74,12 @@ const OAUTH_REDIRECT_PATH = 'oauth/drive';
 // touches no auth, no Drive flow, no queue.
 const CREATOR_COFFEE_URL = 'https://app.guardiancloud.app/cafe.html';
 
+// Temporary beta-feedback survey URL shown right above the creator
+// coffee button. Same opener (`Linking.openURL`), same isolation: no
+// analytics, no webview, no backend, no queue. Removed when the beta
+// closes.
+const BETA_FEEDBACK_URL = 'https://app.guardiancloud.app/encuesta.html';
+
 type Screen =
   | { kind: 'loading' }
   | { kind: 'signed-out' }
@@ -615,6 +621,39 @@ export default function SettingsScreen() {
             }}
           />
         </View>
+      </Pressable>
+
+      {/* Temporary beta-feedback affordance. Discreet dark card so it
+          reads as informational rather than promotional, distinct from
+          the warm "café al creador" button right below. Opens an
+          external survey via the OS browser — no webview, no auth,
+          no analytics, no queue interaction. Removed when beta ends. */}
+      <Pressable
+        onPress={() => {
+          Linking.openURL(BETA_FEEDBACK_URL).catch((err) => {
+            // Best-effort external open. Same pattern as the coffee
+            // button: a rejection (no browser, malformed URL on custom
+            // ROM, etc.) is logged but never throws — the user can
+            // simply tap again.
+            console.log('BETA FEEDBACK openURL failed', err);
+          });
+        }}
+        style={{
+          marginTop: 24,
+          backgroundColor: '#161b22',
+          borderWidth: 1,
+          borderColor: '#30363d',
+          borderRadius: 6,
+          padding: 14,
+          alignItems: 'center',
+        }}
+      >
+        <Text style={{ color: '#58a6ff', fontSize: 13, fontWeight: '600' }}>
+          Enviar opinión beta
+        </Text>
+        <Text style={{ color: '#8b949e', fontSize: 11, marginTop: 4 }}>
+          Ayúdanos a mejorar Guardian Cloud
+        </Text>
       </Pressable>
 
       <Pressable
