@@ -3119,6 +3119,38 @@ export default function Index() {
       // via the Settings screen. Recovery is independent of this.
       console.log('DEST CHECK ERROR:', error);
       setDrive(null);
+      // Survival-software diagnostic (observability ONLY — does not
+      // change pinning, fallback, or worker behaviour). Surfaces a
+      // narrow but high-consequence beta scenario:
+      //   - User has a persisted destination preference (e.g. NAS-only)
+      //   - Cold-boot is offline so `refreshDestination` fails
+      //   - `destinationResolved` stays false; module-level
+      //     `activeDestinationType` stays at its hardcoded default 'drive'
+      //   - User starts a recording before any successful refresh — the
+      //     pinning capture writes `entry.destination_type = 'drive'`
+      //   - When the network returns the worker uploads to Drive, which
+      //     for NAS-only users surfaces as DRIVE_NOT_CONNECTED 409 →
+      //     permanent failure → the session gets stuck (R3).
+      // Logging here lets the operator measure how often this divergence
+      // happens in beta logs before any behaviour change. Wrapped in
+      // try/catch so a preference read failure (rare, AsyncStorage error)
+      // never escapes the destination check path.
+      if (!destinationResolved) {
+        try {
+          const preferred = await getPreferredDestinationType();
+          if (preferred && preferred !== activeDestinationType) {
+            console.log('GC_DEST_OFFLINE_FALLBACK_DIVERGENCE', {
+              persisted_preference: preferred,
+              module_active: activeDestinationType,
+              warning:
+                'recordings started now would pin to module_active, ' +
+                'not persisted_preference',
+            });
+          }
+        } catch {
+          // Preference read failure has no diagnostic value — ignore.
+        }
+      }
     }
   }
 
