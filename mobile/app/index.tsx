@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Alert, AppState, View, Text, Pressable } from 'react-native';
+import { Alert, AppState, Modal, View, Text, Pressable } from 'react-native';
 import { Audio } from 'expo-av';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import * as FileSystem from 'expo-file-system/legacy';
@@ -86,6 +86,21 @@ const LAST_SESSION_ID_KEY = 'export.last_session_id';
  * a shared module for one constant).
  */
 const QUICK_START_KEY = 'guardian.quick_start';
+/**
+ * One-shot beta welcome modal flag. Set to '1' the first time the user
+ * dismisses the welcome modal; absent (or any other value) means the
+ * modal hasn't been shown yet on this device.
+ *
+ * Pure UI state, scoped strictly to a Home overlay:
+ *   - never read by the upload pipeline / queue / worker / recovery
+ *   - never sent to the backend
+ *   - reset only by a full app data wipe / reinstall
+ *   - works fully offline (AsyncStorage = local SQLite on Android)
+ *
+ * Same naming convention as the other UI flags in this file
+ * (`guardian.preferred_destination`, `guardian.quick_start`).
+ */
+const BETA_WELCOME_SEEN_KEY = 'guardian.beta_welcome_seen';
 /**
  * DEBUG-only toggle for the multi-chunk recovery test.
  *
@@ -3048,6 +3063,46 @@ export default function Index() {
     };
   }, []);
 
+  /**
+   * One-shot beta welcome modal. Shown the first time the user opens
+   * the app on this device; persisted-dismissed forever afterwards via
+   * `BETA_WELCOME_SEEN_KEY`. Defaults to false so a read failure (rare,
+   * AsyncStorage error) silently skips the modal rather than blocking
+   * the user from reaching Home — the welcome is informational, not
+   * gating. Lifecycle is independent from every other piece of state on
+   * this screen: the modal is a transparent overlay that never blocks
+   * recording, recovery, or upload.
+   */
+  const [showBetaWelcome, setShowBetaWelcome] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    AsyncStorage.getItem(BETA_WELCOME_SEEN_KEY)
+      .then(raw => {
+        if (cancelled) return;
+        if (raw !== '1') setShowBetaWelcome(true);
+      })
+      .catch(() => {
+        /* default false (no modal), ignore */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  /**
+   * Dismiss the beta welcome modal and persist the "seen" flag so it
+   * never appears again on this device. Best-effort persistence —
+   * matches the QUICK_START_KEY pattern: a write failure means the
+   * modal will reappear on the next launch, which is annoying but
+   * never affects recording or upload integrity.
+   */
+  function dismissBetaWelcome() {
+    setShowBetaWelcome(false);
+    AsyncStorage.setItem(BETA_WELCOME_SEEN_KEY, '1').catch(() => {
+      /* best-effort, ignore */
+    });
+  }
+
   function resetProgress() {
     setUploadedCount(0);
     setTotalCount(0);
@@ -4678,6 +4733,100 @@ export default function Index() {
           <Text style={{ color: '#8b949e', fontSize: 10 }}>reset</Text>
         </Pressable>
       ) : null}
+
+      {/* One-shot beta welcome modal. Transparent overlay rendered as a
+          sibling of the rest of the Home screen — React Native's Modal
+          uses a native portal so position in the JSX tree does not
+          affect layering. Visible only when `showBetaWelcome=true`,
+          which is only ever set to true once per device (cleared by
+          `dismissBetaWelcome` writing `BETA_WELCOME_SEEN_KEY='1'`).
+          `onRequestClose` handles the Android hardware back button by
+          dismissing the modal rather than letting it bubble up to exit
+          the app — matches the user's tap on "Entendido". */}
+      <Modal
+        visible={showBetaWelcome}
+        transparent
+        animationType="fade"
+        onRequestClose={dismissBetaWelcome}
+        statusBarTranslucent
+      >
+        <View
+          style={{
+            flex: 1,
+            backgroundColor: 'rgba(0, 0, 0, 0.7)',
+            justifyContent: 'center',
+            paddingHorizontal: 24,
+          }}
+        >
+          <View
+            style={{
+              backgroundColor: '#161b22',
+              borderWidth: 1,
+              borderColor: '#30363d',
+              borderRadius: 10,
+              padding: 22,
+            }}
+          >
+            <Text
+              style={{
+                color: '#c9d1d9',
+                fontSize: 17,
+                fontWeight: '700',
+                marginBottom: 12,
+              }}
+            >
+              Gracias por probar Guardian Cloud Beta
+            </Text>
+            <Text
+              style={{
+                color: '#c9d1d9',
+                fontSize: 13,
+                lineHeight: 19,
+                marginBottom: 10,
+              }}
+            >
+              Guardian Cloud intenta proteger tu evidencia en tiempo
+              real mientras grabas, incluso si algo le ocurre al
+              dispositivo.
+            </Text>
+            <Text
+              style={{
+                color: '#c9d1d9',
+                fontSize: 13,
+                lineHeight: 19,
+                marginBottom: 10,
+              }}
+            >
+              Tu feedback ayuda a mejorar la estabilidad, recuperación
+              y confianza del sistema.
+            </Text>
+            <Text
+              style={{
+                color: '#8b949e',
+                fontSize: 12,
+                lineHeight: 17,
+                marginBottom: 18,
+              }}
+            >
+              Puedes enviar opiniones desde Configuración → Enviar
+              opinión beta.
+            </Text>
+            <Pressable
+              onPress={dismissBetaWelcome}
+              style={{
+                backgroundColor: '#1f6feb',
+                borderRadius: 6,
+                paddingVertical: 12,
+                alignItems: 'center',
+              }}
+            >
+              <Text style={{ color: '#fff', fontSize: 14, fontWeight: '600' }}>
+                Entendido
+              </Text>
+            </Pressable>
+          </View>
+        </View>
+      </Modal>
 
     </View>
   );
