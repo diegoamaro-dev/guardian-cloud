@@ -2,19 +2,20 @@
  * Pure-logic tests for the user-facing status derivation.
  *
  * The function is the single source of truth that decides whether the
- * UI shows Grabando / Subiendo / Recuperando / Protegido / Error /
- * Listo. It must obey a strict precedence so two simultaneous signals
- * (e.g. recording + queued chunks from a previous session) never
- * contradict each other.
+ * UI shows Grabando / Iniciando / Subiendo / Recuperando / Protegido /
+ * Error / Listo. It must obey a strict precedence so two simultaneous
+ * signals (e.g. recording + queued chunks from a previous session)
+ * never contradict each other.
  *
  * Precedence (top wins) — copied verbatim from the function's doc:
  *   1. grabando    — recorder is live (isRecording).
- *   2. recuperando — boot recovery is still draining (isRecovering).
- *   3. error       — at least one terminal-failed chunk (failedCount > 0).
- *   4. subiendo    — chunks still in motion (activeCount > 0).
- *   5. protegido   — every emitted chunk is uploaded (totalCount > 0
+ *   2. iniciando   — start path in flight (isStarting && !isRecording).
+ *   3. recuperando — boot recovery is still draining (isRecovering).
+ *   4. error       — at least one terminal-failed chunk (failedCount > 0).
+ *   5. subiendo    — chunks still in motion (activeCount > 0).
+ *   6. protegido   — every emitted chunk is uploaded (totalCount > 0
  *                    AND uploadedCount === totalCount).
- *   6. listo       — fallback.
+ *   7. listo       — fallback.
  */
 
 import { describe, it, expect } from 'vitest';
@@ -26,6 +27,7 @@ import {
 const baseInput: GuardianStatusInput = {
   isRecording: false,
   isRecovering: false,
+  isStarting: false,
   totalCount: 0,
   uploadedCount: 0,
   activeCount: 0,
@@ -39,12 +41,38 @@ describe('deriveGuardianStatus — precedence rules', () => {
         ...baseInput,
         isRecording: true,
         isRecovering: true,
+        isStarting: true,
         failedCount: 5,
         activeCount: 3,
         totalCount: 10,
         uploadedCount: 10,
       }),
     ).toBe('grabando');
+  });
+
+  it('returns "iniciando" while the start path is in flight (isStarting=true) and recorder not yet live', () => {
+    // The pre-recorder window: tap → permissions → audio mode →
+    // foreground service → POST /sessions → recorder.startAsync. On
+    // survival hardware this can be 1–4 s; the UI must reflect it
+    // immediately instead of staying on "Listo".
+    expect(
+      deriveGuardianStatus({
+        ...baseInput,
+        isStarting: true,
+      }),
+    ).toBe('iniciando');
+  });
+
+  it('"iniciando" dominates "recuperando" — active user intent beats background drain', () => {
+    // A user tapping GRABAR while boot recovery is still draining must
+    // see immediate feedback, not the recovery banner.
+    expect(
+      deriveGuardianStatus({
+        ...baseInput,
+        isStarting: true,
+        isRecovering: true,
+      }),
+    ).toBe('iniciando');
   });
 
   it('returns "recuperando" when not recording but boot recovery is in flight', () => {

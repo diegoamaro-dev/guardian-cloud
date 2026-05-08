@@ -4374,6 +4374,7 @@ export default function Index() {
   const guardianStatus = deriveGuardianStatus({
     isRecording,
     isRecovering,
+    isStarting,
     totalCount,
     uploadedCount,
     activeCount,
@@ -4415,26 +4416,43 @@ export default function Index() {
   // contradicts the system's truth — `guardianStatus` keeps its meaning
   // and `deriveGuardianStatus` is unchanged.
   const showProtectedBanner = protectedShownAt !== null;
+  // Subiendo label is conditional on whether at least one chunk has
+  // physically uploaded:
+  //   - uploadedCount === 0  → "Protegiendo evidencia (0 / Y)"  — first
+  //                            chunk in flight, nothing safe yet
+  //   - uploadedCount > 0    → "Evidencia protegida parcialmente (X / Y)"
+  //                            — at least one chunk confirmed server-side
+  // The completion gate (queue + reapEntry) and the green 'protegido'
+  // banner remain unchanged: only the in-flight LABEL is more honest
+  // about partial protection.
+  const subiendoLabel =
+    uploadedCount > 0
+      ? `Evidencia protegida parcialmente (${uploadedCount} / ${totalCount})`
+      : `Protegiendo evidencia (${uploadedCount} / ${totalCount})`;
   const phaseLabel =
     guardianStatus === 'grabando'
       ? 'Grabando'
-      : guardianStatus === 'subiendo'
-        ? `Guardando evidencia (${uploadedCount} / ${totalCount})`
-        : guardianStatus === 'recuperando'
-          ? 'Recuperando'
-          : guardianStatus === 'protegido'
-            ? 'Protegido'
-            : guardianStatus === 'error'
-              ? 'Error'
-              : 'Listo';
+      : guardianStatus === 'iniciando'
+        ? 'Iniciando grabación…'
+        : guardianStatus === 'subiendo'
+          ? subiendoLabel
+          : guardianStatus === 'recuperando'
+            ? 'Recuperando'
+            : guardianStatus === 'protegido'
+              ? 'Protegido'
+              : guardianStatus === 'error'
+                ? 'Error'
+                : 'Listo';
   const phaseColor =
     guardianStatus === 'grabando'
       ? '#ff4d4d'
-      : guardianStatus === 'subiendo' || guardianStatus === 'recuperando'
-        ? '#f0b400'
-        : guardianStatus === 'error'
-          ? '#f85149'
-          : '#3ddc84';
+      : guardianStatus === 'iniciando'
+        ? '#58a6ff'
+        : guardianStatus === 'subiendo' || guardianStatus === 'recuperando'
+          ? '#f0b400'
+          : guardianStatus === 'error'
+            ? '#f85149'
+            : '#3ddc84';
 
   // Destination gate. We never block a STOP — even with no destination,
   // a running recording must always be stoppable. The block only applies
