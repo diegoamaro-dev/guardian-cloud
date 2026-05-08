@@ -16,7 +16,10 @@ import {
   type DestinationType,
   type PublicDestination,
 } from '@/api/destinations';
-import { getPreferredDestinationType } from '@/destinations/preference';
+import {
+  getPreferredDestinationType,
+  subscribePreferredDestinationChange,
+} from '@/destinations/preference';
 import { ApiError } from '@/api/client';
 import { listSessionChunks } from '@/api/export';
 import { useAuthStore, getFreshAccessToken } from '@/auth/store';
@@ -3444,6 +3447,29 @@ export default function Index() {
       }
     }
   }
+
+  // Live preference sync: when Settings persists a new Drive/NAS choice
+  // (Settings sub-tree → cross-route, same JS runtime) the in-process
+  // pub/sub fires here and we re-resolve immediately. Without this the
+  // module-level `activeDestinationType` and the React state mirror
+  // `activeDest` stay stale until the next cold boot — observable as
+  // "I changed destination in Settings, Home still says the old one,
+  // and my next recording pins to the wrong destination".
+  //
+  // Active sessions are NOT retargeted: the queue entry's
+  // `destination_type` (per-session pin) was captured at GRABAR time
+  // and the worker reads `pick.destinationType ?? activeDestinationType`
+  // — pinned values always win. Only FUTURE recordings observe the new
+  // resolver result.
+  useEffect(() => {
+    return subscribePreferredDestinationChange(() => {
+      refreshDestination();
+    });
+    // refreshDestination is a stable component-scoped function that
+    // only writes via stable React setters and reads fresh values from
+    // AsyncStorage / the network on each call, so the captured closure
+    // does not cause stale reads. Single subscription per mount.
+  }, []);
 
   useEffect(() => {
     (async () => {
