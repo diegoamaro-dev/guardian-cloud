@@ -1744,8 +1744,22 @@ async function uploadDrainLoop(): Promise<void> {
   if (DEBUG_QUEUE) console.log('GC_DEBUG drain entered loop');
   try {
     while (true) {
+      // GC_PERF_DRAIN_PICK measures how long it takes to determine the next
+      // chunk to send (queueRead + pickNext + base64 rehydrate where
+      // applicable). Pure observation; no behavior change.
+      const t_pickStart = Date.now();
       const queue = await queueRead();
       const pick = await pickNext(queue);
+      perfLog('GC_PERF_DRAIN_PICK', {
+        ms: Date.now() - t_pickStart,
+        found: pick !== null,
+        ...(pick
+          ? {
+              session_id: pick.sessionId,
+              chunk_index: pick.chunk.chunk_index,
+            }
+          : {}),
+      });
       if (!pick) {
         // Nothing pending. Try to finalize any closed session whose chunks
         // are all done, then check if any session is still recording.
@@ -1771,7 +1785,26 @@ async function uploadDrainLoop(): Promise<void> {
               })),
           });
         }
-        await sleep(500);
+        // GC_PERF_DRAIN_IDLE_SLEEP fires every time the worker enters its
+        // inter-chunk wait window — i.e. nothing pending in the queue, but
+        // at least one session is still open or has residual entries the
+        // worker may need to reap. The reason + counts are useful when
+        // tracing the gap between chunk N uploaded and chunk N+1 uploading.
+        //
+        // Tuned 500ms → 150ms so the audio cadence (one chunk every ~2s
+        // at 64 kbps with 16 KB chunks) is picked up within ~150ms of
+        // emit instead of up to 500ms. Single-flight (`isDraining`),
+        // retry/backoff, and recovery semantics are intentionally
+        // unchanged — backoff sleeps live in the catch branch below
+        // with their own `await sleep(backoff)` and are not affected.
+        perfLog('GC_PERF_DRAIN_IDLE_SLEEP', {
+          ms: 150,
+          reason: 'queue_empty_session_open',
+          any_open: anyOpen,
+          any_residual: anyResidual,
+          queue_size: remaining.length,
+        });
+        await sleep(150);
         continue;
       }
 
@@ -1830,6 +1863,29 @@ async function uploadDrainLoop(): Promise<void> {
               size: chunk.size,
             });
           }
+          // Single token fetch per chunk: reused for both
+          // /destinations/<dest>/chunks AND /chunks. supabase-js caches
+          // its session in memory and only hits the network when the
+          // access token has expired, so the second internal lookup the
+          // worker used to do was almost always a no-op — but this
+          // collapses it down to a guaranteed one-call-per-chunk path
+          // and avoids the rare race where supabase-js races a refresh
+          // with our outgoing request. If the token expires DURING
+          // `uploadChunkBytes`, `postChunk` will see a 401 → classifyError
+          // marks transient → retry on the next drain pass picks up a
+          // fresh token. Same self-healing as before, fewer get-session
+          // round-trips on the steady-state path.
+          const accessToken = await getFreshAccessToken();
+          if (!accessToken) {
+            throw new ApiError(401, 'NO_TOKEN', 'No access token in store', null);
+          }
+          // GC_PERF_DRAIN_UPLOAD_BYTES isolates the bytes-to-destination leg
+          // (mobile → ngrok → backend → Drive/NAS, including the backend's
+          // own Google token refresh + uploadFile when destinationType is
+          // 'drive'). Compared against GC_PERF_DRAIN_POST_CHUNKS below this
+          // tells us whether the bottleneck is the proxy upload or the
+          // metadata-only POST /chunks.
+          const t_uploadStart = Date.now();
           const drive = await uploadChunkBytes(
             sessionId,
             chunk.chunk_index,
@@ -1837,7 +1893,15 @@ async function uploadDrainLoop(): Promise<void> {
             rehydratedSlice,
             30_000,
             sessionDestinationType,
+            accessToken,
           );
+          perfLog('GC_PERF_DRAIN_UPLOAD_BYTES', {
+            ms: Date.now() - t_uploadStart,
+            session_id: sessionId,
+            chunk_index: chunk.chunk_index,
+            destination_type: sessionDestinationType,
+            size: chunk.size,
+          });
           if (DEBUG_QUEUE) {
             console.log('GC_DEBUG after uploadChunkBytes', {
               sessionId,
@@ -1845,15 +1909,22 @@ async function uploadDrainLoop(): Promise<void> {
               remote_reference: drive.remote_reference,
             });
           }
-          const token = await getFreshAccessToken();
-          if (!token) throw new ApiError(401, 'NO_TOKEN', 'No access token in store', null);
+          // GC_PERF_DRAIN_POST_CHUNKS isolates the metadata leg (mobile →
+          // ngrok → backend → DB INSERT). Should be small in steady state
+          // but a multi-hundred-ms value here points at ngrok or DB latency.
+          const t_postStart = Date.now();
           await postChunk(
-            token,
+            accessToken,
             sessionId,
             { chunk_index: chunk.chunk_index, hash: chunk.hash, size: chunk.size },
             'uploaded',
             drive.remote_reference,
           );
+          perfLog('GC_PERF_DRAIN_POST_CHUNKS', {
+            ms: Date.now() - t_postStart,
+            session_id: sessionId,
+            chunk_index: chunk.chunk_index,
+          });
           await queueUpdateChunk(sessionId, chunk.chunk_index, {
             status: 'uploaded',
             base64Slice: undefined,           // poda
@@ -2871,6 +2942,19 @@ async function deleteRecordingBestEffort(
   }
 }
 
+/**
+ * Inner timeout for POST /chunks. Mirrors the 30s ceiling that
+ * `uploadChunkBytes` already applies to the `/destinations/<dest>/chunks`
+ * proxy upload, so a hung metadata write does not eat the full outer 60s
+ * `CHUNK_UPLOAD_TIMEOUT_MS` budget before the worker gives up.
+ *
+ * AbortError surfaces as a non-`ApiError` throw whose message lacks any
+ * `HTTP NNN` token — `classifyError` falls through to its `'transient'`
+ * default, so the existing retry/backoff machinery handles it identically
+ * to a network failure.
+ */
+const POST_CHUNKS_TIMEOUT_MS = 30_000;
+
 async function postChunk(
   token: string,
   sessionId: string,
@@ -2891,14 +2975,22 @@ async function postChunk(
   const url = `${env.apiUrl}/chunks`;
   if (!token) console.log('AUTH MISSING', { path: '/chunks' });
   console.log('API CALL', { method: 'POST', url, authed: true });
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${token}`,
-    },
-    body: JSON.stringify(body),
-  });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), POST_CHUNKS_TIMEOUT_MS);
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
   const contentType = res.headers.get('content-type') ?? '<none>';
   const rawText = await res.text();
   if (!res.ok) {

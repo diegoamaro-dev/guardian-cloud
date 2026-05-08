@@ -185,6 +185,12 @@ function base64ToBytes(b64: string): Uint8Array {
  *                     already has, from FileSystem.readAsStringAsync).
  *   destinationType — which backend proxy to use ('drive' | 'nas').
  *                     Defaults to 'drive' to preserve existing behaviour.
+ *   accessToken     — OPTIONAL. When the caller has already obtained a
+ *                     fresh access token (e.g. the upload worker, which
+ *                     reuses the same token for the subsequent POST
+ *                     /chunks), pass it in to skip the internal
+ *                     `getFreshAccessToken()` call. Otherwise we fetch
+ *                     it ourselves (legacy/standalone callers).
  *
  * Returns { remote_reference, dedup } on success.
  *
@@ -197,12 +203,14 @@ export async function uploadChunkBytes(
   base64Slice: string,
   timeoutMs = 30_000,
   destinationType: DestinationType = 'drive',
+  accessToken?: string,
 ): Promise<DriveChunkUploadResponse> {
-  // Same reasoning as apiFetch: read the latest token from supabase-js
-  // so an expired snapshot in the Zustand store doesn't send us into a
-  // 401. supabase-js will refresh inline if the persisted access token
-  // has expired.
-  const token = await getFreshAccessToken();
+  // Token resolution: use the caller-provided one when present (worker
+  // hot path — saves one supabase.auth.getSession() per chunk), fall back
+  // to the inline refresh otherwise. supabase-js refreshes the persisted
+  // access token in-place when it has expired, so a stale snapshot in
+  // the Zustand store cannot drag this into a 401.
+  const token = accessToken ?? (await getFreshAccessToken());
   if (!token) {
     console.log('AUTH MISSING', { path: `/destinations/${destinationType}/chunks` });
     throw new ApiError(401, 'NO_TOKEN', 'No access token in store', null);
