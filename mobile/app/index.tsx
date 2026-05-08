@@ -101,6 +101,38 @@ const QUICK_START_KEY = 'guardian.quick_start';
  * (`guardian.preferred_destination`, `guardian.quick_start`).
  */
 const BETA_WELCOME_SEEN_KEY = 'guardian.beta_welcome_seen';
+
+/**
+ * Activation-perf instrumentation (TEMPORARY — beta hardening).
+ *
+ * Captures the wall-clock timestamps of the milestones between the user
+ * tapping GRABAR and the first chunk landing server-side. Pure logging:
+ *
+ *   - never read by any decision path
+ *   - never persisted
+ *   - never sent to the backend
+ *   - module-level so logs from the worker (which run outside the
+ *     startRecording closure) can compute `since_tap_ms` consistently
+ *
+ * Limitation: `lastTapAtMs` is overwritten on every new tap. If the user
+ * starts a second recording while a previous session's first chunk is
+ * still in flight, the worker's GC_PERF_FIRST_CHUNK_* events for the
+ * older session will reference the NEWER tap time. For one-recording-
+ * at-a-time beta perf testing (the intended scenario) this is fine; the
+ * `session_id` field on every log lets you correlate after the fact.
+ *
+ * Remove the perf logs once activation latency is measured and the
+ * relevant cuts are applied.
+ */
+let lastTapAtMs: number | null = null;
+function perfLog(name: string, extra: Record<string, unknown> = {}): void {
+  const now = Date.now();
+  console.log(name, {
+    ts: now,
+    since_tap_ms: lastTapAtMs !== null ? now - lastTapAtMs : null,
+    ...extra,
+  });
+}
 /**
  * DEBUG-only toggle for the multi-chunk recovery test.
  *
@@ -1619,6 +1651,13 @@ async function uploadDrainLoop(): Promise<void> {
               chunk_index: chunk.chunk_index,
             });
           }
+          if (chunk.chunk_index === 0) {
+            perfLog('GC_PERF_FIRST_CHUNK_UPLOAD_START', {
+              session_id: sessionId,
+              destination_type: sessionDestinationType,
+              size: chunk.size,
+            });
+          }
           const drive = await uploadChunkBytes(
             sessionId,
             chunk.chunk_index,
@@ -1649,6 +1688,13 @@ async function uploadDrainLoop(): Promise<void> {
             remote_reference: drive.remote_reference,
             last_error: undefined,
           });
+          if (chunk.chunk_index === 0) {
+            perfLog('GC_PERF_FIRST_CHUNK_UPLOADED', {
+              session_id: sessionId,
+              destination_type: sessionDestinationType,
+              remote_reference: drive.remote_reference,
+            });
+          }
           // Best-effort cleanup of the on-disk video payload. The file
           // is no longer needed once the chunk is acknowledged on the
           // backend AND in Drive; leaving it would just consume disk
@@ -2346,6 +2392,13 @@ async function emitChunk(
     size: bytes.length,
     hash_short: hash.substring(0, 12),
   });
+  if (chunk_index === 0) {
+    perfLog('GC_PERF_FIRST_CHUNK_EMITTED', {
+      session_id: sessionId,
+      mode: 'audio',
+      size: bytes.length,
+    });
+  }
   logBackgroundChunkEmittedIfApplicable(sessionId, chunk_index);
   // Wake the worker (single-flight; no-op if already draining).
   // The .catch keeps unhandled rejections from being silently swallowed
@@ -2424,6 +2477,13 @@ async function emitVideoChunk(
     byteLength,
     hash_short: hash.substring(0, 12),
   });
+  if (chunk_index === 0) {
+    perfLog('GC_PERF_FIRST_CHUNK_EMITTED', {
+      session_id: sessionId,
+      mode: 'video_realtime',
+      size: bytes.length,
+    });
+  }
   logBackgroundChunkEmittedIfApplicable(sessionId, chunk_index);
   uploadDrainLoop().catch(err => {
     if (DEBUG_QUEUE) {
@@ -2506,6 +2566,13 @@ async function videoChunkSink(payload: ChunkPayload): Promise<void> {
     local_uri,
     isFinal: payload.isFinal === true,
   });
+  if (payload.chunk_index === 0) {
+    perfLog('GC_PERF_FIRST_CHUNK_EMITTED', {
+      session_id: payload.sessionId,
+      mode: 'video_post_stop',
+      size: bytes.length,
+    });
+  }
   logBackgroundChunkEmittedIfApplicable(payload.sessionId, payload.chunk_index);
   uploadDrainLoop().catch(err => {
     if (DEBUG_QUEUE) {
@@ -3473,6 +3540,7 @@ export default function Index() {
   }, []);
 
   async function startRecording() {
+    perfLog('GC_PERF_START_RECORDING_ENTER');
     if (
       isStartingRef.current ||
       recordingRef.current ||
@@ -3556,6 +3624,7 @@ export default function Index() {
         site: 'startRecording',
         ok: bgStarted,
       });
+      perfLog('GC_PERF_BACKGROUND_START_DONE', { ok: bgStarted });
 
       const token = tokenRef.current;
       if (!token) throw new Error('TOKEN_MISSING_AT_START');
@@ -3595,6 +3664,10 @@ export default function Index() {
       // backend record and queue entry NEVER disagree even if a
       // Settings toggle races between the two writes.
       const pinnedDestinationType: DestinationType = activeDestinationType;
+      perfLog('GC_PERF_SESSION_CREATE_START', {
+        local_session_id: localSessionId,
+        destination_type: pinnedDestinationType,
+      });
       try {
         sessionId = await createSessionRequest(
           token,
@@ -3620,6 +3693,13 @@ export default function Index() {
         }
       }
       sessionIdRef.current = sessionId;
+      perfLog('GC_PERF_SESSION_CREATED', {
+        session_id: sessionId,
+        // Equal session_id == localSessionId means the deferred-offline
+        // path took the catch above; backend was unreachable but the
+        // local UUID is still safe to chunk against.
+        deferred_offline: sessionId === localSessionId,
+      });
       AsyncStorage.setItem(LAST_SESSION_ID_KEY, sessionId).catch(() => {});
       // Append to local history index (best-effort, never blocks the
       // recording flow). The index is the only source the History
@@ -3642,7 +3722,9 @@ export default function Index() {
       if (recordingMode === 'audio') {
         const recording = new Audio.Recording();
         await recording.prepareToRecordAsync(RECORDING_OPTIONS);
+        perfLog('GC_PERF_RECORDER_START_START', { mode: 'audio' });
         await recording.startAsync();
+        perfLog('GC_PERF_RECORDER_STARTED', { mode: 'audio' });
         recordingRef.current = recording;
 
         const audioUri = recording.getURI();
@@ -3683,10 +3765,12 @@ export default function Index() {
           bitrate_bps: VIDEO_RECORDING_BITRATE_BPS,
           maxDuration: VIDEO_MAX_DURATION_S,
         });
+        perfLog('GC_PERF_RECORDER_START_START', { mode: 'video' });
         const recordPromise = cameraRef.current.recordAsync({
           maxDuration: VIDEO_MAX_DURATION_S,
         }) as Promise<{ uri: string } | undefined>;
         videoRecordPromiseRef.current = recordPromise;
+        perfLog('GC_PERF_RECORDER_STARTED', { mode: 'video' });
 
         // Best-effort early URI discovery via cache listing-diff. This
         // is DIAGNOSTIC ONLY under the post-stop chunker: the
@@ -3791,6 +3875,14 @@ export default function Index() {
       });
 
       setIsRecording(true);
+      // PERF: tap → "Grabando" UI visible. setIsRecording is the
+      // canonical render trigger for the recording-state UI; the actual
+      // pixel commit happens on the next React render cycle (typically
+      // a few ms later) so this log is the closest synchronous proxy.
+      perfLog('GC_PERF_UI_RECORDING_VISIBLE', {
+        session_id: sessionIdRef.current,
+        mode: recordingMode,
+      });
       setTestStatus('REC STARTED');
       await new Promise(r => setTimeout(r, 50));
     } catch (error) {
@@ -4641,7 +4733,20 @@ export default function Index() {
       ) : null}
 
       <Pressable
-        onPress={showStop ? stopRecording : startRecording}
+        onPress={
+          showStop
+            ? stopRecording
+            : () => {
+                // PERF instrumentation tap-anchor — sets the timing
+                // origin all subsequent GC_PERF_* events compute their
+                // `since_tap_ms` against. Synchronous, fire-and-forget
+                // call into startRecording (matches the previous
+                // direct-reference behaviour).
+                lastTapAtMs = Date.now();
+                perfLog('GC_PERF_TAP_RECORD');
+                startRecording();
+              }
+        }
         disabled={buttonDisabled}
         style={{
           backgroundColor: buttonBg,
