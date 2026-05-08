@@ -4418,17 +4418,23 @@ export default function Index() {
   const showProtectedBanner = protectedShownAt !== null;
   // Subiendo label is conditional on whether at least one chunk has
   // physically uploaded:
-  //   - uploadedCount === 0  → "Protegiendo evidencia (0 / Y)"  — first
-  //                            chunk in flight, nothing safe yet
-  //   - uploadedCount > 0    → "Evidencia protegida parcialmente (X / Y)"
-  //                            — at least one chunk confirmed server-side
+  //   - uploadedCount === 0  → "Protegiendo evidencia"  — first chunk
+  //                            in flight, nothing safe yet
+  //   - uploadedCount > 0    → "Evidencia protegida parcialmente"
+  //                            — at least one chunk confirmed
+  //                            server-side
   // The completion gate (queue + reapEntry) and the green 'protegido'
   // banner remain unchanged: only the in-flight LABEL is more honest
   // about partial protection.
+  //
+  // The numeric counter `(X / Y)` is rendered SEPARATELY via
+  // `phaseSubLabel` so the long Spanish copy + counter never collapse
+  // into a misaligned single-Text wrap. Pure layout split — no string
+  // parsing, no width constants.
   const subiendoLabel =
     uploadedCount > 0
-      ? `Evidencia protegida parcialmente (${uploadedCount} / ${totalCount})`
-      : `Protegiendo evidencia (${uploadedCount} / ${totalCount})`;
+      ? 'Evidencia protegida parcialmente'
+      : 'Protegiendo evidencia';
   const phaseLabel =
     guardianStatus === 'grabando'
       ? 'Grabando'
@@ -4443,6 +4449,12 @@ export default function Index() {
               : guardianStatus === 'error'
                 ? 'Error'
                 : 'Listo';
+  // Numeric progress shown only when a counter is meaningful — today
+  // that is the 'subiendo' state. Rendered as its own centred Text
+  // beneath the main label so the dot/label row never has to wrap a
+  // long "label (X / Y)" string.
+  const phaseSubLabel: string | null =
+    guardianStatus === 'subiendo' ? `${uploadedCount} / ${totalCount}` : null;
   const phaseColor =
     guardianStatus === 'grabando'
       ? '#ff4d4d'
@@ -4613,25 +4625,61 @@ export default function Index() {
         </View>
       ) : null}
 
+      {/* Status block: column with an inner row (dot + label) and an
+          optional centred sub-label below for numeric progress. The
+          column stretches to the parent's cross-axis so the inner Text
+          can `flexShrink` and wrap centred on small screens / long
+          translations without needing magic widths or absolute
+          positioning. The dot stays anchored to the FIRST line of the
+          label by virtue of being a row peer. */}
       <View
         style={{
-          flexDirection: 'row',
           alignItems: 'center',
+          alignSelf: 'stretch',
           marginBottom: 16,
         }}
       >
         <View
           style={{
-            width: 10,
-            height: 10,
-            borderRadius: 5,
-            backgroundColor: phaseColor,
-            marginRight: 8,
+            flexDirection: 'row',
+            alignItems: 'center',
+            justifyContent: 'center',
           }}
-        />
-        <Text style={{ color: phaseColor, fontSize: 16, fontWeight: '600' }}>
-          {phaseLabel}
-        </Text>
+        >
+          <View
+            style={{
+              width: 10,
+              height: 10,
+              borderRadius: 5,
+              backgroundColor: phaseColor,
+              marginRight: 8,
+            }}
+          />
+          <Text
+            style={{
+              color: phaseColor,
+              fontSize: 16,
+              fontWeight: '600',
+              textAlign: 'center',
+              flexShrink: 1,
+            }}
+          >
+            {phaseLabel}
+          </Text>
+        </View>
+        {phaseSubLabel !== null ? (
+          <Text
+            style={{
+              color: phaseColor,
+              fontSize: 14,
+              fontWeight: '500',
+              textAlign: 'center',
+              marginTop: 4,
+            }}
+          >
+            {phaseSubLabel}
+          </Text>
+        ) : null}
       </View>
 
       {/* Older sessions still draining behind the current one. Two
