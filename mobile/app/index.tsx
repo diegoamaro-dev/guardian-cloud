@@ -3785,9 +3785,134 @@ export default function Index() {
     // recorder branch all using the same value).
     const recordingMode: SessionMode = mode;
 
+    // Local-first: generate the UUID synchronously so EVERY downstream
+    // piece (queue entry, chunker, worker) can use it from the first
+    // millisecond — no waiting for the backend round-trip. Backend is
+    // idempotent on (id, user_id), so the eventual POST /sessions echoes
+    // the same id back; `sessionId === localSessionId` always.
+    const localSessionId = Crypto.randomUUID();
+    // Single-source capture of the pinned destination for THIS session.
+    // See createSessionRequest's docblock for the full rationale; the
+    // value flows into:
+    //   1. POST /sessions (eventual)
+    //   2. queueAppendNewSession (immediate)
+    //   3. schedulePendingSessionRegistration on the deferred branch
+    const pinnedDestinationType: DestinationType = activeDestinationType;
+
+    const token = tokenRef.current;
+    if (!token) {
+      console.log('ERROR REC: TOKEN_MISSING_AT_START');
+      setTestStatus('ERROR REC: TOKEN_MISSING_AT_START');
+      isStartingRef.current = false;
+      setIsStarting(false);
+      return;
+    }
+
+    // ----- KICK in PARALLEL (do NOT await — recorder doesn't need them) -----
+
+    // (P1) Foreground service: kept idempotent and self-stabilising via
+    // its predicate gate (`hasPendingWork` / `isRecordingActive`).
+    //
+    // Critical: the FG service's task body fires its FIRST iteration
+    // immediately after `BackgroundActions.start()` resolves (the
+    // `await sleep` is at the END of the loop, not the start). With
+    // Phase 1 parallelization, that first tick can fall in the window
+    // BEFORE the recorder is live and BEFORE `queueAppendNewSession`
+    // has run — i.e. with `recordingRef`/`videoRecordPromiseRef` null
+    // AND queue empty. Without `isStartingRef`, the predicate would
+    // return false, `hasPendingWork` would return false, and the
+    // service would auto-STOP via `no_pending_work` before the
+    // recorder ever needs it. Including `isStartingRef.current` keeps
+    // the service alive until startRecording's finally block
+    // (success or error path) flips it false; by then recordingRef is
+    // either set (success) or the queue / cleanup correctly indicate
+    // no work, so the auto-stop semantics outside the start window
+    // are byte-identical to the previous behaviour.
+    console.log('GC_BACKGROUND_CALL_START_BEGIN', {
+      site: 'startRecording',
+      mode: recordingMode,
+    });
+    startBackgroundProtection({
+      drain: () => uploadDrainLoop(),
+      isRecordingActive: () =>
+        isStartingRef.current ||
+        recordingRef.current !== null ||
+        videoRecordPromiseRef.current !== null ||
+        postStopChunkingInFlightRef.current,
+      hasPendingWork: hasPendingUploadWork,
+    })
+      .then(ok => {
+        console.log('GC_BACKGROUND_CALL_START_RESULT', {
+          site: 'startRecording',
+          ok,
+        });
+        perfLog('GC_PERF_BACKGROUND_START_DONE', { ok });
+      })
+      .catch(err => {
+        console.log('GC_BACKGROUND_UPLOAD_ERROR', {
+          phase: 'start_recording_parallel',
+          err: err instanceof Error ? err.message : String(err),
+        });
+        perfLog('GC_PERF_BACKGROUND_START_DONE', { ok: false });
+      });
+
+    // (P2) Backend session create: the worker's chunk POSTs need this
+    // row to exist server-side, but the recorder + queue + chunker can
+    // all run with `localSessionId` while we wait. The worker treats
+    // SESSION_NOT_FOUND as transient (classifyError), so any chunk
+    // POSTed before this resolves just back-offs and retries.
+    //
+    // We capture the promise so we can await it ONCE — strictly to
+    // detect non-retryable errors (which today abort the start). The
+    // await happens BELOW, AFTER the recorder is live, so the user
+    // never waits on this network round-trip to see "Grabando".
+    perfLog('GC_PERF_SESSION_CREATE_START', {
+      local_session_id: localSessionId,
+      destination_type: pinnedDestinationType,
+    });
+    const sessionCreatePromise: Promise<string> = (async () => {
+      try {
+        const sid = await createSessionRequest(
+          token,
+          recordingMode,
+          localSessionId,
+          pinnedDestinationType,
+        );
+        perfLog('GC_PERF_SESSION_CREATED', {
+          session_id: sid,
+          deferred_offline: false,
+        });
+        return sid;
+      } catch (err) {
+        if (isRetryableSessionCreateError(err)) {
+          await schedulePendingSessionRegistration(
+            localSessionId,
+            recordingMode,
+            pinnedDestinationType,
+          );
+          console.log('GC_LOCAL_FIRST session deferred', {
+            session_id: localSessionId,
+            reason: err instanceof Error ? err.message : String(err),
+          });
+          perfLog('GC_PERF_SESSION_CREATED', {
+            session_id: localSessionId,
+            deferred_offline: true,
+          });
+          return localSessionId;
+        }
+        // Non-retryable — re-throw so the await site below can abort
+        // the start cleanly (this matches today's behaviour where a
+        // hard 4xx from POST /sessions prevents recording).
+        throw err;
+      }
+    })();
+    // Suppress unhandled-rejection if the recorder path errors out
+    // before we ever await `sessionCreatePromise`. The actual handling
+    // happens at the explicit `await sessionCreatePromise` below.
+    sessionCreatePromise.catch(() => undefined);
+
     try {
-      setTestStatus('REC START');
-      await new Promise(r => setTimeout(r, 50));
+      // ----- CRITICAL PATH — only what the recorder strictly needs -----
       console.log('REC START — manual trigger', { mode: recordingMode });
 
       const perm = await Audio.requestPermissionsAsync();
@@ -3799,8 +3924,6 @@ export default function Index() {
         const cam = await requestCameraPermission();
         if (!cam.granted) throw new Error('CAMERA permission denied');
       }
-      setTestStatus('REC PERMISSION OK');
-      await new Promise(r => setTimeout(r, 50));
 
       await Audio.setAudioModeAsync({
         allowsRecordingIOS: true,
@@ -3813,130 +3936,6 @@ export default function Index() {
         // the app off-screen.
         staysActiveInBackground: true,
       });
-      setTestStatus('REC MODE SET');
-      await new Promise(r => setTimeout(r, 50));
-
-      // Start the foreground service. Keeps the JS runtime alive in
-      // background. Predicate-driven lifecycle: the service stays up
-      // while EITHER the recorder is active OR the queue still has
-      // chunks in `pending` / `uploading` (see `hasPendingUploadWork`).
-      // It does NOT depend on app foreground/background — that decoupling
-      // is what lets minimise → restore → minimise keep working without
-      // re-arming. Stop is delegated to either:
-      //   - the tick body itself (when both predicates go false), or
-      //   - `stopRecording`'s finally if it observes both false right
-      //     after the recorder ends.
-      // Idempotent; non-fatal if it fails (foreground recording carries
-      // on, only background lifetime is lost).
-      console.log('GC_BACKGROUND_CALL_START_BEGIN', {
-        site: 'startRecording',
-        mode: recordingMode,
-      });
-      const bgStarted = await startBackgroundProtection({
-        drain: () => uploadDrainLoop(),
-        isRecordingActive: () =>
-          recordingRef.current !== null ||
-          videoRecordPromiseRef.current !== null ||
-          postStopChunkingInFlightRef.current,
-        hasPendingWork: hasPendingUploadWork,
-      });
-      console.log('GC_BACKGROUND_CALL_START_RESULT', {
-        site: 'startRecording',
-        ok: bgStarted,
-      });
-      perfLog('GC_PERF_BACKGROUND_START_DONE', { ok: bgStarted });
-
-      const token = tokenRef.current;
-      if (!token) throw new Error('TOKEN_MISSING_AT_START');
-
-      // Create the session BEFORE the recorder so the concurrent chunker
-      // can attribute its first tick to a known session_id. If the POST
-      // succeeds but recorder.startAsync fails below, the session is
-      // orphan in `active` — the worker's tryFinalizeReadySessions
-      // path will reap it (chunks=[] → all-settled → completeSession).
-      //
-      // Local-first: generate the UUID up front so we have a stable
-      // session_id whether or not the backend is reachable. Backend is
-      // idempotent on (id, user_id) — replaying the same id later (when
-      // the network returns) returns the existing row instead of
-      // creating a duplicate. If POST /sessions fails for a retryable
-      // reason (offline, DNS, 5xx), we keep the local id, schedule a
-      // background re-register loop, and let the recorder/chunker run
-      // normally. The worker tolerates SESSION_NOT_FOUND as transient
-      // (see classifyError) so chunks emitted before registration just
-      // back off and retry — base64Slice is preserved on disk/queue.
-      setTestStatus('REC SESSION CREATING');
-      await new Promise(r => setTimeout(r, 50));
-      const localSessionId = Crypto.randomUUID();
-      let sessionId: string = localSessionId;
-      // Single-source capture of the pinned destination for THIS session.
-      // Used by:
-      //   1. POST /sessions (so the backend `sessions.destination_type`
-      //      column reflects where chunks actually land)
-      //   2. queueAppendNewSession (so the worker pins per-session
-      //      routing — unchanged behaviour, same value)
-      //   3. schedulePendingSessionRegistration on the offline-deferred
-      //      branch (so the retry loop replays the SAME destination
-      //      we'd have sent on the synchronous path)
-      // The const is hoisted to startRecording's scope so the existing
-      // `GC_QUEUE session destination pinned` log site below can keep
-      // reading the same name without an extra capture — guaranteeing
-      // backend record and queue entry NEVER disagree even if a
-      // Settings toggle races between the two writes.
-      const pinnedDestinationType: DestinationType = activeDestinationType;
-      perfLog('GC_PERF_SESSION_CREATE_START', {
-        local_session_id: localSessionId,
-        destination_type: pinnedDestinationType,
-      });
-      try {
-        sessionId = await createSessionRequest(
-          token,
-          recordingMode,
-          localSessionId,
-          pinnedDestinationType,
-        );
-      } catch (err) {
-        if (isRetryableSessionCreateError(err)) {
-          await schedulePendingSessionRegistration(
-            localSessionId,
-            recordingMode,
-            pinnedDestinationType,
-          );
-          console.log('GC_LOCAL_FIRST session deferred', {
-            session_id: localSessionId,
-            reason: err instanceof Error ? err.message : String(err),
-          });
-          setTestStatus('REC SESSION DEFERRED — sin conexión');
-          await new Promise(r => setTimeout(r, 50));
-        } else {
-          throw err;
-        }
-      }
-      sessionIdRef.current = sessionId;
-      perfLog('GC_PERF_SESSION_CREATED', {
-        session_id: sessionId,
-        // Equal session_id == localSessionId means the deferred-offline
-        // path took the catch above; backend was unreachable but the
-        // local UUID is still safe to chunk against.
-        deferred_offline: sessionId === localSessionId,
-      });
-      AsyncStorage.setItem(LAST_SESSION_ID_KEY, sessionId).catch(() => {});
-      // Append to local history index (best-effort, never blocks the
-      // recording flow). The index is the only source the History
-      // screen has to enumerate past sessions; per-row real status is
-      // still fetched live from GET /sessions/:id/chunks.
-      appendHistoryEntry({
-        session_id: sessionId,
-        created_at: new Date().toISOString(),
-        mode: recordingMode,
-      });
-      console.log('GC_VALIDATION: SESSION_CREATED', {
-        session_id: sessionId,
-        phase: 1,
-        mode: recordingMode,
-      });
-      setTestStatus('REC SESSION CREATED');
-      await new Promise(r => setTimeout(r, 50));
 
       let cacheUri: string;
       if (recordingMode === 'audio') {
@@ -3968,18 +3967,12 @@ export default function Index() {
         // Camera hardware needs a beat to initialize before recordAsync
         // will succeed. Without this delay expo-camera silently resolves
         // recordAsync to undefined. 800ms matches the pre-flight probe.
+        // (Phase 1 keeps this; reducing it requires expo-camera's
+        // `onCameraReady` callback wiring — separate change.)
         await new Promise(r => setTimeout(r, 800));
-
-        // Snapshot baseline candidate files BEFORE recordAsync so the
-        // diff after start uniquely identifies the in-flight file.
-        const baseline = await listCachedVideoFiles();
 
         // Kick off recording. DO NOT await — the promise resolves only
         // when stopRecording() is called (returns the authoritative URI).
-        // Quality settings come from CameraView props (videoQuality,
-        // videoBitrate) and are logged here so the file-size envelope
-        // is visible at session start, not just inferred from the
-        // resulting mp4.
         console.log('VIDEO_RECORDING_OPTIONS', {
           quality: VIDEO_RECORDING_QUALITY,
           bitrate_bps: VIDEO_RECORDING_BITRATE_BPS,
@@ -3992,60 +3985,67 @@ export default function Index() {
         videoRecordPromiseRef.current = recordPromise;
         perfLog('GC_PERF_RECORDER_STARTED', { mode: 'video' });
 
-        // Best-effort early URI discovery via cache listing-diff. This
-        // is DIAGNOSTIC ONLY under the post-stop chunker: the
-        // authoritative URI comes from `recordPromise.then(({uri}) =>
-        // ...)` at stop, and `controller.chunkVideoFile(uri)` consumes
-        // THAT — not the cache scan. A missing or late file is no
-        // longer a hard failure; we log it and let the recording
-        // continue. Earlier builds tore the recording down here on the
-        // assumption the live chunker needed `cacheUri` to read from,
-        // but that path no longer runs for video.
-        let inFlightUri: string | null = null;
-        const tCallStart = Date.now();
-        const deadline = tCallStart + VIDEO_URI_DISCOVERY_TIMEOUT_MS;
-        while (Date.now() < deadline) {
-          await new Promise(r => setTimeout(r, 200));
-          const after = await listCachedVideoFiles();
-          const novel = after.filter(
-            a => !baseline.some(b => b.path === a.path),
-          );
-          if (novel.length > 0) {
-            novel.sort((a, b) => b.modificationTime - a.modificationTime);
-            inFlightUri = novel[0]!.path;
-            break;
-          }
-        }
-        if (inFlightUri) {
-          videoRecordingUriRef.current = inFlightUri;
-          cacheUri = inFlightUri;
-          console.log('GC_DIAG: VIDEO_URI_DISCOVERED', {
-            uri: inFlightUri,
-            discovered_at_ms: Date.now() - tCallStart,
-          });
-        } else {
-          // No novel cache file appeared inside the diagnostic window.
-          // The recording is still alive (recordPromise was not
-          // rejected); we just don't have a URI yet. The post-stop
-          // chunker reads from the URI returned by the camera promise
-          // at stopRecording, so this is recoverable. Empty placeholder
-          // for queueAppendNewSession — `queueMarkRecordingClosed`
-          // overwrites `entry.uri` with the authoritative URI at stop.
-          videoRecordingUriRef.current = null;
-          cacheUri = '';
-          console.log('VIDEO_URI_DISCOVERY_PENDING', {
-            waited_ms: Date.now() - tCallStart,
-            note: 'Authoritative URI will be taken from recordPromise at stop',
-          });
-        }
+        // Phase 1: skip the URI discovery loop entirely. It was purely
+        // diagnostic — the post-stop chunker reads from the URI the
+        // recordPromise resolves with at stop, NOT from any cache scan.
+        // The empty placeholder is overwritten by `queueMarkRecordingClosed`
+        // at stop with the authoritative URI; this matches the existing
+        // "URI discovery timed out" branch we used to fall back to.
+        videoRecordingUriRef.current = null;
+        cacheUri = '';
       }
 
+      // ----- RECORDER LIVE -----
+      // The native recorder is now writing samples. We do NOT flip the
+      // user-visible "Grabando" yet: a throw between here and the chunker
+      // setup would otherwise leave the user looking at "Grabando" while
+      // the catch block tears the recorder down (regression seen in the
+      // Phase-1-only ordering). Resolution: keep the recorder + queue +
+      // chunker setup atomic w.r.t. the catch boundary, and only commit
+      // the UI once they have all succeeded. The `await sessionCreatePromise`
+      // below is typically already resolved (parallel kick at startRecording
+      // entry), so the user-visible cost is dominated by the AsyncStorage
+      // write of `queueAppendNewSession` (~10–30ms).
+
+      // Resolve the session id. Parallel kick from the top of the function
+      // means in the common case this await is ~0ms. On non-retryable POST
+      // /sessions failure (4xx) it throws — caught by the outer try/catch,
+      // where the recorder is stopped cleanly BEFORE the user ever sees
+      // "Grabando", restoring the pre-Phase-1 semantics. Retryable errors
+      // were already converted to a deferred registration inside the
+      // promise body, so they resolve with `localSessionId` and never
+      // throw here. `sessionId === localSessionId` in both branches.
+      let sessionId: string;
+      try {
+        sessionId = await sessionCreatePromise;
+      } catch (err) {
+        console.log('SESSION_CREATE_NON_RETRYABLE_ABORT', {
+          err: err instanceof Error ? err.message : String(err),
+        });
+        throw err;
+      }
+
+      sessionIdRef.current = sessionId;
+      AsyncStorage.setItem(LAST_SESSION_ID_KEY, sessionId).catch(() => {});
+      // Append to local history index (best-effort, never blocks the
+      // recording flow). The index is the only source the History
+      // screen has to enumerate past sessions; per-row real status is
+      // still fetched live from GET /sessions/:id/chunks.
+      appendHistoryEntry({
+        session_id: sessionId,
+        created_at: new Date().toISOString(),
+        mode: recordingMode,
+      });
+      console.log('GC_VALIDATION: SESSION_CREATED', {
+        session_id: sessionId,
+        phase: 1,
+        mode: recordingMode,
+      });
+
       // Pinning log — `pinnedDestinationType` was captured ONCE earlier
-      // in this function (just before createSessionRequest) so the
-      // backend `sessions.destination_type` and the queue entry's
-      // `destination_type` cannot diverge under a Settings race. The
-      // log stays here so the binding is observable from the very
-      // first chunk emission, matching the existing logcat contract.
+      // in this function so the backend `sessions.destination_type`
+      // and the queue entry's `destination_type` cannot diverge under
+      // a Settings race.
       console.log('GC_QUEUE session destination pinned', {
         sessionId,
         destinationType: pinnedDestinationType,
@@ -4086,6 +4086,22 @@ export default function Index() {
       if (recordingMode === 'audio') {
         startChunkerForSession(sessionId, cacheUri, recordingMode);
       }
+
+      // ----- COMMIT UI: "Grabando" -----
+      // Every side effect required for chunk production + queue
+      // persistence is in place. The invariant we restore here is:
+      // "if the user sees 'Grabando', the chunker is scheduled and the
+      // session is committed to GC_QUEUE." Anything that throws above
+      // unwinds via the catch BEFORE the UI was ever committed, so the
+      // user sees a clean error instead of a half-started "Grabando"
+      // pill that disappears.
+      setIsRecording(true);
+      perfLog('GC_PERF_UI_RECORDING_VISIBLE', {
+        session_id: sessionId,
+        mode: recordingMode,
+      });
+      setTestStatus('REC STARTED');
+
       uploadDrainLoop().catch(err => {
         if (DEBUG_QUEUE) {
           console.log('GC_DEBUG drain rejected (from startRecording)', {
@@ -4093,27 +4109,34 @@ export default function Index() {
           });
         }
       });
-
-      setIsRecording(true);
-      // PERF: tap → "Grabando" UI visible. setIsRecording is the
-      // canonical render trigger for the recording-state UI; the actual
-      // pixel commit happens on the next React render cycle (typically
-      // a few ms later) so this log is the closest synchronous proxy.
-      perfLog('GC_PERF_UI_RECORDING_VISIBLE', {
-        session_id: sessionIdRef.current,
-        mode: recordingMode,
-      });
-      setTestStatus('REC STARTED');
-      await new Promise(r => setTimeout(r, 50));
     } catch (error) {
       const message = (error as Error).message ?? String(error);
       setTestStatus(`ERROR REC: ${message}`);
       console.log('ERROR REC:', error);
       sessionIdRef.current = null;
+      // Defensive UI reset. With the Phase-1.1 ordering, `setIsRecording(true)`
+      // only runs AFTER queueAppendNewSession + chunker setup have succeeded,
+      // so reaching this catch implies `isRecording` is still false — this
+      // call is a no-op in the common path. We keep it as belt-and-braces
+      // for any future reordering that pushes the UI commit earlier again.
+      setIsRecording(false);
+      // Stop and unload the audio recorder if it managed to start before
+      // the error. With session create now awaited BEFORE queue/chunker
+      // setup, a non-retryable POST /sessions failure can hit this branch
+      // with a live audio recorder (the recorder is started on every
+      // path, including offline/deferred). Cleanup keeps the OS-level
+      // audio session from leaking and matches the pre-Phase-1 catch
+      // semantics now that the user-visible "Grabando" was never shown.
+      if (recordingRef.current) {
+        try {
+          await recordingRef.current.stopAndUnloadAsync();
+        } catch {
+          /* ignore — best effort */
+        }
+        recordingRef.current = null;
+      }
       // Make sure no half-started video state leaks if we threw after
-      // recordAsync was invoked. Audio's recordingRef is cleared
-      // separately in the recorder block on success; on failure either
-      // it never got set or the throw happens before assignment.
+      // recordAsync was invoked.
       if (videoRecordPromiseRef.current) {
         try {
           cameraRef.current?.stopRecording();
