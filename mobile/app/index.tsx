@@ -18,6 +18,7 @@ import {
 } from '@/api/destinations';
 import { getPreferredDestinationType } from '@/destinations/preference';
 import { ApiError } from '@/api/client';
+import { listSessionChunks } from '@/api/export';
 import { useAuthStore, getFreshAccessToken } from '@/auth/store';
 import { appendHistoryEntry, type SessionMode } from '@/api/history';
 import { hardResetAppState } from '@/dev/reset';
@@ -1124,6 +1125,174 @@ export async function reapAlreadyDoneEntries(): Promise<{ reaped: number }> {
     }
   }
   return { reaped };
+}
+
+/**
+ * Boot-time reconciliation against the backend's view of each stuck
+ * session.
+ *
+ * Closes a real beta-observable hole: a chunk can end up `status='failed'`
+ * locally (4xx classified as permanent — typical reasons: HASH_MISMATCH
+ * on a transient race, postChunk parsing hiccup, DRIVE_NOT_CONNECTED
+ * mid-flight) WHILE the same chunk's bytes are already on Drive/NAS via
+ * a sibling retry / dedup path. The local queue then carries `failed`
+ * forever, `tryFinalizeReadySessions`'s gate refuses to call
+ * completeSession, and Home shows "Error" indefinitely even though the
+ * evidence IS complete server-side and exportable.
+ *
+ * This helper consults the backend's `GET /sessions/:id/chunks` once
+ * per stuck entry and reaps **only when the backend explicitly confirms
+ * the session is whole**. The criterion is strict:
+ *
+ *   backend_uploaded_count >= entry.next_chunk_index
+ *
+ * If the backend has FEWER chunks than we expected to emit, the partial
+ * is real and we leave the entry alone (Home keeps showing Error — the
+ * user sees an honest signal). If the backend has all (or more), we
+ * still try to mark the session completed via POST /complete; only on
+ * 200 OR 409 SESSION_ALREADY_COMPLETED do we mark + reap. Any other
+ * failure (5xx, NETWORK_ERROR, unrecognised 4xx) leaves the entry
+ * untouched and is logged for the operator.
+ *
+ * Strict isolation:
+ *   - never touches GC_QUEUE contract — uses the public helpers only
+ *   - never touches the upload worker, chunking, recovery normalize
+ *   - never modifies a single chunk's status (entire entry is reaped
+ *     atomically once backend confirms; the failed/pending chunks are
+ *     dropped together with the rest of the entry)
+ *   - never converts a real partial into "protegido" — backend must
+ *     unambiguously confirm completeness first
+ *
+ * Best-effort: any I/O failure (network, parse, auth) folds to
+ * `not_reconciled` and the entry stays for the next boot to retry.
+ *
+ * Logs:
+ *   GC_QUEUE_STALE_LOCAL_ERROR_RECONCILED     — entry reaped after
+ *                                                backend confirmed.
+ *   GC_QUEUE_STALE_LOCAL_ERROR_NOT_RECONCILED — entry left untouched
+ *                                                (carries `reason`).
+ */
+export async function reconcileStaleSessionsWithBackend(): Promise<{
+  reconciled: number;
+  not_reconciled: number;
+}> {
+  const queue = await queueRead();
+  let reconciled = 0;
+  let not_reconciled = 0;
+
+  // Token is checked per entry rather than once up-front so a refresh
+  // race during the loop doesn't strand otherwise-reconcilable
+  // entries. `getFreshAccessToken` is cheap (cache-backed unless the
+  // persisted token actually expired).
+  for (const entry of queue) {
+    // Only consider entries that LOOK stuck/errored locally. A healthy
+    // entry (all uploaded, session_completed=true) is handled by
+    // `reapAlreadyDoneEntries` which ran just before us.
+    const hasFailed = entry.chunks.some(c => c.status === 'failed');
+    const hasIncompleteUpload = entry.chunks.some(
+      c => c.status !== 'uploaded' || !c.remote_reference,
+    );
+    if (!hasFailed && !hasIncompleteUpload) continue;
+
+    // Reconciliation is meaningful only when we know how many chunks
+    // were SUPPOSED to be emitted. A zero `next_chunk_index` means the
+    // recorder never produced a chunk — `tryFinalizeReadySessions`
+    // already handles that path; skip here.
+    const expected = entry.next_chunk_index;
+    if (expected === 0) continue;
+
+    const token = await getFreshAccessToken();
+    if (!token) {
+      console.log('GC_QUEUE_STALE_LOCAL_ERROR_NOT_RECONCILED', {
+        session_id: entry.session_id,
+        reason: 'no_access_token',
+      });
+      not_reconciled += 1;
+      continue;
+    }
+
+    let backendChunks;
+    try {
+      backendChunks = await listSessionChunks(entry.session_id);
+    } catch (err) {
+      console.log('GC_QUEUE_STALE_LOCAL_ERROR_NOT_RECONCILED', {
+        session_id: entry.session_id,
+        reason: 'list_chunks_failed',
+        err: err instanceof Error ? err.message : String(err),
+      });
+      not_reconciled += 1;
+      continue;
+    }
+
+    const backendUploaded = backendChunks.filter(
+      c => c.status === 'uploaded' && !!c.remote_reference,
+    ).length;
+
+    // Strict criterion: backend must have AT LEAST as many uploaded
+    // chunks as the local queue expected to emit. Less than that is a
+    // real partial — leave the entry alone so Home shows the honest
+    // failed/error state. The user can still export whatever the
+    // backend has; we won't pretend the local error doesn't exist.
+    if (backendUploaded < expected) {
+      console.log('GC_QUEUE_STALE_LOCAL_ERROR_NOT_RECONCILED', {
+        session_id: entry.session_id,
+        expected,
+        backend_uploaded: backendUploaded,
+        reason: 'backend_count_below_expected',
+      });
+      not_reconciled += 1;
+      continue;
+    }
+
+    // Backend has at least all the chunks we expected. Try to mark the
+    // session completed server-side. 200 OK or 409 SESSION_ALREADY_-
+    // COMPLETED both mean "backend agrees we're done" and trigger reap.
+    // Any other error → don't reap; the entry stays for next boot.
+    let completeOk = false;
+    try {
+      await completeSession(token, entry.session_id);
+      completeOk = true;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (
+        msg.includes('SESSION_ALREADY_COMPLETED') ||
+        msg.includes('HTTP 409')
+      ) {
+        completeOk = true;
+      } else {
+        console.log('GC_QUEUE_STALE_LOCAL_ERROR_NOT_RECONCILED', {
+          session_id: entry.session_id,
+          expected,
+          backend_uploaded: backendUploaded,
+          reason: 'complete_session_failed',
+          err: msg,
+        });
+        not_reconciled += 1;
+        continue;
+      }
+    }
+
+    if (!completeOk) {
+      // Defensive — the if/else above should already have continued.
+      not_reconciled += 1;
+      continue;
+    }
+
+    // Backend confirms whole. Mark + reap. `reapEntry` drops the queue
+    // entry, the rehydration cache, the completion-gate log map, the
+    // local recording file (if any), and the chunks/<sid>/ directory.
+    // The local 'failed' chunks die WITH the entry — they were stale.
+    await queueMarkSessionCompleted(entry.session_id);
+    await reapEntry(entry.session_id, entry.uri);
+    console.log('GC_QUEUE_STALE_LOCAL_ERROR_RECONCILED', {
+      session_id: entry.session_id,
+      expected,
+      backend_uploaded: backendUploaded,
+    });
+    reconciled += 1;
+  }
+
+  return { reconciled, not_reconciled };
 }
 
 // ----- error classification (HC: never retry 4xx forever) -----
@@ -3454,6 +3623,31 @@ export default function Index() {
           }
         } catch (err) {
           console.log('GC_QUEUE recovery reap failed', err);
+        }
+
+        // Backend reconciliation: for entries that locally still look
+        // failed/incomplete (typically `status='failed'` chunks left
+        // over from a 4xx-classified-permanent race), consult
+        // `GET /sessions/:id/chunks` and reap ONLY when the backend
+        // explicitly confirms the session is whole. Without this step a
+        // single locally-failed chunk freezes Home on "Error" forever
+        // even though the evidence IS complete server-side. The helper
+        // is strict about its criterion (backend uploaded count must
+        // be >= our `next_chunk_index` AND completeSession must
+        // succeed or already be completed) so partial sessions are NOT
+        // silently swept away. Best-effort: any I/O failure leaves the
+        // entry alone for the next boot to retry.
+        try {
+          const { reconciled, not_reconciled } =
+            await reconcileStaleSessionsWithBackend();
+          if (reconciled > 0 || not_reconciled > 0) {
+            console.log('GC_QUEUE recovery reconcile report', {
+              reconciled,
+              not_reconciled,
+            });
+          }
+        } catch (err) {
+          console.log('GC_QUEUE recovery reconcile failed', err);
         }
 
         // Local-first recovery: re-fire the pending-registration loop in
