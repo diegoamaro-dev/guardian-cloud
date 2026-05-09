@@ -30,6 +30,13 @@ yarn-error.*
 *.pem
 
 # local env files
+# `.env` is loaded by Metro for local builds (`expo run:android`).
+# EAS builds get the same vars from EAS Environment Variables — see
+# the `environment` field per profile in `eas.json`. Either way the
+# file MUST stay out of git: anon keys / API URLs are not "secret"
+# but accidental commits make rotation painful.
+.env
+.env.local
 .env*.local
 
 # typescript
