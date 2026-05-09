@@ -128,9 +128,13 @@ export default function SettingsScreen() {
    * in the home screen falls back to "Drive first, NAS second".
    */
   const [preferred, setPreferred] = useState<DestinationType | null>(null);
-  // Persisted "Inicio rápido" panic-mode preference. Pure UI flag: the
-  // home screen renders an "Inicio rápido activado" pill when true.
-  // Never auto-records — Play Store policy + project rule.
+  // Persisted "Inicio rápido" panic-mode preference. When true, the
+  // home screen renders the "Inicio rápido activado" pill AND, on a
+  // returning-user cold start, launches a short visible countdown
+  // that ends in `startRecording()` unless the user cancels (tap,
+  // blur, background). First-install is gated, so the first contact
+  // with the app stays explicit. See QUICK_START_KEY in app/index.tsx
+  // for the full behaviour spec.
   const [quickStartEnabled, setQuickStartEnabled] = useState(false);
   const [quickStartBusy, setQuickStartBusy] = useState(false);
 
@@ -655,10 +659,12 @@ export default function SettingsScreen() {
         cuenta de Google.
       </Text>
 
-      {/* Modo pánico — UI-only preference. NEVER auto-records. The home
-          screen reads this flag at mount and renders an "Inicio rápido
-          activado" pill near the GRABAR AHORA button so the user can
-          confirm at a glance the panic flow is armed. */}
+      {/* Modo pánico — persisted user preference. When ON, the home
+          screen renders an "Inicio rápido activado" pill near the
+          GRABAR AHORA button and, on a returning-user cold start,
+          launches a visible cancelable countdown that ends in
+          `startRecording()`. First-install is gated. Full behaviour
+          spec in app/index.tsx near QUICK_START_KEY. */}
       <Text
         style={{
           color: '#8b949e',
@@ -692,8 +698,9 @@ export default function SettingsScreen() {
           <Text
             style={{ color: '#6e7681', fontSize: 11, marginTop: 4, lineHeight: 15 }}
           >
-            Resalta el botón principal para que puedas iniciar la grabación
-            de inmediato. La app NUNCA graba sin que pulses.
+            Resalta el botón principal y, al abrir la app, puede iniciar
+            la grabación tras una cuenta atrás. Puedes cancelarla antes
+            de que empiece.
           </Text>
         </View>
         <View
@@ -773,9 +780,10 @@ export default function SettingsScreen() {
         </Text>
       </Pressable>
 
-      {/* Temporary beta-feedback affordance. Discreet dark card so it
-          reads as informational rather than promotional, distinct from
-          the warm "café al creador" button right below. Opens an
+      {/* Beta-feedback CTA. Promoted from a discreet dark card to a
+          solid blue button matching the primary action chrome
+          ("Conectar Google Drive") so the survey link reads as a
+          first-class call-to-action during the closed beta. Opens an
           external survey via the OS browser — no webview, no auth,
           no analytics, no queue interaction. Removed when beta ends. */}
       <Pressable
@@ -790,18 +798,22 @@ export default function SettingsScreen() {
         }}
         style={{
           marginTop: 24,
-          backgroundColor: '#161b22',
-          borderWidth: 1,
-          borderColor: '#30363d',
+          backgroundColor: '#1f6feb',
           borderRadius: 6,
           padding: 14,
           alignItems: 'center',
         }}
       >
-        <Text style={{ color: '#58a6ff', fontSize: 13, fontWeight: '600' }}>
+        <Text style={{ color: '#fff', fontSize: 14, fontWeight: '700' }}>
           Enviar opinión beta
         </Text>
-        <Text style={{ color: '#8b949e', fontSize: 11, marginTop: 4 }}>
+        <Text
+          style={{
+            color: 'rgba(255,255,255,0.85)',
+            fontSize: 11,
+            marginTop: 4,
+          }}
+        >
           Ayúdanos a mejorar Guardian Cloud
         </Text>
       </Pressable>

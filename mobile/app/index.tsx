@@ -86,14 +86,25 @@ export const PENDING_RETRY_KEY = 'test.pending_retry';
  */
 const LAST_SESSION_ID_KEY = 'export.last_session_id';
 /**
- * Persisted UI preference for "Inicio rápido" (panic mode prep).
+ * Persisted user preference for "Inicio rápido" (panic mode prep).
  *
- * Pure UI affordance: when true, the home screen surfaces the
- * "Inicio rápido activado" pill near the GRABAR button. The toggle
- * lives in the Settings screen. Critically, this flag does NOT
- * auto-start a recording — the user must always tap the button.
- * Play Store policy and the project's "no hidden recording" rule
- * forbid background-initiated capture without explicit consent.
+ * When true, the home screen does two things on a returning-user
+ * cold start:
+ *   1. Surfaces the "Inicio rápido activado" pill near the GRABAR
+ *      button so the user can confirm at a glance the panic flow is
+ *      armed.
+ *   2. Launches a short, visible countdown (`countdownSec`) that
+ *      reaches 0 → calls the same `startRecording()` path as the
+ *      manual button. The countdown can be cancelled by tapping
+ *      Cancelar, navigating away from Home, or backgrounding the
+ *      app. First-install (welcome modal still pending) blocks the
+ *      auto-countdown so the very first contact with the app stays
+ *      explicit.
+ *
+ * Play Store policy compliance is preserved through the visibility
+ * + cancelability of the countdown and the first-install gate, not
+ * by avoiding auto-record. The toggle lives in the Settings screen
+ * (the only mutator).
  *
  * Lives in AsyncStorage alongside `LAST_SESSION_ID_KEY`. Same
  * literal duplicated verbatim in `app/settings.tsx` (precedent: the
