@@ -3774,6 +3774,37 @@ export default function Index() {
     // does not cause stale reads. Single subscription per mount.
   }, []);
 
+  // Re-resolve destinations whenever Home regains focus. The trigger
+  // path that motivates this: the user opens Settings, runs the Drive
+  // OAuth dance, returns to Home — without a focus refresh the home
+  // would still render "Sin destino conectado" and refuse to record
+  // until a cold start. The Settings → Home navigation does NOT
+  // remount this screen, so the bootstrap useEffect below does NOT
+  // re-fire on its own.
+  //
+  // First-focus skip: the bootstrap useEffect already calls
+  // `refreshDestination()` once after auth + recovery, and that focus
+  // also fires on initial mount. Skipping the first focus avoids a
+  // redundant network round-trip on cold start. The function is
+  // idempotent so a double-fire would be safe — the skip is purely a
+  // performance hygiene choice.
+  //
+  // Cross-tab updates of `preferred` are handled by the in-process
+  // subscription right above; this focus path is the safety net for
+  // Drive/NAS row arrival (a different state class than preference
+  // change), and also catches the case where Settings refreshed the
+  // backend while Home was blurred but no preference event fired.
+  const firstDestFocusRef = useRef(true);
+  useFocusEffect(
+    useCallback(() => {
+      if (firstDestFocusRef.current) {
+        firstDestFocusRef.current = false;
+        return;
+      }
+      refreshDestination();
+    }, []),
+  );
+
   useEffect(() => {
     (async () => {
       try {
