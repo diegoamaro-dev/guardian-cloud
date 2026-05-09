@@ -488,17 +488,19 @@ export default function SettingsScreen() {
         </Pressable>
       )}
 
-      {/* Destination selector. Visible ONLY when both Drive and NAS are
-          connected — when only one is connected the resolver in the home
-          screen picks it automatically and the selector would just add
-          noise. The selected value is the persisted preference; an
-          unselected (null) preference defaults to Drive on the home
-          side, matching the "Drive first" fallback.
+      {/* Destination selector — visible whenever Drive is connected.
+          During the beta Drive is the only active option; the NAS
+          button is rendered in a fully inert disabled state so the
+          user can see the destination on the roadmap without being
+          able to pick it (no onPress, opacity dimmed, never highlighted
+          as selected). When the mobile NAS onboarding flow ships,
+          re-enable NAS in the inner map and restore the original "both
+          connected → user picks" semantics.
 
           Pure UI: writing the preference does NOT touch GC_QUEUE, the
           worker, recovery, or the backend. The home screen picks up
           the new value on its next `refreshDestination` tick. */}
-      {screen.kind === 'ready' && screen.drive && nas && (
+      {screen.kind === 'ready' && screen.drive && (
         <View
           style={{
             marginBottom: 10,
@@ -513,8 +515,7 @@ export default function SettingsScreen() {
             Destino activo
           </Text>
           <Text style={{ color: '#8b949e', fontSize: 11, marginTop: 4 }}>
-            Tienes ambos conectados. Elige a dónde se subirán las
-            grabaciones nuevas.
+            La beta usa Google Drive. NAS personal llegará después.
           </Text>
           <View style={{ flexDirection: 'row', marginTop: 10 }}>
             {(['drive', 'nas'] as const).map((opt) => {
