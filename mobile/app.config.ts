@@ -201,8 +201,18 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
       'expo-splash-screen',
       {
         backgroundColor: '#0d1117',
-        image: './assets/foreground.png',
-        imageWidth: 200,
+        // Splash-specific asset, NOT the adaptive icon foreground.
+        // `foreground.png` (1024x1536) wraps the escudo in ~28% L/R
+        // and ~32% T/B of transparent padding — necessary for the
+        // Android adaptive icon mask, but it makes the splash logo
+        // look small no matter how high `imageWidth` goes (we'd just
+        // be scaling padding). `splash-logo.png` is the same raster
+        // recropped to a tight 540x660 canvas (~8% breathing room),
+        // so `imageWidth` now controls the actual perceived shield
+        // size. The adaptive icon entry up top still points to
+        // `foreground.png` and is unaffected.
+        image: './assets/splash-logo.png',
+        imageWidth: 300,
         resizeMode: 'contain',
       },
     ],
