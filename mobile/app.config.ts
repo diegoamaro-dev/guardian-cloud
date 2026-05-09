@@ -107,6 +107,12 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
           // and the foreground-service notification never appears, so the
           // user has no visible signal that background protection is active.
           'android.permission.POST_NOTIFICATIONS',
+          // Lets the app open the system "ignore battery optimisations"
+          // settings page so the user can grant a Doze exemption. We do
+          // NOT request the exemption via system dialog (Play Store
+          // policy review). The Settings screen exposes a button that
+          // calls Linking.sendIntent() into this page.
+          'android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS',
         ];
         for (const perm of requiredPerms) {
           if (!existingPerms.includes(perm)) {

@@ -66,6 +66,16 @@ export interface BackgroundProtectionCallbacks {
   isRecordingActive: () => boolean;
   /** Async predicate — queue still has chunks the worker can act on. */
   hasPendingWork: () => Promise<boolean>;
+  /**
+   * Optional. Fires once per `startBackgroundProtection` invocation
+   * with the result of the POST_NOTIFICATIONS request (Android 13+).
+   * `true` when already-granted, freshly-granted, or on a platform
+   * that does not have the runtime permission (pre-13, iOS); `false`
+   * only when the user actively denied. Lets the caller surface a
+   * "no background indicator" hint on the UI without re-running the
+   * permission gate. No-op on platforms where the gate auto-passes.
+   */
+  onPostNotificationsResult?: (granted: boolean) => void;
 }
 
 /**
@@ -256,6 +266,7 @@ export async function startBackgroundProtection(
     isRunning = false;
   }
   const notifGranted = await ensureNotificationPermission();
+  cb.onPostNotificationsResult?.(notifGranted);
   console.log('GC_BACKGROUND_UPLOAD_START', {
     platform: Platform.OS,
     interval_ms: TICK_INTERVAL_MS,

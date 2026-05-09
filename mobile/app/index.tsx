@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Alert, AppState, Modal, View, Text, Pressable } from 'react-native';
+import { Alert, AppState, Linking, Modal, View, Text, Pressable } from 'react-native';
 import { Audio } from 'expo-av';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import * as FileSystem from 'expo-file-system/legacy';
@@ -35,6 +35,7 @@ import {
   startBackgroundProtection,
   stopBackgroundProtection,
 } from '@/recording/backgroundService';
+import { usePermissionsStore } from '@/permissions/permissionsStore';
 
 /**
  * Real-audio + real-network-failure recovery test.
@@ -3148,6 +3149,14 @@ async function createSessionRequest(
 export default function Index() {
   const [testStatus, setTestStatus] = useState<string | null>(null);
   const [isRecording, setIsRecording] = useState(false);
+  // POST_NOTIFICATIONS denial flag, written by `startBackgroundProtection`
+  // through the `onPostNotificationsResult` callback. When true the home
+  // screen renders a small read-only pill explaining that the foreground-
+  // service notification will not appear; recording itself is unaffected.
+  const notificationDenied = usePermissionsStore((s) => s.notificationDenied);
+  const setNotificationDenied = usePermissionsStore(
+    (s) => s.setNotificationDenied,
+  );
   const recordingRef = useRef<Audio.Recording | null>(null);
   // Video-mode counterparts of recordingRef. The CameraView is mounted
   // only during a video session (see render); cameraRef is wired through
@@ -3830,6 +3839,8 @@ export default function Index() {
                 videoRecordPromiseRef.current !== null ||
                 postStopChunkingInFlightRef.current,
               hasPendingWork: hasPendingUploadWork,
+              onPostNotificationsResult: (granted) =>
+                setNotificationDenied(!granted),
             }).catch(err => {
               console.log('GC_BACKGROUND_UPLOAD_ERROR', {
                 phase: 'boot_recovery',
@@ -3932,6 +3943,8 @@ export default function Index() {
         videoRecordPromiseRef.current !== null ||
         postStopChunkingInFlightRef.current,
       hasPendingWork: hasPendingUploadWork,
+      onPostNotificationsResult: (granted) =>
+        setNotificationDenied(!granted),
     })
       .then(ok => {
         console.log('GC_BACKGROUND_CALL_START_RESULT', {
@@ -5079,6 +5092,50 @@ export default function Index() {
         onChange={setMode}
         disabled={isRecording || isStarting || isStopping}
       />
+
+      {/* POST_NOTIFICATIONS denial pill. Read-only info: the recording
+          and upload paths still work, but the foreground-service
+          notification ("Guardian Cloud está protegiendo tu evidencia")
+          will not appear, so the user has no system-level confirmation
+          while the app is in the background. Tap opens the per-app
+          settings page so the user can grant the permission and
+          restart. Hidden during recording — it would compete with the
+          live state — and silenced while the gate has not resolved
+          yet (default `false`). */}
+      {!showStop && notificationDenied ? (
+        <Pressable
+          onPress={() => {
+            Linking.openSettings().catch(() => {
+              /* best-effort */
+            });
+          }}
+          style={{
+            flexDirection: 'row',
+            alignItems: 'center',
+            paddingHorizontal: 12,
+            paddingVertical: 8,
+            borderWidth: 1,
+            borderColor: '#9e7c2a',
+            borderRadius: 8,
+            marginTop: 8,
+            marginBottom: 4,
+            backgroundColor: '#1f1a09',
+          }}
+        >
+          <Text style={{ fontSize: 14, marginRight: 8 }}>🔔</Text>
+          <Text
+            style={{
+              color: '#e0c46c',
+              fontSize: 12,
+              flexShrink: 1,
+              lineHeight: 16,
+            }}
+          >
+            Sin notificación de fondo. La grabación funciona, pero al cerrar
+            la app no verás el indicador. Tocar para configurar.
+          </Text>
+        </Pressable>
+      ) : null}
 
       {/* Discreet "Inicio rápido activado" pill. Surfaces the panic
           preference so the user can confirm at a glance that the home

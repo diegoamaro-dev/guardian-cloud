@@ -28,6 +28,7 @@ import {
   setPreferredDestinationType,
 } from '@/destinations/preference';
 import { claimDriveOAuthCode } from '@/oauth/exchangeGuard';
+import { openBatteryOptimizationSettings } from '@/permissions/batteryOptimization';
 // DEV-only queue wipe — surfaced as a button at the bottom of this screen.
 // Does NOT touch auth/Drive/anything else; only Guardian Cloud queue keys.
 import { clearGuardianQueueDev } from '.';
@@ -659,6 +660,61 @@ export default function SettingsScreen() {
             }}
           />
         </View>
+      </Pressable>
+
+      {/* Battery-optimisation exemption. Android Doze pauses background
+          network reads for unwhitelisted apps; that throttles our upload
+          worker when the screen is locked for long periods. We do not
+          query exemption status (would require a native module) and we
+          do not request the dialog programmatically (Play Store policy
+          friction). Tapping the button opens the system "Battery
+          optimisation" settings page so the user can grant the
+          exemption manually. Recording is unaffected if they skip. */}
+      <Text
+        style={{
+          color: '#8b949e',
+          fontSize: 12,
+          letterSpacing: 1,
+          marginTop: 28,
+          marginBottom: 8,
+        }}
+      >
+        SUBIDA EN SEGUNDO PLANO
+      </Text>
+      <Pressable
+        onPress={() => {
+          openBatteryOptimizationSettings().catch(() => {
+            /* helper already swallows; this catch is defensive */
+          });
+        }}
+        style={{
+          padding: 14,
+          borderWidth: 1,
+          borderColor: '#30363d',
+          borderRadius: 8,
+          backgroundColor: '#161b22',
+        }}
+      >
+        <Text style={{ color: '#c9d1d9', fontSize: 14, fontWeight: '600' }}>
+          Batería ilimitada
+        </Text>
+        <Text
+          style={{ color: '#6e7681', fontSize: 11, marginTop: 4, lineHeight: 15 }}
+        >
+          Para que la subida no se pause con la pantalla apagada, Android
+          necesita una excepción de batería. Pulsa para abrir los ajustes
+          del sistema y permitir Guardian Cloud.
+        </Text>
+        <Text
+          style={{
+            color: '#58a6ff',
+            fontSize: 12,
+            fontWeight: '600',
+            marginTop: 10,
+          }}
+        >
+          Abrir ajustes →
+        </Text>
       </Pressable>
 
       {/* Temporary beta-feedback affordance. Discreet dark card so it
