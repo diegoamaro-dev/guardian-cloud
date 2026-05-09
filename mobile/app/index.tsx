@@ -1,5 +1,14 @@
 import { useEffect, useRef, useState } from 'react';
-import { Alert, AppState, Linking, Modal, View, Text, Pressable } from 'react-native';
+import {
+  ActivityIndicator,
+  Alert,
+  AppState,
+  Linking,
+  Modal,
+  View,
+  Text,
+  Pressable,
+} from 'react-native';
 import { Audio } from 'expo-av';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import * as FileSystem from 'expo-file-system/legacy';
@@ -4820,6 +4829,22 @@ export default function Index() {
       setProtectedShownAt(Date.now());
     }
   }, [guardianStatus]);
+  // Warning haptic on entering the `error` phase. Mirrors the Heavy
+  // impact on start (line 3932) and the Success notification on stop
+  // (line 4325) so the user feels a consistent triple — start, stop,
+  // problem — without having to look at the screen. Fires once per
+  // transition: the effect only re-runs when `guardianStatus` actually
+  // changes, so a long-lived error pill stays haptic-silent. No queue,
+  // worker, recovery or chunking touched.
+  useEffect(() => {
+    if (guardianStatus === 'error') {
+      Haptics.notificationAsync(
+        Haptics.NotificationFeedbackType.Warning,
+      ).catch(() => {
+        /* haptics not available — ignore */
+      });
+    }
+  }, [guardianStatus]);
   useEffect(() => {
     if (protectedShownAt === null) return;
     const elapsed = Date.now() - protectedShownAt;
@@ -5070,15 +5095,30 @@ export default function Index() {
             justifyContent: 'center',
           }}
         >
-          <View
-            style={{
-              width: 10,
-              height: 10,
-              borderRadius: 5,
-              backgroundColor: phaseColor,
-              marginRight: 8,
-            }}
-          />
+          {/* While `iniciando`, swap the static dot for a small spinner
+              so the user has a visible sign that work is happening
+              between tap and the recorder going live. Same colour as
+              the label, same horizontal slot — no layout shift, no new
+              row, no animation library. The `iniciando` window is
+              typically <2s; the spinner removes the "dead state" feel
+              without otherwise touching the status pill. */}
+          {guardianStatus === 'iniciando' ? (
+            <ActivityIndicator
+              size="small"
+              color={phaseColor}
+              style={{ marginRight: 8 }}
+            />
+          ) : (
+            <View
+              style={{
+                width: 10,
+                height: 10,
+                borderRadius: 5,
+                backgroundColor: phaseColor,
+                marginRight: 8,
+              }}
+            />
+          )}
           <Text
             style={{
               color: phaseColor,
