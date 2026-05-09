@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -15,7 +15,7 @@ import * as FileSystem from 'expo-file-system/legacy';
 import * as Crypto from 'expo-crypto';
 import * as Haptics from 'expo-haptics';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { router, Stack, useLocalSearchParams } from 'expo-router';
+import { router, Stack, useFocusEffect, useLocalSearchParams } from 'expo-router';
 import { supabase } from '@/auth/supabase';
 import { env } from '@/config/env';
 import {
@@ -3444,10 +3444,19 @@ export default function Index() {
    */
   const [protectedShownAt, setProtectedShownAt] = useState<number | null>(null);
   /**
-   * Persisted UI preference: "Inicio rápido" (panic mode prep). UI-only.
-   * When true the home screen renders a small "Inicio rápido activado"
-   * pill near the main button so the user knows the panic flow is
-   * armed. NEVER auto-records — the user must always tap.
+   * Persisted UI preference: "Inicio rápido" (panic mode prep).
+   *
+   * When true:
+   *   - The home screen renders the "Inicio rápido activado" pill near
+   *     the main button so the user knows the panic flow is armed.
+   *   - On a returning-user cold start the screen launches a short
+   *     visual countdown (`countdownSec`) that the user can cancel.
+   *     Reaching 0 calls the same `startRecording()` path that the
+   *     GRABAR button uses — no duplicated start logic, no background
+   *     auto-start, no widget/intent shortcut. SOLO apertura normal.
+   *   - First install (welcome modal active or unseen this session)
+   *     blocks the auto-countdown so the user's first contact with
+   *     the app stays explicit.
    */
   const [quickStartEnabled, setQuickStartEnabled] = useState(false);
   useEffect(() => {
@@ -3476,15 +3485,38 @@ export default function Index() {
    * recording, recovery, or upload.
    */
   const [showBetaWelcome, setShowBetaWelcome] = useState(false);
+  /**
+   * Welcome flow status — separate from `showBetaWelcome` (which only
+   * tracks modal visibility) so the auto-countdown trigger can gate on
+   * "returning user, never first install in this session". Three values:
+   *   - `loading`: AsyncStorage read still pending.
+   *   - `first-install-this-session`: BETA_WELCOME_SEEN_KEY was unset
+   *     when we read it; the welcome modal is showing or was dismissed.
+   *     Even after dismissal, this stays sticky for the rest of the
+   *     session so the auto-countdown never fires on first contact.
+   *   - `returning-user`: BETA_WELCOME_SEEN_KEY was '1' on this device.
+   *     Auto-countdown is allowed (subject to the other gates).
+   */
+  const [welcomeStatus, setWelcomeStatus] = useState<
+    'loading' | 'first-install-this-session' | 'returning-user'
+  >('loading');
   useEffect(() => {
     let cancelled = false;
     AsyncStorage.getItem(BETA_WELCOME_SEEN_KEY)
       .then(raw => {
         if (cancelled) return;
-        if (raw !== '1') setShowBetaWelcome(true);
+        if (raw !== '1') {
+          setShowBetaWelcome(true);
+          setWelcomeStatus('first-install-this-session');
+        } else {
+          setWelcomeStatus('returning-user');
+        }
       })
       .catch(() => {
-        /* default false (no modal), ignore */
+        /* default false (no modal). Treat as returning user — the
+           welcome is informational and we never want a transient
+           AsyncStorage failure to permanently disable quick-start. */
+        if (!cancelled) setWelcomeStatus('returning-user');
       });
     return () => {
       cancelled = true;
@@ -3504,6 +3536,102 @@ export default function Index() {
       /* best-effort, ignore */
     });
   }
+
+  // ----- Quick-start countdown (panic-mode auto-record) -----
+  //
+  // Visible 3 → 2 → 1 ticking before the canonical `startRecording()`
+  // is invoked — same function the GRABAR button calls, so the queue,
+  // worker, recorder and recovery code paths see ZERO change. Local
+  // state, local refs, single file. No persistence, no global store.
+  /**
+   * Visible countdown number, or `null` when no countdown is running.
+   * Drives the modal's visibility (`countdownSec !== null`) and the
+   * big number rendered inside it.
+   */
+  const [countdownSec, setCountdownSec] = useState<number | null>(null);
+  /**
+   * Single-shot guard. Set to `true` the first time the trigger effect
+   * fires the countdown in this mount, NEVER reset. A user who cancels
+   * (or whose countdown is killed by background / blur) keeps the flag
+   * — re-firing the auto-countdown after an explicit cancel would feel
+   * harassing.
+   */
+  const countdownDispatchedRef = useRef(false);
+  /**
+   * Handle of the in-flight `setTimeout`. Held so cancel paths
+   * (button, blur, background, unmount) can clear it deterministically.
+   */
+  const countdownTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  function cancelCountdown(): void {
+    if (countdownTimerRef.current !== null) {
+      clearTimeout(countdownTimerRef.current);
+      countdownTimerRef.current = null;
+    }
+    setCountdownSec(null);
+  }
+
+  function startCountdown(): void {
+    countdownDispatchedRef.current = true;
+    setCountdownSec(3);
+    // One soft haptic at appearance — confirms to the user that the
+    // panic flow has armed without competing with the Heavy haptic
+    // that fires when `startRecording()` actually starts at 0.
+    Haptics.selectionAsync().catch(() => {
+      /* haptics not available — ignore */
+    });
+    let value = 3;
+    const tick = (): void => {
+      value -= 1;
+      if (value > 0) {
+        setCountdownSec(value);
+        countdownTimerRef.current = setTimeout(tick, 1000);
+      } else {
+        // Reached zero. Clear timer ref + visible state BEFORE
+        // calling startRecording so the function reads a clean state.
+        // `startRecording` has its own `isStartingRef` guard
+        // (line ~3931) that fail-safes against any race where the
+        // GRABAR button might have been double-tapped through a
+        // race window we haven't anticipated.
+        countdownTimerRef.current = null;
+        setCountdownSec(null);
+        startRecording();
+      }
+    };
+    countdownTimerRef.current = setTimeout(tick, 1000);
+  }
+
+  // Cancel countdown when the user navigates away from Home (Settings,
+  // Historial, deep-link route, etc.). The blur callback fires on
+  // navigation; the focus side is intentionally a no-op so we do NOT
+  // re-arm the countdown when the user returns — once dispatched, that
+  // session's auto-countdown is done.
+  useFocusEffect(
+    useCallback(() => {
+      return () => {
+        if (countdownTimerRef.current !== null) cancelCountdown();
+      };
+    }, []),
+  );
+
+  // Cancel countdown when the app goes to background. Mirrors the
+  // navigation-blur behaviour: the user's intent has shifted away
+  // from "I am about to record". Cleanup also clears any timer that
+  // outlived the unmount cycle.
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', next => {
+      if (next !== 'active' && countdownTimerRef.current !== null) {
+        cancelCountdown();
+      }
+    });
+    return () => {
+      sub.remove();
+      if (countdownTimerRef.current !== null) {
+        clearTimeout(countdownTimerRef.current);
+        countdownTimerRef.current = null;
+      }
+    };
+  }, []);
 
   function resetProgress() {
     setUploadedCount(0);
@@ -4939,6 +5067,30 @@ export default function Index() {
   const buttonLabel = showStop ? 'PARAR' : 'GRABAR AHORA';
   const buttonBg = showStop ? '#d73a49' : '#1f6feb';
 
+  // Auto-trigger the quick-start countdown on a returning-user cold
+  // start when the panic preference is armed and nothing else is
+  // running. Placed AFTER `showStop` / `buttonDisabled` /
+  // `guardianStatus` are defined so the deps array is in scope. Fires
+  // exactly once per mount: `countdownDispatchedRef` blocks re-runs
+  // even if the dependency array oscillates while loading.
+  useEffect(() => {
+    if (countdownDispatchedRef.current) return;
+    if (!quickStartEnabled) return;
+    if (welcomeStatus !== 'returning-user') return; // first install / loading
+    if (showBetaWelcome) return; // modal currently visible
+    if (showStop) return; // already recording / stopping
+    if (buttonDisabled) return; // isStarting / isBusy / no destination
+    if (guardianStatus === 'error') return;
+    startCountdown();
+  }, [
+    quickStartEnabled,
+    welcomeStatus,
+    showBetaWelcome,
+    showStop,
+    buttonDisabled,
+    guardianStatus,
+  ]);
+
   return (
     <View
       style={{
@@ -5574,6 +5726,83 @@ export default function Index() {
             >
               <Text style={{ color: '#fff', fontSize: 14, fontWeight: '600' }}>
                 Entendido
+              </Text>
+            </Pressable>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Quick-start countdown modal. Visibility tied to `countdownSec`:
+          while non-null the user sees a big number ticking down with a
+          single primary "Cancelar" action. Tapping Cancelar (or Android
+          back via `onRequestClose`) calls `cancelCountdown()` which
+          clears the timer ref and the state. Hitting 0 inside the tick
+          callback calls `startRecording()` directly — same path as the
+          GRABAR button, no duplicated logic, no extra state machine.
+          The Modal blocks the underlying GRABAR button visually so a
+          double-tap race is impossible. Style mirrors the beta-welcome
+          card above for consistency. */}
+      <Modal
+        visible={countdownSec !== null}
+        transparent
+        animationType="fade"
+        onRequestClose={cancelCountdown}
+        statusBarTranslucent
+      >
+        <View
+          style={{
+            flex: 1,
+            backgroundColor: 'rgba(0, 0, 0, 0.7)',
+            justifyContent: 'center',
+            paddingHorizontal: 24,
+          }}
+        >
+          <View
+            style={{
+              backgroundColor: '#161b22',
+              borderWidth: 1,
+              borderColor: '#30363d',
+              borderRadius: 10,
+              padding: 22,
+              alignItems: 'center',
+            }}
+          >
+            <Text
+              style={{
+                color: '#c9d1d9',
+                fontSize: 16,
+                fontWeight: '600',
+                marginBottom: 12,
+                textAlign: 'center',
+              }}
+            >
+              Grabación automática en…
+            </Text>
+            <Text
+              style={{
+                color: '#3ddc84',
+                fontSize: 72,
+                fontWeight: '700',
+                marginBottom: 18,
+                textAlign: 'center',
+                fontVariant: ['tabular-nums'],
+              }}
+            >
+              {countdownSec ?? ''}
+            </Text>
+            <Pressable
+              accessibilityRole="button"
+              onPress={cancelCountdown}
+              style={({ pressed }) => ({
+                alignSelf: 'stretch',
+                backgroundColor: pressed ? '#a82a36' : '#d73a49',
+                borderRadius: 6,
+                paddingVertical: 14,
+                alignItems: 'center',
+              })}
+            >
+              <Text style={{ color: '#fff', fontSize: 16, fontWeight: '700' }}>
+                Cancelar
               </Text>
             </Pressable>
           </View>
