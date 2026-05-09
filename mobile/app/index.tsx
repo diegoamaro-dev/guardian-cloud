@@ -36,6 +36,7 @@ import {
   stopBackgroundProtection,
 } from '@/recording/backgroundService';
 import { usePermissionsStore } from '@/permissions/permissionsStore';
+import { humanizeFailure } from '@/errors/humanError';
 
 /**
  * Real-audio + real-network-failure recovery test.
@@ -820,6 +821,46 @@ export async function queueMarkRecordingClosed(
     e.emitted_base64_length = emittedBase64Length;
     e.next_chunk_index = nextChunkIndex;
   });
+}
+
+/**
+ * Flip every chunk currently at `failed` back to `pending` so the
+ * upload worker re-attempts them on its next tick. Clears `last_error`
+ * and resets `attempts` so the backoff starts at the floor.
+ *
+ * Behavioural contract:
+ *   - The worker is unchanged. It already drains `pending` chunks via
+ *     `uploadDrainLoop`; flipping the status is the only state change
+ *     needed to wake it up.
+ *   - Bytes survive: AUDIO chunks pruned their `base64Slice` on
+ *     permanent failure but their source recording at `entry.uri` is
+ *     still on disk (the entry has not been reaped because at least
+ *     one chunk is failed) — `rehydrateChunkSlice` re-reads from disk.
+ *     VIDEO chunks keep `byteOffset` / `byteLength` / `local_uri`
+ *     across the failure, so the rehydration path does not touch them.
+ *   - The home screen surfaces this only when the human-readable
+ *     failure category is recoverable (see `humanizeFailure`). Codes
+ *     where retry would fail the same way (HASH_MISMATCH, BODY_TOO_LARGE,
+ *     SESSION_NOT_ACTIVE, INVALID_HEADERS) hide the button.
+ *
+ * Single AsyncStorage write — `queueMutate` re-serialises the queue
+ * once even when N chunks are flipped.
+ */
+export async function requeueFailedChunks(): Promise<void> {
+  let flipped = 0;
+  await queueMutate(q => {
+    for (const entry of q) {
+      for (const c of entry.chunks) {
+        if (c.status === 'failed') {
+          c.status = 'pending';
+          c.last_error = undefined;
+          c.attempts = 0;
+          flipped += 1;
+        }
+      }
+    }
+  });
+  console.log('GC_QUEUE requeue_failed', { flipped });
 }
 
 export async function queueMarkSessionCompleted(sessionId: string): Promise<void> {
@@ -3331,6 +3372,18 @@ export default function Index() {
    */
   const [failedCount, setFailedCount] = useState(0);
   /**
+   * Most recent permanent-failure shape from the current session's
+   * queue, kept so the home screen can render a human-readable line
+   * under the red `error` pill via `humanizeFailure`. Set in the same
+   * 500ms poll tick that drives `failedCount`. `null` whenever
+   * `failedCount === 0`. Capturing only the FIRST failed chunk keeps
+   * the UI deterministic — multiple chunks failing the same way show
+   * one message; mixed failures (rare) show the earliest.
+   */
+  const [lastFailedError, setLastFailedError] = useState<
+    QueueChunk['last_error'] | null
+  >(null);
+  /**
    * Older sessions still draining in the queue while the user looks at
    * the most recent one. Derived from `queue.length - 1` — the queue
    * is appended in creation order by `queueAppendNewSession`'s
@@ -3448,6 +3501,7 @@ export default function Index() {
     setTotalCount(0);
     setActiveCount(0);
     setFailedCount(0);
+    setLastFailedError(null);
     setBackgroundSessions(0);
   }
 
@@ -4554,12 +4608,18 @@ export default function Index() {
         let uploaded = 0;
         let active = 0;
         let failed = 0;
+        let firstFailedError: QueueChunk['last_error'] | null = null;
         if (current) {
           total = current.chunks.length;
           for (const c of current.chunks) {
             if (c.status === 'uploaded') uploaded += 1;
             else if (c.status === 'pending' || c.status === 'uploading') active += 1;
-            else if (c.status === 'failed') failed += 1;
+            else if (c.status === 'failed') {
+              failed += 1;
+              if (firstFailedError === null && c.last_error) {
+                firstFailedError = c.last_error;
+              }
+            }
           }
         }
         const background = Math.max(0, q.length - 1);
@@ -4614,6 +4674,22 @@ export default function Index() {
           setUploadedCount(uploaded);
           setActiveCount(active);
           setFailedCount(failed);
+          // Stable-update guard so the 500ms tick does not allocate a
+          // fresh state reference (and force a re-render) when the
+          // underlying error has not changed. Two values are equal when
+          // they have the same status + code; the `message` field is
+          // operator detail and may vary token-by-token between retries.
+          setLastFailedError(prev => {
+            if (failed === 0 || !firstFailedError) return null;
+            if (
+              prev &&
+              prev.status === firstFailedError.status &&
+              prev.code === firstFailedError.code
+            ) {
+              return prev;
+            }
+            return firstFailedError;
+          });
           setBackgroundSessions(background);
           setBgActiveSessions(bgActiveSessions_);
           setBgUploaded(bgUploaded_);
@@ -5029,6 +5105,79 @@ export default function Index() {
           </Text>
         ) : null}
       </View>
+
+      {/* Human translation of the most recent permanent failure on
+          the current session. Visible only while `guardianStatus`
+          is `error` AND a `last_error` was captured by the polling
+          tick — both conditions are derived state, not new
+          persistence. The mapping lives in `humanizeFailure`; this
+          block contributes copy + the optional Reintentar button.
+          Worker-internal vocabulary (codes, statuses) never leaves
+          the queue. */}
+      {guardianStatus === 'error' && lastFailedError ? (() => {
+        const failureView = humanizeFailure(lastFailedError);
+        return (
+          <View
+            style={{
+              marginTop: 4,
+              marginBottom: 16,
+              paddingHorizontal: 24,
+              alignItems: 'center',
+            }}
+          >
+            <Text
+              style={{
+                color: '#f85149',
+                fontSize: 14,
+                fontWeight: '600',
+                textAlign: 'center',
+                lineHeight: 18,
+              }}
+            >
+              {failureView.message}
+            </Text>
+            <Text
+              style={{
+                color: '#8b949e',
+                fontSize: 12,
+                textAlign: 'center',
+                marginTop: 6,
+                lineHeight: 16,
+              }}
+            >
+              {failureView.evidence}
+            </Text>
+            {failureView.recoverable ? (
+              <Pressable
+                onPress={() => {
+                  // Best-effort. The mutation is single-AsyncStorage-write
+                  // and we don't surface its result to the user — the
+                  // 500ms poll tick will reflect the new status (failed
+                  // → pending → uploading → uploaded) on its own.
+                  requeueFailedChunks().catch(() => {
+                    /* swallow — next tick reflects state regardless */
+                  });
+                }}
+                style={({ pressed }) => ({
+                  marginTop: 10,
+                  paddingHorizontal: 18,
+                  paddingVertical: 8,
+                  borderRadius: 999,
+                  borderWidth: 1,
+                  borderColor: '#3ddc84',
+                  backgroundColor: pressed ? '#0a2a14' : 'transparent',
+                })}
+              >
+                <Text
+                  style={{ color: '#3ddc84', fontSize: 13, fontWeight: '600' }}
+                >
+                  Reintentar
+                </Text>
+              </Pressable>
+            ) : null}
+          </View>
+        );
+      })() : null}
 
       {/* Older sessions still draining behind the current one. Two
           shapes, both derived from the queue on the same poll tick:
