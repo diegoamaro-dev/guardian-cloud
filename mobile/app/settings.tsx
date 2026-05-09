@@ -169,7 +169,23 @@ export default function SettingsScreen() {
       // destination cases the resolver in the home screen picks the
       // only valid option automatically, so the preference is
       // informational at most.
-      const pref = await getPreferredDestinationType();
+      let pref = await getPreferredDestinationType();
+      // Beta defensive guard: NAS has no mobile onboarding flow yet, so
+      // a stale `preferred === 'nas'` would leave the home resolver
+      // pointing at a destination the user cannot manage from mobile.
+      // Normalize silently to 'drive' here — and persist the rewrite so
+      // subsequent reads (home screen `refreshDestination`, next app
+      // launch) see the corrected value too. Storage failure is
+      // swallowed: local state still normalizes, next visit retries.
+      // Remove this block when the NAS mobile flow ships.
+      if (pref === 'nas') {
+        try {
+          await setPreferredDestinationType('drive');
+        } catch {
+          /* persistence failed — local state still corrected below */
+        }
+        pref = 'drive';
+      }
       setPreferred(pref);
       setScreen({ kind: 'ready', drive: driveDest });
     } catch (err) {
@@ -498,13 +514,27 @@ export default function SettingsScreen() {
           </Text>
           <View style={{ flexDirection: 'row', marginTop: 10 }}>
             {(['drive', 'nas'] as const).map((opt) => {
+              // NAS is wired in the backend but the mobile onboarding
+              // flow does not exist yet. We keep the button rendered so
+              // users with a pre-existing NAS connection still see the
+              // destination on the roadmap, but it is fully inert during
+              // beta: no onPress, no `selected` highlight (even if a
+              // stale `preferred === 'nas'` is persisted), opacity
+              // dimmed, and `disabled` so RN swallows touches. Drive
+              // remains the only pickable option. Restore original
+              // logic when the mobile NAS flow ships.
+              const isNas = opt === 'nas';
               const selected =
-                preferred === opt ||
-                (preferred === null && opt === 'drive');
+                !isNas &&
+                (preferred === opt ||
+                  (preferred === null && opt === 'drive'));
               return (
                 <Pressable
                   key={opt}
-                  onPress={() => handleSelectPreferred(opt)}
+                  onPress={
+                    isNas ? undefined : () => handleSelectPreferred(opt)
+                  }
+                  disabled={isNas}
                   style={{
                     flex: 1,
                     paddingVertical: 10,
@@ -515,6 +545,7 @@ export default function SettingsScreen() {
                     borderRadius: 6,
                     backgroundColor: selected ? '#0b2240' : '#0d1117',
                     alignItems: 'center',
+                    opacity: isNas ? 0.5 : 1,
                   }}
                 >
                   <Text
@@ -522,10 +553,23 @@ export default function SettingsScreen() {
                       color: selected ? '#58a6ff' : '#c9d1d9',
                       fontSize: 13,
                       fontWeight: '600',
+                      textAlign: 'center',
                     }}
                   >
-                    {opt === 'drive' ? 'Google Drive' : 'NAS'}
+                    {isNas ? '🗄️ NAS personal' : 'Google Drive'}
                   </Text>
+                  {isNas && (
+                    <Text
+                      style={{
+                        color: '#6e7681',
+                        fontSize: 10,
+                        marginTop: 4,
+                        textAlign: 'center',
+                      }}
+                    >
+                      Disponible después de la beta
+                    </Text>
+                  )}
                 </Pressable>
               );
             })}
