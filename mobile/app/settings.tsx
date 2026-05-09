@@ -545,6 +545,11 @@ export default function SettingsScreen() {
                     borderRadius: 6,
                     backgroundColor: selected ? '#0b2240' : '#0d1117',
                     alignItems: 'center',
+                    // Vertical centering matters because the NAS button
+                    // wraps two lines (title + "Disponible…") while
+                    // Drive has only one — without this the Drive label
+                    // sticks to the top of its taller-by-sibling box.
+                    justifyContent: 'center',
                     opacity: isNas ? 0.5 : 1,
                   }}
                 >
@@ -649,34 +654,6 @@ export default function SettingsScreen() {
         revocar el permiso en cualquier momento desde la configuración de tu
         cuenta de Google.
       </Text>
-
-      {/* NAS personal — UX-only placeholder. The backend supports NAS
-          (/destinations/nas + WebDAV adapter) but the mobile onboarding
-          flow does not exist yet, so testers cannot reach it. Surface
-          the destination honestly as "coming after the beta" instead of
-          hiding it. Not a Pressable on purpose: a disabled-looking
-          button still gets tapped and frustrates — a plain View has no
-          touch target at all. No state, no handlers, no AsyncStorage,
-          no API. Removed/promoted to a real card when the mobile flow
-          ships. */}
-      <View
-        style={{
-          marginTop: 16,
-          padding: 14,
-          borderWidth: 1,
-          borderColor: '#30363d',
-          borderRadius: 8,
-          backgroundColor: '#161b22',
-          opacity: 0.5,
-        }}
-      >
-        <Text style={{ color: '#c9d1d9', fontSize: 14, fontWeight: '600' }}>
-          🗄️ NAS personal
-        </Text>
-        <Text style={{ color: '#8b949e', fontSize: 12, marginTop: 4 }}>
-          Disponible después de la beta
-        </Text>
-      </View>
 
       {/* Modo pánico — UI-only preference. NEVER auto-records. The home
           screen reads this flag at mount and renders an "Inicio rápido
