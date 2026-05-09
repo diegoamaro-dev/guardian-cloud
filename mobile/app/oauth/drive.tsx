@@ -35,6 +35,7 @@ import {
   exchangeDriveCode,
   getConnectedDrive,
 } from '@/api/destinations';
+import { claimDriveOAuthCode } from '@/oauth/exchangeGuard';
 
 type CallbackStatus = 'idle' | 'exchanging' | 'success' | 'error';
 
@@ -70,16 +71,57 @@ export default function OAuthDriveCallback() {
 
       setStatus('exchanging');
 
+      // Module-level claim prevents the duplicate exchange call that
+      // would otherwise fire when Settings's `Linking` listener AND
+      // this dedicated screen both react to the same deep-link URL in
+      // the same JS runtime. First caller wins — the loser falls
+      // through to the existing `getConnectedDrive` confirmation path
+      // (which already covers the ex-race fallback semantics, and now
+      // is also the canonical "the other handler is doing the work"
+      // path). No HTTP exchange is started by the loser.
+      if (!claimDriveOAuthCode(code)) {
+        try {
+          const drive = await getConnectedDrive();
+          if (drive) {
+            setStatus('success');
+            return;
+          }
+          // The other handler claimed but Drive is not connected yet —
+          // it is still in flight. Brief retry window: poll a couple
+          // of times to catch the connection settling. We intentionally
+          // keep this short; a hung handshake on the other side surfaces
+          // as the existing "could not connect" error rather than an
+          // infinite spinner.
+          for (let i = 0; i < 6; i++) {
+            await new Promise((r) => setTimeout(r, 250));
+            const recheck = await getConnectedDrive();
+            if (recheck) {
+              setStatus('success');
+              return;
+            }
+          }
+          setErrorMsg(
+            'No se pudo confirmar la conexión tras la autorización. Reintenta desde Configuración.',
+          );
+          setStatus('error');
+          return;
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          setErrorMsg(`No se pudo completar la conexión: ${msg}`);
+          setStatus('error');
+          return;
+        }
+      }
+
       try {
         await exchangeDriveCode(code, undefined, state);
         setStatus('success');
         return;
       } catch (err) {
-        // Settings screen may have already consumed this code via its
-        // own Linking listener (race condition we don't try to
-        // coordinate out-of-band). If the destination is now
-        // connected, our side of the handshake is effectively done
-        // and the user experience should reflect success.
+        // We claimed the code but the exchange itself failed (network
+        // / Google rejection / backend). Best-effort confirm via
+        // `getConnectedDrive` in case the backend created the row
+        // before the response surfaced an error; otherwise propagate.
         try {
           const drive = await getConnectedDrive();
           if (drive) {

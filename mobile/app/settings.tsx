@@ -27,6 +27,7 @@ import {
   getPreferredDestinationType,
   setPreferredDestinationType,
 } from '@/destinations/preference';
+import { claimDriveOAuthCode } from '@/oauth/exchangeGuard';
 // DEV-only queue wipe — surfaced as a button at the bottom of this screen.
 // Does NOT touch auth/Drive/anything else; only Guardian Cloud queue keys.
 import { clearGuardianQueueDev } from '.';
@@ -230,6 +231,44 @@ export default function SettingsScreen() {
       if (exchangedCodesRef.current.has(code)) return;
       exchangedCodesRef.current.add(code);
 
+      // Module-level claim coordinates with the dedicated
+      // `app/oauth/drive.tsx` screen, which also reacts to this same
+      // deep link via Expo Router mounting. First caller wins — the
+      // loser MUST NOT call `exchangeDriveCode` (Google codes are
+      // single-use, the duplicate POST returns invalid_grant). The
+      // loser instead waits briefly for the winner to land the
+      // connection, then refreshes the visible state.
+      if (!claimDriveOAuthCode(code)) {
+        try {
+          setErrorMsg(null);
+          setBusy('exchanging');
+          // Short polling window: the dedicated screen's exchange is
+          // typically a single round-trip, so a few hundred ms covers
+          // the common case. We intentionally do NOT chain on a
+          // promise the other screen owns — this is a UI refresh,
+          // not coordination of the network call itself.
+          for (let i = 0; i < 6; i++) {
+            const drive = await getConnectedDrive();
+            if (drive) {
+              await refreshState();
+              return;
+            }
+            await new Promise((r) => setTimeout(r, 250));
+          }
+          // The other handler did not finish in our window. Refresh
+          // anyway so the user sees current truth — and surface a
+          // generic message (no exchange-side detail to forward,
+          // since we never started one ourselves).
+          await refreshState();
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          setErrorMsg(`No se pudo completar la conexión: ${msg}`);
+        } finally {
+          setBusy(false);
+        }
+        return;
+      }
+
       try {
         setErrorMsg(null);
         setBusy('exchanging');
@@ -237,11 +276,10 @@ export default function SettingsScreen() {
         await refreshState();
         Alert.alert('Google Drive', 'Conexión completada correctamente.');
       } catch (err) {
-        // The oauth/drive screen may have consumed this code first (race:
-        // both screens receive the same deep-link URL). Google codes are
-        // single-use — whichever side called exchange second gets
-        // invalid_grant. If Drive is now connected the handshake succeeded
-        // on the other side; reflect that here instead of showing an error.
+        // We won the claim but the exchange itself failed (network /
+        // Google / backend). Confirm against the backend in case the
+        // row was created before the response surfaced an error; if
+        // not, surface the original failure.
         try {
           const drive = await getConnectedDrive();
           if (drive) {
