@@ -212,7 +212,11 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
         // size. The adaptive icon entry up top still points to
         // `foreground.png` and is unaffected.
         image: './assets/splash-logo.png',
-        imageWidth: 300,
+        // 220 — iterated down from 360 → 260 → 220 against a OnePlus 6.
+        // 360 dominated, 260 still felt heavy; 220 lets the escudo
+        // breathe inside the Android 12+ icon area while staying
+        // clearly readable. Asset unchanged.
+        imageWidth: 220,
         resizeMode: 'contain',
       },
     ],
