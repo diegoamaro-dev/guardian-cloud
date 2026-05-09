@@ -290,16 +290,10 @@ router.post(
       const input = req.body as DriveConnectInput;
 
       if (input.action === 'start') {
-  console.log('GC_DEBUG_REDIRECT_ENV', env.GOOGLE_REDIRECT_URI);
-  console.log('GC_DEBUG_REDIRECT_INPUT', input.redirect_uri);
-
-  const authUrl = buildAuthUrl(input.state, env.GOOGLE_REDIRECT_URI!);
-
-  console.log('GC_DEBUG_AUTH_URL', authUrl);
-
-  res.status(200).json({ auth_url: authUrl, state: input.state ?? null });
-  return;
-}
+        const authUrl = buildAuthUrl(input.state, env.GOOGLE_REDIRECT_URI!);
+        res.status(200).json({ auth_url: authUrl, state: input.state ?? null });
+        return;
+      }
       // action === 'exchange'
 logger.info(
   { op: 'drive.connect.exchange', userId: req.user.id },

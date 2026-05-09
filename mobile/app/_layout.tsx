@@ -3,6 +3,7 @@ import { Stack } from 'expo-router';
 
 import { env } from '@/config/env';
 import { pingHealth } from '@/api/health';
+import { ErrorBoundary } from '@/components/ErrorBoundary';
 
 export default function RootLayout() {
   // Boot-time diagnostics. Runs ONCE on app mount.
@@ -27,5 +28,9 @@ export default function RootLayout() {
       });
   }, []);
 
-  return <Stack />;
+  return (
+    <ErrorBoundary>
+      <Stack />
+    </ErrorBoundary>
+  );
 }

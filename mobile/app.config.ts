@@ -101,6 +101,12 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
           'android.permission.FOREGROUND_SERVICE',
           'android.permission.FOREGROUND_SERVICE_MICROPHONE',
           'android.permission.WAKE_LOCK',
+          // Android 13+ requires POST_NOTIFICATIONS to be declared in the
+          // manifest before the runtime request takes effect. Without it,
+          // PermissionsAndroid.request() returns 'never_ask_again' silently
+          // and the foreground-service notification never appears, so the
+          // user has no visible signal that background protection is active.
+          'android.permission.POST_NOTIFICATIONS',
         ];
         for (const perm of requiredPerms) {
           if (!existingPerms.includes(perm)) {

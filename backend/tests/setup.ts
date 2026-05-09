@@ -15,3 +15,4 @@ process.env.LOG_LEVEL = 'fatal'; // silence pino during tests
 process.env.SUPABASE_URL = 'https://test.supabase.co';
 process.env.SUPABASE_SERVICE_ROLE_KEY = 'test-service-role-key-padding-xxxxxx';
 process.env.MAX_CHUNK_SIZE_BYTES = String(20 * 1024 * 1024);
+process.env.MOBILE_OAUTH_REDIRECT = 'guardiancloud://oauth/drive';

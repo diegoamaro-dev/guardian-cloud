@@ -46,17 +46,15 @@ const EnvSchema = z.object({
   GOOGLE_REDIRECT_URI: z.string().url().optional(),
 
   // Deep link the OAuth callback redirects to after Google's redirect
-  // lands on this backend. In Expo dev/Go this is the dev-server URL
-  // (`exp://<lan-ip>:8081/--/oauth/drive`) so the device opens the
-  // running JS bundle rather than a standalone install. In a production
-  // build it would be the app's custom scheme (`guardiancloud://oauth/drive`).
-  // Default targets the dev machine the project is currently running on
-  // so the OAuth round-trip works out of the box; override per-machine
-  // by setting MOBILE_OAUTH_REDIRECT in `.env`.
-  MOBILE_OAUTH_REDIRECT: z
-    .string()
-    .min(1)
-    .default('exp://192.168.178.21:8081/--/oauth/drive'),
+  // lands on this backend. In production this is the app's custom
+  // scheme (`guardiancloud://oauth/drive`); in Expo Dev Client it can
+  // be the dev-server URL (`exp://<lan-ip>:8081/--/oauth/drive`).
+  //
+  // Required — no default on purpose. A wrong value silently routes
+  // OAuth callbacks to a dead URL and testers get a stuck connecting
+  // screen with no recovery. Better to fail boot than to ship a
+  // personal LAN address baked in as fallback.
+  MOBILE_OAUTH_REDIRECT: z.string().min(1),
 });
 
 const parsed = EnvSchema.safeParse(process.env);
