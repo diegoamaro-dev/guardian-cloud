@@ -24,7 +24,7 @@ import {
   Text,
   View,
 } from 'react-native';
-import { router } from 'expo-router';
+import { router, Stack } from 'expo-router';
 
 import { listSessionChunks } from '@/api/export';
 import {
@@ -125,7 +125,21 @@ export default function HistoryScreen() {
   }
 
   return (
-    <View style={{ flex: 1, backgroundColor: '#0d1117', padding: 16 }}>
+    <View style={{ flex: 1, backgroundColor: '#0d1117', padding: 16, paddingTop: 48 }}>
+      {/* Hide Expo Router's default header so the screen renders only
+          the Guardian Cloud custom dark header below. The native bar
+          is what previously provided the back affordance; we replace
+          it with the same `← Volver` Pressable settings.tsx uses so
+          the user is never stranded without a visible back. Same
+          technique as the home route. */}
+      <Stack.Screen options={{ headerShown: false }} />
+      <Pressable
+        onPress={() => router.back()}
+        style={{ marginBottom: 16, alignSelf: 'flex-start' }}
+        hitSlop={12}
+      >
+        <Text style={{ color: '#8b949e', fontSize: 14 }}>← Volver</Text>
+      </Pressable>
       <Text
         style={{
           color: '#c9d1d9',

@@ -10,7 +10,7 @@ import {
 } from 'react-native';
 import * as ExpoLinking from 'expo-linking';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { router } from 'expo-router';
+import { router, Stack } from 'expo-router';
 
 import { supabase } from '@/auth/supabase';
 import { useAuthStore } from '@/auth/store';
@@ -368,6 +368,13 @@ export default function SettingsScreen() {
       style={{ flex: 1, backgroundColor: '#0d1117' }}
       contentContainerStyle={{ padding: 20, paddingTop: 48 }}
     >
+      {/* Hide Expo Router's default header so the screen renders only
+          the Guardian Cloud custom dark header below. Without this the
+          user sees two headers — the native "settings" bar plus our
+          "← Volver / Configuración" pair — which looked inconsistent
+          and added a duplicate back affordance. Same technique as the
+          home route. */}
+      <Stack.Screen options={{ headerShown: false }} />
       <Pressable
         onPress={() => router.back()}
         style={{ marginBottom: 16, alignSelf: 'flex-start' }}
