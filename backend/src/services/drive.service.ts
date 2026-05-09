@@ -22,6 +22,8 @@
  * (tokens, codes) ever appear in thrown messages or logs.
  */
 
+import { createHash } from 'node:crypto';
+
 import { AppError } from '../errors/AppError.js';
 import { env } from '../config/env.js';
 import { logger } from '../utils/logger.js';
@@ -191,8 +193,17 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** Swap a stored refresh_token for a short-lived access_token. */
-export async function getAccessToken(refreshToken: string): Promise<string> {
+/**
+ * Network refresh of a Google access token. Internal — callers should use
+ * the cached `getAccessToken` below, which falls back to this on miss /
+ * expiry / explicit invalidation. The retry/backoff for transient Google
+ * failures is owned here, NOT by the cache layer (the cache must not add
+ * another retry tier on top).
+ */
+async function _refreshFromGoogle(refreshToken: string): Promise<{
+  access_token: string;
+  expires_in: number;
+}> {
   const { clientId, clientSecret } = assertGoogleConfigured();
 
   const body = new URLSearchParams({
@@ -232,7 +243,10 @@ export async function getAccessToken(refreshToken: string): Promise<string> {
     }
 
     if (res.ok) {
-      const json = (await res.json()) as { access_token?: string };
+      const json = (await res.json()) as {
+        access_token?: string;
+        expires_in?: number;
+      };
       if (!json.access_token) {
         logger.warn(
           {
@@ -250,7 +264,14 @@ export async function getAccessToken(refreshToken: string): Promise<string> {
           'Google returned no access token',
         );
       }
-      return json.access_token;
+      return {
+        access_token: json.access_token,
+        // Default to 3600s if Google omits the field — same as observed
+        // production behaviour. The cache layer applies its own safety
+        // margin AND a hard ceiling on top, so a missing value cannot
+        // make us cache for longer than is safe.
+        expires_in: typeof json.expires_in === 'number' ? json.expires_in : 3600,
+      };
     }
 
     // Non-2xx: decide retryable vs terminal.
@@ -325,6 +346,312 @@ export async function getAccessToken(refreshToken: string): Promise<string> {
   );
 }
 
+// ===== Access-token cache (in-memory, per-process) ===========================
+//
+// Why this cache exists:
+//   `_refreshFromGoogle` makes an outbound HTTP call to oauth2.googleapis.com
+//   that typically takes 150-400 ms. The chunk-upload hot path
+//   (POST /destinations/drive/chunks) used to invoke it on every chunk —
+//   30+ token refreshes for a 1-minute audio session, 100% redundant since
+//   Google access_tokens live ~1 hour.
+//
+// Strict isolation contract (matches the project rules):
+//   - in-memory only, no DB, no Redis, no migrations
+//   - never persisted across process restarts
+//   - never logs the access_token or the raw refresh_token (the cache key
+//     is the truncated SHA-256 of the refresh_token, sized so it identifies
+//     the entry in logs but cannot be inverted to recover the secret)
+//   - if any cache operation throws, callers fall back to the uncached path
+//     transparently — the cache is a pure latency optimisation, never a
+//     correctness gate
+//   - external HTTP behaviour (status codes, response bodies, error codes)
+//     is byte-identical to the previous uncached path
+//
+// TTL strategy:
+//   Google's `expires_in` typically returns 3600 (1 hour). We subtract a
+//   5-minute safety margin so the cached token is always returned with
+//   meaningful runway before Google rejects it. We additionally cap the
+//   cached lifetime at 55 minutes regardless of how long Google says the
+//   token is good for — defence against an upstream change that returns
+//   a much longer lifetime than we are prepared to validate.
+//
+// Concurrency:
+//   Two requests from the same user racing on a cache miss would both
+//   refresh against Google, wasting one network round-trip. The slot
+//   stores either a resolved CachedToken or an in-flight Promise; the
+//   second arrival awaits the first's promise instead of starting its
+//   own. If the in-flight refresh rejects, the slot is cleared and any
+//   waiter falls through to start a fresh attempt.
+
+interface CachedToken {
+  access_token: string;
+  /** Epoch ms past which the entry is considered stale and must refresh. */
+  expires_at: number;
+}
+
+interface InFlightToken {
+  in_flight: Promise<CachedToken>;
+}
+
+type CacheValue = CachedToken | InFlightToken;
+
+const TOKEN_CACHE_SAFETY_MARGIN_MS = 5 * 60 * 1000; // 5 minutes
+const TOKEN_CACHE_MAX_TTL_MS = 55 * 60 * 1000; // hard ceiling
+const tokenCache = new Map<string, CacheValue>();
+
+function isCachedToken(v: CacheValue): v is CachedToken {
+  return 'access_token' in v;
+}
+
+/**
+ * Cache key: truncated SHA-256 of the refresh_token. Hashing makes the
+ * key safe to put in logs and prevents accidental token leakage; truncating
+ * keeps log lines short while leaving enough entropy that collisions are
+ * astronomically unlikely for any realistic user count.
+ */
+function tokenCacheKey(refreshToken: string): string {
+  return createHash('sha256').update(refreshToken).digest('hex').substring(0, 32);
+}
+
+/**
+ * Public cache-aware wrapper around `_refreshFromGoogle`. Same external
+ * signature as the previous uncached `getAccessToken` so call sites do
+ * not change. On any cache failure (key computation throw, Map.set/get
+ * throw, slot found in unexpected state) this falls back to a direct
+ * `_refreshFromGoogle` call so a buggy cache layer can never block the
+ * chunk-upload path.
+ */
+export async function getAccessToken(refreshToken: string): Promise<string> {
+  let key: string;
+  try {
+    key = tokenCacheKey(refreshToken);
+  } catch (err) {
+    // Cache key computation failed — fall back to the uncached path.
+    logger.warn(
+      { op: 'getAccessToken', reason: err instanceof Error ? err.message : String(err) },
+      'DRIVE_TOKEN_CACHE_FALLBACK',
+    );
+    const fresh = await _refreshFromGoogle(refreshToken);
+    return fresh.access_token;
+  }
+  const keyShort = key.substring(0, 12);
+
+  // Cache lookup. Wrapped in try/catch so a Map error cannot drag the
+  // request down.
+  let cached: CacheValue | undefined;
+  try {
+    cached = tokenCache.get(key);
+  } catch {
+    cached = undefined;
+  }
+
+  if (cached) {
+    if (isCachedToken(cached)) {
+      if (cached.expires_at > Date.now()) {
+        logger.info(
+          { op: 'getAccessToken', cache: 'hit', key_short: keyShort },
+          'DRIVE_TOKEN_CACHE',
+        );
+        return cached.access_token;
+      }
+      // Expired — fall through to refresh; clean the stale slot first
+      // so a concurrent caller does not also see it.
+      try {
+        tokenCache.delete(key);
+      } catch {
+        /* swallow */
+      }
+    } else {
+      // Concurrent in-flight refresh — share its promise.
+      logger.info(
+        { op: 'getAccessToken', cache: 'in_flight', key_short: keyShort },
+        'DRIVE_TOKEN_CACHE',
+      );
+      try {
+        const shared = await cached.in_flight;
+        return shared.access_token;
+      } catch {
+        // The in-flight refresh failed. Fall through to start a fresh
+        // attempt; the original promise's catch already cleared the slot.
+      }
+    }
+  }
+
+  // Cache miss / expired / failed in-flight. Start a refresh and install
+  // the in-flight slot synchronously (no awaits between this `set` and
+  // the caller's await) so concurrent callers see it.
+  const t_start = Date.now();
+  const promise = (async (): Promise<CachedToken> => {
+    const fresh = await _refreshFromGoogle(refreshToken);
+    const expires_in_ms = Math.max(0, fresh.expires_in * 1000);
+    const ttl_ms = Math.min(
+      Math.max(0, expires_in_ms - TOKEN_CACHE_SAFETY_MARGIN_MS),
+      TOKEN_CACHE_MAX_TTL_MS,
+    );
+    return {
+      access_token: fresh.access_token,
+      expires_at: Date.now() + ttl_ms,
+    };
+  })();
+  try {
+    tokenCache.set(key, { in_flight: promise });
+  } catch {
+    // If the set throws we still await our own promise — the
+    // single-flight benefit is lost for this call but correctness holds.
+  }
+
+  let result: CachedToken;
+  try {
+    result = await promise;
+  } catch (err) {
+    // Refresh failed. Clean up the in-flight slot so subsequent calls
+    // retry from scratch. We only delete OUR slot — concurrent callers
+    // that arrive after the failure will install their own.
+    try {
+      const current = tokenCache.get(key);
+      if (current && !isCachedToken(current) && current.in_flight === promise) {
+        tokenCache.delete(key);
+      }
+    } catch {
+      /* swallow */
+    }
+    throw err;
+  }
+
+  // Promote in-flight → resolved value. Guard against the slot having
+  // been overwritten or invalidated while we were awaiting (rare).
+  try {
+    const current = tokenCache.get(key);
+    if (current && !isCachedToken(current) && current.in_flight === promise) {
+      tokenCache.set(key, result);
+    }
+  } catch {
+    /* swallow */
+  }
+
+  logger.info(
+    {
+      op: 'getAccessToken',
+      cache: 'miss',
+      key_short: keyShort,
+      refresh_ms: Date.now() - t_start,
+      ttl_ms: result.expires_at - Date.now(),
+    },
+    'DRIVE_TOKEN_CACHE',
+  );
+
+  return result.access_token;
+}
+
+/**
+ * Drop any cached entry for `refreshToken`. Called by `withDriveRetry`
+ * after Drive responds 401, on the assumption that the cached
+ * access_token has been invalidated server-side (token revoked, scope
+ * changed, etc.). The next `getAccessToken` for the same refresh_token
+ * will refresh against Google.
+ *
+ * Idempotent and silent: deleting a missing entry is a no-op. Logged so
+ * an operator can trace cause/effect when chasing a 401 storm.
+ */
+export function invalidateAccessToken(refreshToken: string): void {
+  let key: string;
+  try {
+    key = tokenCacheKey(refreshToken);
+  } catch {
+    return;
+  }
+  let had = false;
+  try {
+    had = tokenCache.delete(key);
+  } catch {
+    /* swallow */
+  }
+  if (had) {
+    logger.info(
+      { op: 'invalidateAccessToken', key_short: key.substring(0, 12), reason: '401' },
+      'DRIVE_TOKEN_INVALIDATE',
+    );
+  }
+}
+
+/**
+ * True if `err` is the synthetic `DRIVE_AUTH_EXPIRED` AppError raised by
+ * the Drive helpers below when Google returns 401. Used by
+ * `withDriveRetry` to decide whether to invalidate + retry vs propagate.
+ */
+export function isDriveAuthExpired(err: unknown): boolean {
+  return err instanceof AppError && err.code === 'DRIVE_AUTH_EXPIRED';
+}
+
+/**
+ * Diagnostic metrics populated by `withDriveRetry` for the route-level
+ * timing log. Optional — passing `undefined` means the wrapper still
+ * works, callers just lose the per-leg timings.
+ */
+export interface DriveRetryMetrics {
+  /** Wall-clock ms spent inside the FIRST `getAccessToken` call. */
+  token_ms: number;
+  /** True if the closure was retried after a `DRIVE_AUTH_EXPIRED`. */
+  retried: boolean;
+  /**
+   * Wall-clock ms spent inside the SECOND `getAccessToken` call, only
+   * populated when `retried === true`. Useful for telling apart "cached
+   * token went stale" (small ms) from "refresh_token was revoked
+   * server-side" (full Google round-trip ms).
+   */
+  retry_token_ms?: number;
+}
+
+/**
+ * Run `fn(accessToken)` against a freshly-resolved access token. If the
+ * Drive call inside throws `DRIVE_AUTH_EXPIRED` (Google 401), invalidate
+ * the cache, refresh once, and retry exactly once with the new token.
+ * Any further failure — including a second `DRIVE_AUTH_EXPIRED` —
+ * propagates unchanged. There is no third attempt, no exponential
+ * backoff, no loop. Comportamiento externo idéntico al flujo previo en
+ * todo lo demás.
+ */
+export async function withDriveRetry<T>(
+  refreshToken: string,
+  fn: (accessToken: string) => Promise<T>,
+  metrics?: DriveRetryMetrics,
+): Promise<T> {
+  const t_token = Date.now();
+  let token = await getAccessToken(refreshToken);
+  if (metrics) {
+    metrics.token_ms = Date.now() - t_token;
+    metrics.retried = false;
+  }
+  try {
+    return await fn(token);
+  } catch (err) {
+    if (!isDriveAuthExpired(err)) throw err;
+    invalidateAccessToken(refreshToken);
+    const t_retry = Date.now();
+    token = await getAccessToken(refreshToken);
+    if (metrics) {
+      metrics.retried = true;
+      metrics.retry_token_ms = Date.now() - t_retry;
+    }
+    logger.info(
+      { op: 'withDriveRetry', retried_after_401: true },
+      'DRIVE_TOKEN_RETRY',
+    );
+    return await fn(token);
+  }
+}
+
+/** Test-only seam: clear the entire cache. Intentionally NOT used by
+ *  production code paths. Exported so unit tests can isolate cases
+ *  across `vi.resetModules` boundaries when needed. */
+export function _resetAccessTokenCacheForTests(): void {
+  try {
+    tokenCache.clear();
+  } catch {
+    /* swallow */
+  }
+}
+
 interface UserInfo {
   email?: string;
   sub?: string;
@@ -350,6 +677,16 @@ async function driveGet<T>(accessToken: string, path: string): Promise<T> {
   });
   if (!res.ok) {
     const detail = await res.text().catch(() => '<no body>');
+    if (res.status === 401) {
+      // 401 from Drive means the access_token has been invalidated
+      // server-side. Distinct code so `withDriveRetry` can detect this
+      // exact failure mode and refresh+retry once instead of propagating.
+      throw new AppError(
+        401,
+        'DRIVE_AUTH_EXPIRED',
+        `Drive API GET ${path} 401 (access token rejected)`,
+      );
+    }
     throw new AppError(
       502,
       'DRIVE_API_FAILED',
@@ -374,6 +711,13 @@ async function drivePost<T>(
   });
   if (!res.ok) {
     const detail = await res.text().catch(() => '<no body>');
+    if (res.status === 401) {
+      throw new AppError(
+        401,
+        'DRIVE_AUTH_EXPIRED',
+        `Drive API POST ${path} 401 (access token rejected)`,
+      );
+    }
     throw new AppError(
       502,
       'DRIVE_API_FAILED',
@@ -517,6 +861,13 @@ export async function uploadFile(
       },
       'Drive upload failed',
     );
+    if (res.status === 401) {
+      throw new AppError(
+        401,
+        'DRIVE_AUTH_EXPIRED',
+        'Drive upload 401 (access token rejected)',
+      );
+    }
     throw new AppError(
       502,
       'DRIVE_UPLOAD_FAILED',
@@ -594,6 +945,13 @@ export async function downloadFile(
       },
       'Drive download failed',
     );
+    if (res.status === 401) {
+      throw new AppError(
+        401,
+        'DRIVE_AUTH_EXPIRED',
+        'Drive download 401 (access token rejected)',
+      );
+    }
     throw new AppError(
       502,
       'DRIVE_DOWNLOAD_FAILED',

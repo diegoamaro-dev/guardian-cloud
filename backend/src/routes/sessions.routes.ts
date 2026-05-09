@@ -29,7 +29,7 @@ import {
 } from '../services/sessions.service.js';
 import { listChunksForSession } from '../services/chunks.service.js';
 import { getDestinationWithSecretForUser } from '../services/destinations.service.js';
-import { downloadFile, getAccessToken } from '../services/drive.service.js';
+import { downloadFile, withDriveRetry } from '../services/drive.service.js';
 import { downloadChunk as webdavDownloadChunk } from '../adapters/webdav.adapter.js';
 import { logger } from '../utils/logger.js';
 
@@ -324,8 +324,19 @@ router.get(
             'No connected Google Drive destination for this user',
           );
         }
-        const accessToken = await getAccessToken(dest.refresh_token);
-        bytes = await downloadFile(accessToken, chunk.remote_reference);
+        // Capture into a local so TypeScript keeps the non-null narrowing
+        // from the `!chunk.remote_reference` guard above through the
+        // closure (object-property narrowing is not preserved across an
+        // async arrow body).
+        const remoteReference = chunk.remote_reference;
+        // Token via cache, plus a single retry-after-401 in case the
+        // cached access_token has been invalidated server-side. Same
+        // semantics as POST /destinations/drive/chunks; behaviour
+        // outside the rare 401 case is byte-identical to the previous
+        // uncached path.
+        bytes = await withDriveRetry(dest.refresh_token, async (accessToken) =>
+          downloadFile(accessToken, remoteReference),
+        );
       }
 
       logger.info(

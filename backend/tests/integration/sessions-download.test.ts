@@ -94,6 +94,20 @@ vi.mock('../../src/adapters/webdav.adapter.js', () => ({
 vi.mock('../../src/services/drive.service.js', () => ({
   downloadFile: driveDownloadMock,
   getAccessToken: driveAccessTokenMock,
+  // Thin pass-through stub for the retry wrapper added in the access-token
+  // cache work. The route under test went from `getAccessToken` + direct
+  // `downloadFile` to `withDriveRetry(refresh_token, fn)`; the wrapper
+  // resolves the token via the cache and runs `fn(token)` once. The test
+  // does not exercise the retry-after-401 path, so a no-retry pass-through
+  // keeps the existing assertions on `driveAccessTokenMock` and
+  // `driveDownloadMock` valid.
+  withDriveRetry: async (
+    refreshToken: string,
+    fn: (token: string) => unknown,
+  ) => {
+    const token = await driveAccessTokenMock(refreshToken);
+    return fn(token);
+  },
 }));
 
 const { createApp } = await import('../../src/app.js');

@@ -57,6 +57,8 @@ import {
   getUserInfo,
   ROOT_FOLDER_NAME,
   uploadFile,
+  withDriveRetry,
+  type DriveRetryMetrics,
 } from '../services/drive.service.js';
 import { uploadChunk as webdavUploadChunk } from '../adapters/webdav.adapter.js';
 import { encryptWebdavPassword } from '../security/webdavCredentials.js';
@@ -406,32 +408,36 @@ router.post(
         );
       }
 
-      const accessToken = await getAccessToken(dest.refresh_token);
-
-      // If the stored folder went missing (user deleted it by hand), we
-      // transparently recreate it. Without this, the first test-upload
-      // after such a deletion would fail — breaking the user's ability
-      // to re-prove the connection.
-      const folderId = dest.folder_id ?? (await ensureRootFolder(accessToken));
-      if (!dest.folder_id) {
-        await upsertDestination(req.user.id, 'drive', { folder_id: folderId });
-      }
-
+      const userId = req.user.id;
+      const cachedFolderId = dest.folder_id;
       const fileName = `guardian-cloud-test-${new Date()
         .toISOString()
         .replace(/[:.]/g, '-')}.txt`;
       const payload = Buffer.from(
-        `Guardian Cloud test upload\nuser_id=${req.user.id}\nts=${new Date().toISOString()}\n`,
+        `Guardian Cloud test upload\nuser_id=${userId}\nts=${new Date().toISOString()}\n`,
         'utf8',
       );
 
-      const result = await uploadFile(
-        accessToken,
-        folderId,
-        fileName,
-        payload,
-        'text/plain; charset=utf-8',
-      );
+      // Same retry-on-401 pattern as POST /drive/chunks: token via cache,
+      // and if Drive rejects it (rare but possible after manual revoke),
+      // invalidate + refresh + retry the closure exactly once.
+      const result = await withDriveRetry(dest.refresh_token, async (accessToken) => {
+        // If the stored folder went missing (user deleted it by hand), we
+        // transparently recreate it. Without this, the first test-upload
+        // after such a deletion would fail — breaking the user's ability
+        // to re-prove the connection.
+        const folderId = cachedFolderId ?? (await ensureRootFolder(accessToken));
+        if (!cachedFolderId) {
+          await upsertDestination(userId, 'drive', { folder_id: folderId });
+        }
+        return await uploadFile(
+          accessToken,
+          folderId,
+          fileName,
+          payload,
+          'text/plain; charset=utf-8',
+        );
+      });
 
       res.status(200).json({
         ok: true,
@@ -556,6 +562,16 @@ router.post(
     let phase: string = 'enter';
     let sessionIdLog: string | undefined;
     let chunkIndexLog: number | undefined;
+    // Wall-clock instrumentation for the unified DRIVE_CHUNK_UPLOAD_SUCCESS
+    // log. Each leg is timed independently so an operator can attribute
+    // a slow chunk to (token refresh) vs (Drive find) vs (Drive upload)
+    // without diffing two log lines. `driveMetrics` is populated by
+    // `withDriveRetry`; the find/upload counters live here because
+    // they are inside the closure.
+    const t_total = Date.now();
+    let find_existing_ms = 0;
+    let drive_upload_ms = 0;
+    const driveMetrics: DriveRetryMetrics = { token_ms: 0, retried: false };
     try {
       if (!req.user) throw new UnauthorizedError();
 
@@ -691,57 +707,108 @@ router.post(
         );
       }
 
+      // Token-and-Drive operations live inside `withDriveRetry`: the
+      // wrapper resolves the access_token via the cache (instant on a
+      // hit, ~150-400ms on a miss) and, if any Drive call below replies
+      // 401 (DRIVE_AUTH_EXPIRED), invalidates the cache and re-runs the
+      // closure exactly once with a freshly-refreshed token. No second
+      // retry, no loop. `phase` is updated inside the closure so the
+      // failure log still names the exact step that blew up.
       phase = 'token_refresh';
-      const accessToken = await getAccessToken(dest.refresh_token);
+      const userId = req.user.id;
+      const refreshToken = dest.refresh_token;
+      const cachedFolderId = dest.folder_id;
+      const result = await withDriveRetry(
+        refreshToken,
+        async (accessToken) => {
+          // Self-heal: if the stored folder is missing (user deleted it
+          // by hand), recreate and persist. Same pattern as
+          // /drive/test-upload.
+          phase = 'ensure_folder';
+          const folderId = cachedFolderId ?? (await ensureRootFolder(accessToken));
+          if (!cachedFolderId) {
+            await upsertDestination(userId, 'drive', { folder_id: folderId });
+          }
 
-      // Self-heal: if the stored folder is missing (user deleted it by
-      // hand), recreate and persist. Same pattern as /drive/test-upload.
-      phase = 'ensure_folder';
-      const folderId = dest.folder_id ?? (await ensureRootFolder(accessToken));
-      if (!dest.folder_id) {
-        await upsertDestination(req.user.id, 'drive', { folder_id: folderId });
-      }
+          // --- 7) Deterministic filename — part of the idempotency contract.
+          // Full path in Drive: /GuardianCloud/{session_id}_{NNNNNN}_{hash12}.chunk
+          const paddedIndex = String(chunkIndex).padStart(6, '0');
+          const shortHash = hash.slice(0, 12);
+          const fileName = `${sessionId}_${paddedIndex}_${shortHash}.chunk`;
 
-      // --- 7) Deterministic filename — part of the idempotency contract.
-      // Full path in Drive: /GuardianCloud/{session_id}_{NNNNNN}_{hash12}.chunk
-      const paddedIndex = String(chunkIndex).padStart(6, '0');
-      const shortHash = hash.slice(0, 12);
-      const fileName = `${sessionId}_${paddedIndex}_${shortHash}.chunk`;
+          // --- 8) Layer 2 dedupe — same filename already exists in Drive.
+          phase = 'drive_dedup_lookup';
+          const t_find = Date.now();
+          const existingInDrive = await findFileByName(
+            accessToken,
+            folderId,
+            fileName,
+          );
+          // `+=` so a retry-after-401 accumulates instead of overwriting,
+          // matching how an operator would compute "total Drive work".
+          find_existing_ms += Date.now() - t_find;
+          if (existingInDrive) {
+            return {
+              remote_reference: existingInDrive,
+              dedup: 'drive' as const,
+            };
+          }
 
-      // --- 8) Layer 2 dedupe — same filename already exists in Drive.
-      phase = 'drive_dedup_lookup';
-      const existingInDrive = await findFileByName(accessToken, folderId, fileName);
-      if (existingInDrive) {
+          // --- 9) Actual upload.
+          phase = 'drive_upload';
+          const t_upload = Date.now();
+          const uploaded = await uploadFile(
+            accessToken,
+            folderId,
+            fileName,
+            body,
+            'application/octet-stream',
+          );
+          drive_upload_ms += Date.now() - t_upload;
+          return {
+            remote_reference: uploaded.file_id,
+            dedup: null,
+          };
+        },
+        driveMetrics,
+      );
+
+      const totalMs = Date.now() - t_total;
+
+      if (result.dedup === 'drive') {
         logger.info(
-          { op: 'drive.chunks.upload', sessionId, chunkIndex, dedup: 'drive' },
+          {
+            op: 'drive.chunks.upload',
+            sessionId,
+            chunkIndex,
+            dedup: 'drive',
+            total_ms: totalMs,
+            token_ms: driveMetrics.token_ms,
+            find_existing_ms,
+            drive_upload_ms: 0,
+            retried_after_401: driveMetrics.retried,
+          },
           'chunk dedup via Drive name',
         );
-        res.status(200).json({ remote_reference: existingInDrive, dedup: 'drive' });
-        return;
+      } else {
+        logger.info(
+          {
+            op: 'drive.chunks.upload',
+            sessionId,
+            chunkIndex,
+            size: body.length,
+            file_id: result.remote_reference,
+            total_ms: totalMs,
+            token_ms: driveMetrics.token_ms,
+            find_existing_ms,
+            drive_upload_ms,
+            retried_after_401: driveMetrics.retried,
+          },
+          'DRIVE_CHUNK_UPLOAD_SUCCESS',
+        );
       }
 
-      // --- 9) Actual upload.
-      phase = 'drive_upload';
-      const result = await uploadFile(
-        accessToken,
-        folderId,
-        fileName,
-        body,
-        'application/octet-stream',
-      );
-
-      logger.info(
-        {
-          op: 'drive.chunks.upload',
-          sessionId,
-          chunkIndex,
-          size: body.length,
-          file_id: result.file_id,
-        },
-        'DRIVE_CHUNK_UPLOAD_SUCCESS',
-      );
-
-      res.status(200).json({ remote_reference: result.file_id, dedup: null });
+      res.status(200).json(result);
     } catch (err) {
       // Unified failure log. Names the phase, the error class, and (for
       // AppError) the stable code/status — so the mobile-side detail log
