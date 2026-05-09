@@ -39,6 +39,7 @@ import { getFreshAccessToken } from '@/auth/store';
 import { apiFetch, ApiError } from './client';
 import { type DestinationType } from './destinations';
 import { type SessionMode } from './history';
+import { log, error } from '@/utils/log';
 
 /**
  * DEBUG-only: simulate a corrupted download for the chunk whose
@@ -204,7 +205,7 @@ export async function downloadChunk(
   const path = `/sessions/${encodeURIComponent(sessionId)}/chunks/${chunkIndex}/download`;
   const token = await getFreshAccessToken();
   if (!token) {
-    console.log('AUTH MISSING', { path });
+    log('AUTH MISSING', { path });
     throw new ApiError(401, 'NO_TOKEN', 'No access token in store', null);
   }
 
@@ -212,7 +213,7 @@ export async function downloadChunk(
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   const url = `${env.apiUrl}${path}`;
-  console.log('API CALL', { method: 'GET', url, authed: true });
+  log('API CALL', { method: 'GET', url, authed: true });
   let response: Response;
   try {
     response = await fetch(url, {
@@ -295,13 +296,13 @@ export async function exportSession(
    */
   mode?: SessionMode,
 ): Promise<ExportResult> {
-  console.log('EXPORT START', { sessionId, mode });
+  log('EXPORT START', { sessionId, mode });
 
   let chunks: ChunkMeta[];
   try {
     chunks = await listSessionChunks(sessionId);
   } catch (err) {
-    console.log('EXPORT ERROR', {
+    error('EXPORT ERROR', {
       sessionId,
       phase: 'list',
       err: err instanceof Error ? err.message : String(err),
@@ -321,7 +322,7 @@ export async function exportSession(
     .sort((a, b) => a.chunk_index - b.chunk_index);
 
   if (uploaded.length === 0) {
-    console.log('EXPORT ERROR', {
+    error('EXPORT ERROR', {
       sessionId,
       phase: 'filter',
       reason: 'no_uploaded_chunks',
@@ -348,7 +349,7 @@ export async function exportSession(
 
   const docDir = FileSystem.documentDirectory;
   if (!docDir) {
-    console.log('EXPORT ERROR', {
+    error('EXPORT ERROR', {
       sessionId,
       phase: 'filesystem',
       reason: 'no_document_directory',
@@ -403,7 +404,7 @@ export async function exportSession(
     // this is just the boundary observation.
     if (!meta) {
       stoppedAt = idx;
-      console.log('EXPORT STOPPED AT GAP', {
+      log('EXPORT STOPPED AT GAP', {
         sessionId,
         atIndex: idx,
         reason: 'missing',
@@ -425,7 +426,7 @@ export async function exportSession(
         bytes.length > 0
       ) {
         bytes[0] = (bytes[0]! ^ 0xff) & 0xff;
-        console.log('GC_EXPORT_DEBUG_CORRUPTED_CHUNK', {
+        log('GC_EXPORT_DEBUG_CORRUPTED_CHUNK', {
           sessionId,
           chunkIndex: idx,
         });
@@ -435,14 +436,14 @@ export async function exportSession(
 
       // (b) Hash mismatch — record this index as corrupt and stop.
       if (!ok) {
-        console.log('EXPORT CHUNK CORRUPT', {
+        error('EXPORT CHUNK CORRUPT', {
           sessionId,
           chunkIndex: idx,
           expected: meta.hash,
           headerHash,
           reason: 'hash_mismatch',
         });
-        console.log('GC_EXPORT_HASH_MISMATCH', {
+        error('GC_EXPORT_HASH_MISMATCH', {
           sessionId,
           chunkIndex: idx,
           expected: meta.hash,
@@ -451,7 +452,7 @@ export async function exportSession(
         });
         corruptIndexes.push(idx);
         stoppedAt = idx;
-        console.log('EXPORT STOPPED AT GAP', {
+        log('EXPORT STOPPED AT GAP', {
           sessionId,
           atIndex: idx,
           reason: 'hash_mismatch',
@@ -462,7 +463,7 @@ export async function exportSession(
       accumulated.push(bytes);
       validChunks += 1;
 
-      console.log('EXPORT CHUNK DOWNLOADED', {
+      log('EXPORT CHUNK DOWNLOADED', {
         sessionId,
         chunkIndex: idx,
         size: bytes.length,
@@ -470,7 +471,7 @@ export async function exportSession(
     } catch (err) {
       // (c) Download failure — record and stop.
       const msg = err instanceof Error ? err.message : String(err);
-      console.log('EXPORT CHUNK CORRUPT', {
+      error('EXPORT CHUNK CORRUPT', {
         sessionId,
         chunkIndex: idx,
         reason: 'download_failed',
@@ -478,7 +479,7 @@ export async function exportSession(
       });
       corruptIndexes.push(idx);
       stoppedAt = idx;
-      console.log('EXPORT STOPPED AT GAP', {
+      log('EXPORT STOPPED AT GAP', {
         sessionId,
         atIndex: idx,
         reason: 'download_failed',
@@ -489,7 +490,7 @@ export async function exportSession(
 
   onProgress?.({ total: totalChunks, done: validChunks, currentIndex: -1 });
 
-  console.log('EXPORT PREFIX SUMMARY', {
+  log('EXPORT PREFIX SUMMARY', {
     sessionId,
     totalChunks,
     validChunks,
@@ -498,7 +499,7 @@ export async function exportSession(
   });
 
   if (validChunks === 0) {
-    console.log('EXPORT ERROR', {
+    error('EXPORT ERROR', {
       sessionId,
       phase: 'concat',
       reason: 'no_valid_chunks',
@@ -554,7 +555,7 @@ export async function exportSession(
       extension = hasFtyp ? '.m4a' : hasAacSync ? '.aac' : '.bin';
     }
     filePath = `${docDir}guardian_export_${sessionId}${extension}`;
-    console.log('EXPORT EXT SNIFF', {
+    log('EXPORT EXT SNIFF', {
       sessionId,
       extension,
       mode,
@@ -567,7 +568,7 @@ export async function exportSession(
       encoding: FileSystem.EncodingType.Base64,
     });
   } catch (err) {
-    console.log('EXPORT ERROR', {
+    error('EXPORT ERROR', {
       sessionId,
       phase: 'write_final',
       err: err instanceof Error ? err.message : String(err),
@@ -592,7 +593,7 @@ export async function exportSession(
   // the concatenated bytes as a forensic dump and surface "parcial" in
   // the UI. A future pass could reconstruct or patch the moov atom.
 
-  console.log(isComplete ? 'EXPORT COMPLETE' : 'EXPORT PARTIAL', {
+  log(isComplete ? 'EXPORT COMPLETE' : 'EXPORT PARTIAL', {
     sessionId,
     filePath,
     totalChunks,
@@ -601,7 +602,7 @@ export async function exportSession(
     corruptIndexes,
   });
 
-  console.log('GC_EXPORT_RESULT', {
+  log('GC_EXPORT_RESULT', {
     sessionId,
     status,
     filePath,

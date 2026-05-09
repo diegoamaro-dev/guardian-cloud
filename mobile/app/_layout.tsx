@@ -4,6 +4,7 @@ import { Stack } from 'expo-router';
 import { env } from '@/config/env';
 import { pingHealth } from '@/api/health';
 import { ErrorBoundary } from '@/components/ErrorBoundary';
+import { installGlobalErrorHandler } from '@/utils/log';
 
 export default function RootLayout() {
   // Boot-time diagnostics. Runs ONCE on app mount.
@@ -15,6 +16,11 @@ export default function RootLayout() {
   //   - HEALTH probe is a fire-and-forget GET /health. Logs API OK on
   //     success, API UNREACHABLE on any throw. Independent of auth.
   useEffect(() => {
+    // Global error handler — funnels uncaught throws / unhandled
+    // rejections to console.error so they survive release builds.
+    // Chained, NOT swallowing — RN's default behaviour still fires.
+    installGlobalErrorHandler();
+
     console.log('ENV STARTUP', { apiUrl: env.apiUrl });
     pingHealth()
       .then((res) => {

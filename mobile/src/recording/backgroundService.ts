@@ -43,6 +43,8 @@ import BackgroundActions, {
   type BackgroundTaskOptions,
 } from 'react-native-background-actions';
 
+import { log, error } from '@/utils/log';
+
 const TASK_NAME = 'guardian-cloud-evidence';
 const NOTIFICATION_TITLE = 'Guardian Cloud';
 const NOTIFICATION_TEXT = 'Guardian Cloud está protegiendo tu evidencia';
@@ -88,11 +90,11 @@ function makeTaskBody(
 ): () => Promise<void> {
   return async () => {
     while (BackgroundActions.isRunning()) {
-      console.log('GC_BACKGROUND_UPLOAD_TICK', { ts: Date.now() });
+      log('GC_BACKGROUND_UPLOAD_TICK', { ts: Date.now() });
       try {
         await cb.drain();
       } catch (err) {
-        console.log('GC_BACKGROUND_UPLOAD_ERROR', {
+        error('GC_BACKGROUND_UPLOAD_ERROR', {
           err: err instanceof Error ? err.message : String(err),
         });
       }
@@ -102,7 +104,7 @@ function makeTaskBody(
       // signal (a recording with zero emitted chunks yet would
       // otherwise look like "no work" to the queue check).
       if (cb.isRecordingActive()) {
-        console.log('GC_BACKGROUND_SERVICE_KEEPALIVE', {
+        log('GC_BACKGROUND_SERVICE_KEEPALIVE', {
           reason: 'recording_active',
         });
       } else {
@@ -114,18 +116,18 @@ function makeTaskBody(
           // the service (we'd lose background lifetime over a transient
           // AsyncStorage hiccup). Treat as "still work" until proven
           // otherwise. The next tick will re-check.
-          console.log('GC_BACKGROUND_UPLOAD_ERROR', {
+          error('GC_BACKGROUND_UPLOAD_ERROR', {
             phase: 'pending_check',
             err: err instanceof Error ? err.message : String(err),
           });
           pending = true;
         }
         if (pending) {
-          console.log('GC_BACKGROUND_SERVICE_KEEPALIVE', {
+          log('GC_BACKGROUND_SERVICE_KEEPALIVE', {
             reason: 'pending_uploads',
           });
         } else {
-          console.log('GC_BACKGROUND_SERVICE_STOP', {
+          log('GC_BACKGROUND_SERVICE_STOP', {
             reason: 'no_pending_work',
           });
           break;
@@ -207,7 +209,7 @@ async function ensureNotificationPermission(): Promise<boolean> {
     // Older react-native that doesn't surface the constant — surface
     // a log so the operator can see why we skipped, then optimistically
     // proceed.
-    console.log('GC_BACKGROUND_UPLOAD_ERROR', {
+    error('GC_BACKGROUND_UPLOAD_ERROR', {
       phase: 'notif_permission_constant_missing',
     });
     return true;
@@ -217,14 +219,14 @@ async function ensureNotificationPermission(): Promise<boolean> {
     if (already) return true;
     const result = await PermissionsAndroid.request(perm);
     const granted = result === PermissionsAndroid.RESULTS.GRANTED;
-    console.log('GC_BACKGROUND_NOTIF_PERMISSION', {
+    log('GC_BACKGROUND_NOTIF_PERMISSION', {
       requested: true,
       result,
       granted,
     });
     return granted;
   } catch (err) {
-    console.log('GC_BACKGROUND_UPLOAD_ERROR', {
+    error('GC_BACKGROUND_UPLOAD_ERROR', {
       phase: 'notif_permission_request',
       err: err instanceof Error ? err.message : String(err),
     });
@@ -256,18 +258,18 @@ export async function startBackgroundProtection(
   // and the next recording / pending-upload window has no background
   // protection at all.
   if (isRunning && BackgroundActions.isRunning()) {
-    console.log('GC_BACKGROUND_UPLOAD_START', { skipped: 'already_running' });
+    log('GC_BACKGROUND_UPLOAD_START', { skipped: 'already_running' });
     return true;
   }
   if (isRunning) {
     // Drift detected — reset and fall through to a fresh start so
     // background protection actually exists for the next tick.
-    console.log('GC_BACKGROUND_UPLOAD_START', { reset: 'flag_drift_detected' });
+    log('GC_BACKGROUND_UPLOAD_START', { reset: 'flag_drift_detected' });
     isRunning = false;
   }
   const notifGranted = await ensureNotificationPermission();
   cb.onPostNotificationsResult?.(notifGranted);
-  console.log('GC_BACKGROUND_UPLOAD_START', {
+  log('GC_BACKGROUND_UPLOAD_START', {
     platform: Platform.OS,
     interval_ms: TICK_INTERVAL_MS,
     notif_permission_granted: notifGranted,
@@ -275,13 +277,13 @@ export async function startBackgroundProtection(
   try {
     await BackgroundActions.start(makeTaskBody(cb), baseOptions);
     isRunning = true;
-    console.log('GC_BACKGROUND_UPLOAD_STARTED', {
+    log('GC_BACKGROUND_UPLOAD_STARTED', {
       ok: true,
       lib_isRunning: BackgroundActions.isRunning(),
     });
     return true;
   } catch (err) {
-    console.log('GC_BACKGROUND_UPLOAD_ERROR', {
+    error('GC_BACKGROUND_UPLOAD_ERROR', {
       phase: 'start',
       err: err instanceof Error ? err.message : String(err),
       stack: err instanceof Error ? err.stack : undefined,
@@ -305,13 +307,13 @@ export async function stopBackgroundProtection(reason: string): Promise<void> {
   try {
     await BackgroundActions.stop();
   } catch (err) {
-    console.log('GC_BACKGROUND_UPLOAD_ERROR', {
+    error('GC_BACKGROUND_UPLOAD_ERROR', {
       phase: 'stop',
       err: err instanceof Error ? err.message : String(err),
     });
   } finally {
     isRunning = false;
-    console.log('GC_BACKGROUND_SERVICE_STOP', { reason });
+    log('GC_BACKGROUND_SERVICE_STOP', { reason });
   }
 }
 
