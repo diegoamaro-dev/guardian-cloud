@@ -3786,14 +3786,44 @@ export default function Index() {
         await new Promise(r => setTimeout(r, 500));
         setTestStatus(`API URL: ${env.apiUrl}`);
         await new Promise(r => setTimeout(r, 50));
-        const { error: authError } = await supabase.auth.signInWithPassword({
-          email: 'diego@hotmail.com',
-          password: 'Diegoou96.',
-        });
-        if (authError) {
-          setTestStatus('Necesitas iniciar sesión');
-          console.log('ERROR AUTH:', authError);
-          return;
+        // Auth bootstrap — anonymous Supabase user per device. Each
+        // install gets its own distinct auth.users.id, so the existing
+        // server-side `user_id` filters on destinations / sessions /
+        // chunks isolate every user cleanly. No literal credentials in
+        // the bundle.
+        //
+        // Sentinel cleanup: APKs shipped before this fix auto-logged
+        // in as a hardcoded creator account. If we still see that
+        // session persisted in AsyncStorage, force a signOut so the
+        // anon branch below creates a fresh per-device user and the
+        // device stops impersonating the creator. The email literal is
+        // NOT a secret — it was already public in older bundles — but
+        // it is the only reliable signal we can pivot off to detect
+        // and purge those legacy sessions on app update.
+        const HARDCODED_LEGACY_EMAIL = 'diego@hotmail.com';
+        const existingSession = (await supabase.auth.getSession()).data
+          .session;
+        if (existingSession?.user?.email === HARDCODED_LEGACY_EMAIL) {
+          console.log('AUTH PURGE legacy hardcoded session');
+          await supabase.auth.signOut();
+        }
+
+        let bootstrapSession = (await supabase.auth.getSession()).data
+          .session;
+        if (!bootstrapSession) {
+          const { data: anonData, error: anonError } =
+            await supabase.auth.signInAnonymously();
+          if (anonError || !anonData.session) {
+            setTestStatus('No se pudo iniciar sesión anónima');
+            console.log('AUTH ANON_SIGNIN_FAIL', {
+              message: anonError?.message ?? 'no session returned',
+            });
+            return;
+          }
+          bootstrapSession = anonData.session;
+          console.log('AUTH ANON_SIGNIN_OK', {
+            sub: anonData.user?.id ?? null,
+          });
         }
 
         const {
