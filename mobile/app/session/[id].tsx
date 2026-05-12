@@ -14,7 +14,7 @@
  * Historial brick.
  */
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Pressable,
@@ -130,6 +130,78 @@ type FragmentsPhase =
       failedIndexes: number[];
     }
   | { kind: 'error'; message: string };
+
+/**
+ * Pasada A — structured cause for "Reproducible: No / Integridad parcial".
+ *
+ * Pure derivation from the export result + the queue-derived
+ * `expectedLocalChunks`. Lives outside the component so it can be
+ * unit-tested in isolation if we ever decide to. Emitted ONLY in a
+ * diagnostic log (`GC_EXPORT_DIAG_VERDICT`) — does NOT feed the
+ * rendered verdict, which still uses the original `integrityStatus`
+ * computation in `ResultBlock`. Pasada B will revisit the rendering.
+ *
+ * Order matters: the discriminators are evaluated top-down so the
+ * most specific cause wins. In particular, a download-time failure
+ * (hash_mismatch / download_failed) shadows the structural
+ * "pending_upload" verdict because if we already saw bytes-level
+ * trouble, calling it "still uploading" would mislead the operator.
+ *
+ *   'no_uploaded_chunks'   — `validChunks === 0`; loop wrote nothing.
+ *   'hash_mismatch'        — first gap was a sha256 disagreement.
+ *   'download_failed'      — first gap was a network / 4xx / 5xx.
+ *   'gap_before_export'    — first gap was a chunk the backend never
+ *                             registered as `uploaded` (mid-recording
+ *                             upload failure that never recovered).
+ *   'unsupported_format'   — loop completed, but the post-concat sniff
+ *                             matched neither AAC sync nor MP4 ftyp.
+ *   'pending_upload'       — backend has fewer chunks than the local
+ *                             queue claims were emitted, AND the loop
+ *                             completed without bailing on what
+ *                             backend DID expose. Likely transient.
+ *   'all_present'          — `validChunks === totalChunks` AND
+ *                             `expectedLocalChunks` agrees (or is
+ *                             null because the queue was reaped).
+ *   'unknown'              — none of the above matched. Should not
+ *                             happen in normal operation; surfacing
+ *                             this in logs is itself a signal.
+ */
+type ExportDiagCause =
+  | 'no_uploaded_chunks'
+  | 'hash_mismatch'
+  | 'download_failed'
+  | 'gap_before_export'
+  | 'unsupported_format'
+  | 'pending_upload'
+  | 'all_present'
+  | 'unknown';
+
+function deriveExportCause(
+  result: ExportResult,
+  expectedLocalChunks: number | null,
+): ExportDiagCause {
+  if (result.validChunks === 0) return 'no_uploaded_chunks';
+  if (result.stopReason === 'hash_mismatch') return 'hash_mismatch';
+  if (result.stopReason === 'download_failed') return 'download_failed';
+  if (result.stopReason === 'missing') return 'gap_before_export';
+  // From here: the loop ran to completion without bailing. The
+  // remaining discriminators inspect what we DID produce.
+  if (result.extension === '.bin') return 'unsupported_format';
+  if (
+    expectedLocalChunks !== null &&
+    expectedLocalChunks > result.totalChunks
+  ) {
+    return 'pending_upload';
+  }
+  if (
+    result.validChunks === result.totalChunks &&
+    result.missingIndexes.length === 0 &&
+    result.corruptIndexes.length === 0
+  ) {
+    return 'all_present';
+  }
+  return 'unknown';
+}
 
 export default function SessionDetailScreen() {
   const params = useLocalSearchParams<{ id?: string }>();
@@ -249,6 +321,47 @@ export default function SessionDetailScreen() {
       cancelled = true;
     };
   }, [sessionId, phase.kind === 'done']);
+
+  // Pasada A — single-fire guard for the verdict log. Keyed by
+  // sessionId so navigating away and back (which remounts and resets
+  // the ref) re-emits, but a re-render within the same mount does
+  // not spam logcat. Stores the sessionId of the export we already
+  // logged; null on first run.
+  const exportDiagLoggedForRef = useRef<string | null>(null);
+  // Pasada A — emit a structured verdict log when an export
+  // completes. The body is intentionally read-only: no setState, no
+  // network, no disk. It exists to give an operator a single grep
+  // target (`GC_EXPORT_DIAG_VERDICT`) that ties together the export
+  // pipeline output and the queue-derived "still uploading" signal.
+  //
+  // Why not log inside `exportSession`: the queue-derived
+  // `expectedLocalChunks` lives in this screen's state (loaded via a
+  // separate read-only side channel). Passing it into the export
+  // client would couple the client to the queue helper for purely
+  // diagnostic purposes. Cleaner to derive the cause here.
+  //
+  // Pasada B will reuse `deriveExportCause` to map the cause to copy
+  // shown in `ResultBlock`. Today: log-only.
+  useEffect(() => {
+    if (phase.kind !== 'done') return;
+    if (exportDiagLoggedForRef.current === sessionId) return;
+    exportDiagLoggedForRef.current = sessionId;
+    const r = phase.result;
+    const cause = deriveExportCause(r, expectedLocalChunks);
+    console.log('GC_EXPORT_DIAG_VERDICT', {
+      sessionId,
+      cause,
+      status: r.status,
+      totalChunks: r.totalChunks,
+      validChunks: r.validChunks,
+      missingCount: r.missingIndexes.length,
+      corruptCount: r.corruptIndexes.length,
+      expectedLocalChunks,
+      stoppedAt: r.stoppedAt ?? null,
+      stopReason: r.stopReason ?? null,
+      extension: r.extension ?? null,
+    });
+  }, [phase, expectedLocalChunks, sessionId]);
 
   // One-shot session-destination lookup via GET /sessions/:id. Fires
   // once per sessionId; failures fold to `null` so the existing export

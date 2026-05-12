@@ -90,6 +90,63 @@ export interface ExportResult {
   missingIndexes: number[];
   /** chunk_index values that failed download or sha256 verification. */
   corruptIndexes: number[];
+
+  // --- Pasada A diagnostics (additive, optional). ---
+  //
+  // These three fields exist solely to let the caller (the session
+  // detail screen) classify WHY an export landed in a partial state.
+  // They never change export behaviour — `status`, `filePath`,
+  // `validChunks`, `missingIndexes`, `corruptIndexes` remain the
+  // authoritative surface. Treat them as logs that happen to ride in
+  // the same envelope.
+  //
+  // All three are optional so callers that construct an `ExportResult`
+  // literal for an early-failure branch (e.g. local-only fallback in
+  // session/[id].tsx) don't have to be modified.
+
+  /**
+   * Container extension decided by the post-concat byte sniff:
+   *   '.aac' — AAC ADTS sync word present (raw frames; self-framing,
+   *            a contiguous prefix is decodable on its own).
+   *   '.m4a' — MP4 'ftyp' box at offset 4 (legacy HIGH_QUALITY audio;
+   *            the trailing moov atom is required for playback).
+   *   '.mp4' — caller forced video; same MP4 caveat applies.
+   *   '.bin' — neither sniff matched; forensic dump.
+   *   null   — the concat loop never produced bytes (early-return
+   *            failure before the sniff ran).
+   *
+   * Diagnostic only. The UI's "Reproducible" verdict is computed
+   * elsewhere from `status` + this field + `expectedLocalChunks`.
+   */
+  extension?: '.aac' | '.m4a' | '.mp4' | '.bin' | null;
+  /**
+   * chunk_index where the concat loop stopped:
+   *   -1   — the loop ran to `totalChunks` without bailing (every
+   *           expected index was either fetched + verified or the
+   *           result is fully consistent with `totalChunks=0`);
+   *   N>=0 — the loop bailed at index N for the reason in
+   *           `stopReason`; everything in [0, N) was concatenated;
+   *   null — the early-return paths that never entered the loop
+   *           (list error, no uploaded chunks, no document dir).
+   */
+  stoppedAt?: number | null;
+  /**
+   * Why the concat loop stopped, in the same situations as
+   * `stoppedAt`:
+   *   'missing'         — `meta` for that index was absent from the
+   *                        backend listing (chunk not yet uploaded or
+   *                        marked failed server-side);
+   *   'hash_mismatch'   — bytes downloaded but sha256 disagreed with
+   *                        the chunks row;
+   *   'download_failed' — network / 4xx / 5xx prevented retrieval;
+   *   null              — loop completed without bailing OR an
+   *                        early-return path didn't run the loop.
+   *
+   * `missingIndexes` / `corruptIndexes` are still authoritative for
+   * UI rendering and totals; `stopReason` only names the FIRST gap so
+   * downstream code can categorise the export cleanly.
+   */
+  stopReason?: 'missing' | 'hash_mismatch' | 'download_failed' | null;
 }
 
 function bytesDigestToHex(buf: ArrayBuffer): string {
@@ -307,6 +364,18 @@ export async function exportSession(
       phase: 'list',
       err: err instanceof Error ? err.message : String(err),
     });
+    log('GC_EXPORT_DIAG_RAW', {
+      sessionId,
+      phase: 'list_failed',
+      status: 'failed',
+      totalChunks: 0,
+      validChunks: 0,
+      missingCount: 0,
+      corruptCount: 0,
+      stoppedAt: null,
+      stopReason: null,
+      extension: null,
+    });
     return {
       status: 'failed',
       filePath: null,
@@ -314,6 +383,9 @@ export async function exportSession(
       validChunks: 0,
       missingIndexes: [],
       corruptIndexes: [],
+      extension: null,
+      stoppedAt: null,
+      stopReason: null,
     };
   }
 
@@ -328,6 +400,18 @@ export async function exportSession(
       reason: 'no_uploaded_chunks',
       total: chunks.length,
     });
+    log('GC_EXPORT_DIAG_RAW', {
+      sessionId,
+      phase: 'no_uploaded_chunks',
+      status: 'failed',
+      totalChunks: chunks.length,
+      validChunks: 0,
+      missingCount: chunks.length,
+      corruptCount: 0,
+      stoppedAt: null,
+      stopReason: null,
+      extension: null,
+    });
     return {
       status: 'failed',
       filePath: null,
@@ -335,6 +419,9 @@ export async function exportSession(
       validChunks: 0,
       missingIndexes: chunks.map((c) => c.chunk_index),
       corruptIndexes: [],
+      extension: null,
+      stoppedAt: null,
+      stopReason: null,
     };
   }
 
@@ -354,6 +441,18 @@ export async function exportSession(
       phase: 'filesystem',
       reason: 'no_document_directory',
     });
+    log('GC_EXPORT_DIAG_RAW', {
+      sessionId,
+      phase: 'no_document_directory',
+      status: 'failed',
+      totalChunks,
+      validChunks: 0,
+      missingCount: missingIndexes.length,
+      corruptCount: 0,
+      stoppedAt: null,
+      stopReason: null,
+      extension: null,
+    });
     return {
       status: 'failed',
       filePath: null,
@@ -361,6 +460,9 @@ export async function exportSession(
       validChunks: 0,
       missingIndexes,
       corruptIndexes: [],
+      extension: null,
+      stoppedAt: null,
+      stopReason: null,
     };
   }
 
@@ -382,6 +484,18 @@ export async function exportSession(
   // -1 if we made it all the way through). Surfaced in logs so an
   // operator can see exactly where the cut happened.
   let stoppedAt = -1;
+  // Pasada A diagnostics — mirror the in-loop bail so the caller can
+  // classify why the export ended up partial. Populated in the same
+  // three break branches that populate `stoppedAt`. Stays `null` if
+  // the loop completes without bailing.
+  let stopReason: 'missing' | 'hash_mismatch' | 'download_failed' | null =
+    null;
+  // Mirror of the container extension picked by the post-concat
+  // sniff. Lives at function scope (instead of only inside the write
+  // block) so every return path — success, partial, write_final
+  // failure — can include it in the diagnostic payload. Stays `null`
+  // on the early-return paths that never reach the sniff.
+  let sniffedExtension: '.aac' | '.m4a' | '.mp4' | '.bin' | null = null;
 
   // Survival rule: the recoverable evidence is the LONGEST CONTIGUOUS
   // PREFIX of valid chunks starting at chunk_index 0. A "hole" is any
@@ -404,6 +518,7 @@ export async function exportSession(
     // this is just the boundary observation.
     if (!meta) {
       stoppedAt = idx;
+      stopReason = 'missing';
       log('EXPORT STOPPED AT GAP', {
         sessionId,
         atIndex: idx,
@@ -452,6 +567,7 @@ export async function exportSession(
         });
         corruptIndexes.push(idx);
         stoppedAt = idx;
+        stopReason = 'hash_mismatch';
         log('EXPORT STOPPED AT GAP', {
           sessionId,
           atIndex: idx,
@@ -479,6 +595,7 @@ export async function exportSession(
       });
       corruptIndexes.push(idx);
       stoppedAt = idx;
+      stopReason = 'download_failed';
       log('EXPORT STOPPED AT GAP', {
         sessionId,
         atIndex: idx,
@@ -504,6 +621,18 @@ export async function exportSession(
       phase: 'concat',
       reason: 'no_valid_chunks',
     });
+    log('GC_EXPORT_DIAG_RAW', {
+      sessionId,
+      phase: 'no_valid_chunks',
+      status: 'failed',
+      totalChunks,
+      validChunks: 0,
+      missingCount: missingIndexes.length,
+      corruptCount: corruptIndexes.length,
+      stoppedAt,
+      stopReason,
+      extension: sniffedExtension,
+    });
     return {
       status: 'failed',
       filePath: null,
@@ -511,6 +640,9 @@ export async function exportSession(
       validChunks: 0,
       missingIndexes,
       corruptIndexes,
+      extension: sniffedExtension,
+      stoppedAt,
+      stopReason,
     };
   }
 
@@ -555,6 +687,11 @@ export async function exportSession(
       extension = hasFtyp ? '.m4a' : hasAacSync ? '.aac' : '.bin';
     }
     filePath = `${docDir}guardian_export_${sessionId}${extension}`;
+    // Mirror to the function-scope variable so every return path
+    // (including the write_final catch below) can include it in the
+    // diagnostic payload. The narrowing is exhaustive — the assigns
+    // above only ever produce one of these four literals.
+    sniffedExtension = extension as '.aac' | '.m4a' | '.mp4' | '.bin';
     log('EXPORT EXT SNIFF', {
       sessionId,
       extension,
@@ -573,6 +710,18 @@ export async function exportSession(
       phase: 'write_final',
       err: err instanceof Error ? err.message : String(err),
     });
+    log('GC_EXPORT_DIAG_RAW', {
+      sessionId,
+      phase: 'write_final_failed',
+      status: 'failed',
+      totalChunks,
+      validChunks,
+      missingCount: missingIndexes.length,
+      corruptCount: corruptIndexes.length,
+      stoppedAt,
+      stopReason,
+      extension: sniffedExtension,
+    });
     return {
       status: 'failed',
       filePath: null,
@@ -580,6 +729,9 @@ export async function exportSession(
       validChunks,
       missingIndexes,
       corruptIndexes,
+      extension: sniffedExtension,
+      stoppedAt,
+      stopReason,
     };
   }
 
@@ -614,6 +766,25 @@ export async function exportSession(
     corruptIndexes,
   });
 
+  // Pasada A diagnostics. Separate log key from the legacy
+  // `GC_EXPORT_RESULT` so a grep can isolate the structured-cause
+  // payload without having to filter the older format. The downstream
+  // verdict log (`GC_EXPORT_DIAG_VERDICT`) lives in the session detail
+  // screen because it needs `expectedLocalChunks` (queue-derived) to
+  // discriminate "pending upload" from "true gap".
+  log('GC_EXPORT_DIAG_RAW', {
+    sessionId,
+    phase: status === 'complete' ? 'complete' : 'partial',
+    status,
+    totalChunks,
+    validChunks,
+    missingCount: missingIndexes.length,
+    corruptCount: corruptIndexes.length,
+    stoppedAt,
+    stopReason,
+    extension: sniffedExtension,
+  });
+
   return {
     status,
     filePath,
@@ -621,6 +792,9 @@ export async function exportSession(
     validChunks,
     missingIndexes,
     corruptIndexes,
+    extension: sniffedExtension,
+    stoppedAt,
+    stopReason,
   };
 }
 
