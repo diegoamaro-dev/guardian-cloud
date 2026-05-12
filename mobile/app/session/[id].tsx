@@ -943,19 +943,138 @@ function ResultBlock({
     0,
     realTotal - result.validChunks - result.corruptIndexes.length,
   );
-  // Post-export integrity verdict. Computed from the data the export
-  // pipeline already produced (missingIndexes / corruptIndexes) PLUS
-  // the local emission truth — no new state, no new fetch beyond the
-  // already-loaded `expectedLocalChunks`. Decoupled from `summary.status`
-  // on purpose: the session can be `Cerrada` (backend lifecycle terminal)
-  // and STILL have an integrity gap if the completion gate let some
-  // chunk through as failed. UI must never conflate the two.
-  const integrityStatus: 'full' | 'partial' =
-    result.missingIndexes.length === 0 &&
-    result.corruptIndexes.length === 0 &&
-    realMissing === 0
-      ? 'full'
-      : 'partial';
+  // Pasada B — three-axis verdict.
+  //
+  // Replaces the old binary `integrityStatus: 'full' | 'partial'` flag.
+  // The pre-Pasada-B logic collapsed two very different situations
+  // into one "Reproducible: No":
+  //
+  //   1. The AAC pipeline produced a contiguous, hash-verified
+  //      prefix while the worker is still uploading later chunks.
+  //      Pasada A diagnostics confirmed this (cause=pending_upload,
+  //      extension='.aac', validChunks=totalChunks, corrupt=0). The
+  //      file IS reproducible — AAC ADTS is self-framing, any prefix
+  //      decodes — but integrity is partial because more material
+  //      will exist once uploads finish.
+  //
+  //   2. A chunk failed sha256 verification or download. The file
+  //      may technically play but its contents are not trustworthy
+  //      as evidence. That IS damaged, not just incomplete.
+  //
+  // The verdict now separates:
+  //   reproducible — does the file decode for a human listener?
+  //   integrity    — does it represent the FULL captured evidence?
+  //   message      — case-specific copy (null when no extra advice
+  //                  is needed beyond the two axes).
+  //
+  // Order matters. Bytes-level damage (`corruptIndexes`) shadows
+  // structural incompleteness ("still uploading") because if we
+  // already saw a hash mismatch, calling the file "reproducible
+  // partial" would mislead the user. Same rationale as
+  // `deriveExportCause` in Pasada A — keep the discriminators in
+  // sync conceptually.
+  //
+  // Pure derivation. No setState, no I/O, no allocation outside the
+  // returned literal. Inlined inside `ResultBlock` because the
+  // verdict only feeds this component's render and never escapes
+  // the render tree. The Pasada A `deriveExportCause` helper (still
+  // intact, still emitting `GC_EXPORT_DIAG_VERDICT`) keeps its
+  // separate top-level lifetime because it is the canonical
+  // diagnostic surface — UI copy and diagnostic logs evolve at
+  // different speeds and we want them decoupled.
+  const localExceeds =
+    expectedLocalChunks !== null && expectedLocalChunks > result.totalChunks;
+  const corruptCount = result.corruptIndexes.length;
+  const missingCount = result.missingIndexes.length;
+  const ext = result.extension ?? null;
+
+  type Verdict = {
+    reproducible: 'yes' | 'no';
+    integrity: 'complete' | 'partial' | 'damaged';
+    message: string | null;
+  };
+
+  let verdict: Verdict;
+  if (corruptCount > 0) {
+    // (a) Hash mismatch or download failure — bytes-level damage.
+    //     Trumps every structural verdict below.
+    verdict = {
+      reproducible: 'no',
+      integrity: 'damaged',
+      message: 'Se detectó un fragmento corrupto.',
+    };
+  } else if (ext === '.aac' && result.validChunks > 0) {
+    // (b) AAC ADTS — self-framing. A contiguous prefix is decodable
+    //     regardless of how many later chunks exist or not.
+    if (localExceeds) {
+      // (b.1) Worker still has pending chunks for this session.
+      verdict = {
+        reproducible: 'yes',
+        integrity: 'partial',
+        message:
+          'Aún faltan fragmentos por subir. Puedes escuchar esta parte ahora o exportar de nuevo cuando termine.',
+      };
+    } else if (missingCount === 0 && realMissing === 0) {
+      // (b.2) Backend and local agree on the chunk count, every
+      //       slot is uploaded + hash-verified. Fully intact.
+      verdict = {
+        reproducible: 'yes',
+        integrity: 'complete',
+        message: null,
+      };
+    } else {
+      // (b.3) Backend missing some chunks AND not just "pending
+      //       upload" (worker has nothing more to send). The AAC
+      //       prefix still plays; integrity is partial. No extra
+      //       message — the green/yellow framing alone tells the
+      //       story; piling text would be noise.
+      verdict = {
+        reproducible: 'yes',
+        integrity: 'partial',
+        message: null,
+      };
+    }
+  } else if (ext === '.m4a' || ext === '.mp4') {
+    // (c) MP4 container — the moov atom lives at the END of the
+    //     file. Missing tail chunks render the prefix unplayable in
+    //     most decoders. Honest: not reproducible when anything is
+    //     missing locally or server-side.
+    if (missingCount > 0 || localExceeds) {
+      verdict = {
+        reproducible: 'no',
+        integrity: 'partial',
+        message:
+          'Este formato puede necesitar el final del archivo para reproducirse.',
+      };
+    } else {
+      // Every chunk uploaded, every chunk verified, queue agrees.
+      verdict = {
+        reproducible: 'yes',
+        integrity: 'complete',
+        message: null,
+      };
+    }
+  } else if (ext === '.bin') {
+    // (d) Sniff failed — neither AAC sync nor MP4 ftyp. Treat the
+    //     file as forensic dump. Share remains enabled (survival
+    //     principle) but the user knows it is not a media file.
+    verdict = {
+      reproducible: 'no',
+      integrity: 'partial',
+      message:
+        'Formato no reconocido. Es un volcado forense de los chunks disponibles.',
+    };
+  } else {
+    // (e) Defensive default. The branches above cover every
+    //     extension currently produced by `exportSession`; this
+    //     fires only if a new extension is added without updating
+    //     the verdict map. Conservative copy, no false promises.
+    verdict = {
+      reproducible: 'no',
+      integrity: 'partial',
+      message: null,
+    };
+  }
 
   // Survival principle ("subir evidencia > archivo perfecto"): we no
   // longer early-return / hide share for partial MP4 exports. The
@@ -967,57 +1086,60 @@ function ResultBlock({
   // "Evidencia parcial recuperada" banner alongside the share button.
 
   if (result.status === 'complete') {
+    // Damaged ⇒ swap the green frame for a red one. The backend
+    // status is still "complete" (every uploaded chunk made it),
+    // but at least one byte-level verification failed, so we MUST
+    // NOT claim "Evidencia lista" with green confidence. Share
+    // remains enabled because the contiguous prefix in disk is
+    // still useful as evidence (survival principle).
+    const isDamaged = verdict.integrity === 'damaged';
+    const frameBorder = isDamaged ? '#f85149' : '#238636';
+    const frameBackground = isDamaged ? '#2d0d12' : '#0a2a14';
+    const headerColor = isDamaged ? '#f85149' : '#56d364';
     return (
       <View
         style={{
           marginTop: 4,
           padding: 12,
           borderWidth: 1,
-          borderColor: '#238636',
+          borderColor: frameBorder,
           borderRadius: 6,
-          backgroundColor: '#0a2a14',
+          backgroundColor: frameBackground,
         }}
       >
-        <Text style={{ color: '#56d364', fontSize: 13, fontWeight: '600' }}>
-          Evidencia lista
+        <Text style={{ color: headerColor, fontSize: 13, fontWeight: '600' }}>
+          {isDamaged ? 'Evidencia dañada' : 'Evidencia lista'}
         </Text>
         <Text style={{ color: '#c9d1d9', fontSize: 12, marginTop: 6 }}>
           Archivo generado correctamente.
         </Text>
         <Text style={{ color: '#c9d1d9', fontSize: 12, marginTop: 6 }}>
-          {integrityStatus === 'full'
+          {verdict.integrity === 'complete'
             ? 'Integridad: Completa ✅'
-            : 'Integridad: Parcial ⚠️'}
+            : verdict.integrity === 'damaged'
+              ? 'Integridad: Dañada ❌'
+              : 'Integridad: Parcial ⚠️'}
         </Text>
         <Text style={{ color: '#c9d1d9', fontSize: 12, marginTop: 2 }}>
-          {integrityStatus === 'full' ? 'Reproducible: Sí' : 'Reproducible: No'}
+          {verdict.reproducible === 'yes'
+            ? 'Reproducible: Sí'
+            : 'Reproducible: No'}
         </Text>
-        {integrityStatus !== 'full' && (
-          // Survival principle + honesty: we wrote the contiguous
-          // valid prefix and let the user share it, but we DO NOT
-          // claim it is guaranteed playable. Some MP4 decoders need
-          // the trailing moov atom that a truncated export will not
-          // contain; an audio (.aac / .m4a) prefix usually plays but
-          // we still hedge so the user is not surprised. Yellow /
-          // neutral tone — never red, never gating share.
+        {/* Case-specific guidance. Only shown when the verdict
+            carries a non-null message — `'complete' + null` (the
+            happy path) renders nothing extra. The tone of the
+            banner tracks the verdict: red for damaged, yellow for
+            partial. Never gates share. */}
+        {verdict.message !== null && (
           <View style={{ marginTop: 10 }}>
             <Text
               style={{
-                color: '#e3b341',
+                color: isDamaged ? '#f85149' : '#e3b341',
                 fontSize: 12,
                 fontWeight: '600',
               }}
             >
-              Evidencia parcial recuperada
-            </Text>
-            <Text
-              style={{
-                color: '#e3b341',
-                fontSize: 11,
-                marginTop: 2,
-              }}
-            >
-              Puede requerir revisión técnica.
+              {verdict.message}
             </Text>
           </View>
         )}
@@ -1053,6 +1175,17 @@ function ResultBlock({
     const firstChunkAffected =
       result.missingIndexes.includes(0) || result.corruptIndexes.includes(0);
     const isBinFile = result.filePath?.endsWith('.bin') ?? false;
+    // Pasada B — same three-axis verdict as the 'complete' branch.
+    // Reused so the user sees consistent labelling whether the
+    // export bailed mid-loop (status='partial') or completed every
+    // expected backend chunk but local emission outran the upload
+    // (status='complete' + integrity='partial'). The frame colour
+    // stays yellow when integrity is 'partial' and flips red only
+    // for 'damaged' — matching the 'complete' branch's behaviour.
+    const isDamagedPartial = verdict.integrity === 'damaged';
+    const partialBorder = isDamagedPartial ? '#f85149' : '#d29922';
+    const partialBackground = isDamagedPartial ? '#2d0d12' : '#2d1f06';
+    const partialHeader = isDamagedPartial ? '#f85149' : '#e3b341';
 
     return (
       <View
@@ -1060,21 +1193,49 @@ function ResultBlock({
           marginTop: 4,
           padding: 12,
           borderWidth: 1,
-          borderColor: '#d29922',
+          borderColor: partialBorder,
           borderRadius: 6,
-          backgroundColor: '#2d1f06',
+          backgroundColor: partialBackground,
         }}
       >
-        <Text style={{ color: '#e3b341', fontSize: 13, fontWeight: '700' }}>
-          Evidencia parcial recuperada
+        <Text style={{ color: partialHeader, fontSize: 13, fontWeight: '700' }}>
+          {isDamagedPartial
+            ? 'Evidencia dañada'
+            : 'Evidencia parcial recuperada'}
         </Text>
         <Text style={{ color: '#c9d1d9', fontSize: 12, marginTop: 6 }}>
           Se ha guardado el tramo continuo válido. Faltan algunos
           fragmentos posteriores; la parte recuperada es íntegra.
         </Text>
         <Text style={{ color: '#c9d1d9', fontSize: 12, marginTop: 6 }}>
-          Integridad: Parcial ⚠️
+          {verdict.integrity === 'complete'
+            ? 'Integridad: Completa ✅'
+            : verdict.integrity === 'damaged'
+              ? 'Integridad: Dañada ❌'
+              : 'Integridad: Parcial ⚠️'}
         </Text>
+        <Text style={{ color: '#c9d1d9', fontSize: 12, marginTop: 2 }}>
+          {verdict.reproducible === 'yes'
+            ? 'Reproducible: Sí'
+            : 'Reproducible: No'}
+        </Text>
+        {/* Verdict-specific message. Sits above the existing
+            `firstChunkAffected` advisory so the most relevant copy
+            is closest to the verdict lines. Coloured with the same
+            tone as the frame to avoid drawing attention away from
+            the share affordance further down. */}
+        {verdict.message !== null && (
+          <Text
+            style={{
+              color: partialHeader,
+              fontSize: 12,
+              fontWeight: '600',
+              marginTop: 8,
+            }}
+          >
+            {verdict.message}
+          </Text>
+        )}
 
         {/* Qualitative advisory. Honesty without alarm: a partial
             export — and especially one missing chunk_index 0 — may
