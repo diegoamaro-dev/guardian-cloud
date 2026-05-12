@@ -227,6 +227,29 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
           'Allow Guardian Cloud to access the microphone to record evidence.',
       },
     ],
+    // expo-audio is the active recorder for the production audio path
+    // (see `app/index.tsx`). `expo-av` stays installed because the
+    // `debug-camera-probe/*` screens still import `Audio` from it; once
+    // those probes are migrated or removed, both this plugin entry and
+    // the `expo-av` dependency can be dropped together.
+    //
+    // `enableBackgroundRecording: true` is required to keep the recorder
+    // capturing when the activity goes to background. Without the flag,
+    // expo-audio's `OnActivityEntersBackground` lifecycle hook auto-pauses
+    // active recordings, which would break the "subida durante grabación"
+    // invariant. The flag also makes the plugin add a dedicated foreground
+    // service entry (`foregroundServiceType="microphone"`) to the
+    // AndroidManifest, alongside the existing `RNBackgroundActionsTask`
+    // service that owns the GC_QUEUE upload worker.
+    [
+      'expo-audio',
+      {
+        microphonePermission:
+          'Allow Guardian Cloud to access the microphone to record evidence.',
+        recordAudioAndroid: true,
+        enableBackgroundRecording: true,
+      },
+    ],
     [
       'expo-camera',
       {

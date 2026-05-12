@@ -9,7 +9,14 @@ import {
   Text,
   Pressable,
 } from 'react-native';
-import { Audio } from 'expo-av';
+import {
+  AudioModule,
+  requestRecordingPermissionsAsync,
+  setAudioModeAsync,
+  RecordingPresets,
+  type AudioRecorder,
+  type RecordingOptions,
+} from 'expo-audio';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as Crypto from 'expo-crypto';
@@ -292,22 +299,31 @@ function chunkSizeBase64ForMode(mode: SessionMode): number {
  * binaria. Sin esa columna, sesiones antiguas (.m4a) se distinguen de
  * sesiones nuevas (.aac) por los bytes del concat.
  */
-// `as` cast is deliberate: the HIGH_QUALITY preset's TypeScript type in
-// expo-av marks `ios`/`web` as optional while `RecordingOptions` requires
-// them, which the project's `exactOptionalPropertyTypes: true` rejects
-// on a plain spread. The runtime object is complete (preset ships with
-// both branches); this is a pure type-level concession.
-const RECORDING_OPTIONS = {
-  ...Audio.RecordingOptionsPresets.HIGH_QUALITY,
+// Mirrors the prior expo-av options 1:1 on Android: `.aac` extension,
+// AAC ADTS container, AAC encoder, mono 44.1 kHz at 64 kbps. The
+// preserved choice of AAC ADTS over MPEG-4 is documented above — see
+// the long comment around "ADTS has no global header" — and keeps the
+// existing chunk-concat export path playable. The iOS branch is
+// inherited from `RecordingPresets.HIGH_QUALITY` (MPEG4AAC); the MVP
+// is Android-only, so iOS values are not exercised today.
+const RECORDING_OPTIONS: RecordingOptions = {
+  ...RecordingPresets.HIGH_QUALITY,
+  // `numberOfChannels` and `bitRate` live at the top level of
+  // `RecordingOptions` in expo-audio (the Android sub-type only takes
+  // `extension`, `sampleRate`, `outputFormat`, `audioEncoder`,
+  // `maxFileSize`, `audioSource`). expo-audio's `createRecordingOptions`
+  // utility flattens top-level + platform-specific fields before passing
+  // them to the native MediaRecorder, so setting them here matches the
+  // prior expo-av configuration 1:1 (mono / 64 kbps).
+  numberOfChannels: 1,
+  bitRate: 64000,
   android: {
     extension: '.aac',
-    outputFormat: Audio.AndroidOutputFormat.AAC_ADTS,
-    audioEncoder: Audio.AndroidAudioEncoder.AAC,
+    outputFormat: 'aac_adts',
+    audioEncoder: 'aac',
     sampleRate: 44100,
-    numberOfChannels: 1,
-    bitRate: 64000,
   },
-} as Audio.RecordingOptions;
+};
 
 /**
  * Video recording bounds. The camera writes a single growing .mp4 file
@@ -2383,6 +2399,22 @@ interface ChunkerState {
 
 const chunkerStates = new Map<string, ChunkerState>();
 
+/**
+ * Active `AudioRecorder` JS handle, module-scoped so it survives a remount
+ * of the Home component. Background: when the user swipe-closes the app
+ * while audio is recording, Android keeps the JS process alive because
+ * `expo-audio`'s foreground service has elevated the process priority.
+ * The activity is destroyed and re-created, which would lose a
+ * component-local `useRef` — but recovery on the new mount needs to call
+ * `.stop()` on the native recorder so the file stops growing. Promoting
+ * the handle to module scope is the minimum change that lets the boot
+ * cleanup path reach the recorder. Lifecycle: assigned in
+ * `startRecording`; nulled in `stopRecording`, the start catch, and the
+ * stop catch. Always treat as a single-slot resource — never overwrite a
+ * non-null value without stopping the previous one first.
+ */
+let activeAudioRecorder: AudioRecorder | null = null;
+
 function startChunkerForSession(
   sessionId: string,
   cacheUri: string,
@@ -3218,8 +3250,15 @@ export default function Index() {
   const setNotificationDenied = usePermissionsStore(
     (s) => s.setNotificationDenied,
   );
-  const recordingRef = useRef<Audio.Recording | null>(null);
-  // Video-mode counterparts of recordingRef. The CameraView is mounted
+  // The audio `AudioRecorder` handle previously lived in a component-local
+  // `useRef`. It was promoted to the module-scope `activeAudioRecorder`
+  // declared above so a remount of `Index` (which happens when Android
+  // re-creates the activity after a swipe-close while `expo-audio`'s
+  // foreground service keeps the JS process alive) can still reach the
+  // native recorder and stop it during boot dirty-state cleanup. Video
+  // refs below stay component-local — they are unaffected by the
+  // expo-audio lifecycle issue and out of scope.
+  // Video-mode counterparts of the audio recorder handle. The CameraView is mounted
   // only during a video session (see render); cameraRef is wired through
   // its ref callback. videoRecordPromiseRef holds the recordAsync()
   // promise — it resolves only when stopRecording() is called and gives
@@ -3891,6 +3930,122 @@ export default function Index() {
         // 2 recovery. Recovery is the priority when pending state exists.
         refreshDestination();
 
+        // Gate GRABAR for the "closing prior session" window. The
+        // recording invariant of Guardian Cloud is "subir evidencia >
+        // grabar perfecto" — a new recording MUST be allowed while old
+        // chunks finish uploading. So `isRecovering` (which feeds
+        // `isBusy` → `buttonDisabled`) must ONLY be set while the
+        // previous session has not yet been logically closed: three
+        // signals indicate that state, and any one of them is enough to
+        // bring the gate up.
+        //
+        //   1. `chunkerStates.size > 0`     — chunker JS loop still
+        //                                      alive from the previous
+        //                                      mount (foreground-service
+        //                                      kept process alive case).
+        //   2. `activeAudioRecorder !== null` — MediaRecorder handle
+        //                                      still in memory.
+        //   3. some queue entry has         — persisted state from a
+        //      `recording_closed === false`   cold-start kill that never
+        //                                      got the final flip.
+        //
+        // After the `queueMutate` further down flips every entry to
+        // `recording_closed=true` (and the dirty-cleanup block below
+        // clears the in-memory state), the window is over and we lower
+        // the gate immediately so the rest of recovery (drain, reap,
+        // reconcile, worker) runs WITHOUT blocking GRABAR.
+        const dirtyInMemory =
+          chunkerStates.size > 0 || activeAudioRecorder !== null;
+        let dirtyPersisted = false;
+        try {
+          const qDetect = await queueRead();
+          dirtyPersisted = qDetect.some(e => !e.recording_closed);
+        } catch {
+          /* best effort — assume nothing persisted to close */
+        }
+        const closingPriorSession = dirtyInMemory || dirtyPersisted;
+        if (closingPriorSession) {
+          setIsRecovering(true);
+        }
+
+        // Dirty-state cleanup: when the user swipe-closes while audio is
+        // recording, expo-audio's foreground service elevates the JS
+        // process priority enough that Android does NOT kill it. The
+        // activity is destroyed and re-created — so this boot effect
+        // runs again — but `chunkerStates` (module-scoped) and
+        // `activeAudioRecorder` (also module-scoped, promoted from a
+        // component useRef precisely for this case) still hold the
+        // previous session. The chunker keeps emitting and the
+        // MediaRecorder keeps writing, which the user perceives as
+        // "fragments forever after I closed the app". Product rule for
+        // beta: a swipe-close should finalize the recording and upload
+        // what we have, not extend it.
+        //
+        // Cold start (process actually died) is a no-op here because
+        // `chunkerStates.size === 0` and `activeAudioRecorder === null`
+        // on a fresh JS context. The gate is what makes that safe.
+        if (chunkerStates.size > 0 || activeAudioRecorder !== null) {
+          console.log('GC_BOOT_DIRTY_STATE_DETECTED', {
+            chunker_state_ids: Array.from(chunkerStates.keys()),
+            has_active_recorder: activeAudioRecorder !== null,
+          });
+          // 1. Stop the native MediaRecorder FIRST so the file stops
+          //    growing. Without this, the chunker's final pass below
+          //    would race against an open writer and the queue would
+          //    keep getting new chunks while we try to close it.
+          const recorderToStop = activeAudioRecorder;
+          activeAudioRecorder = null;
+          if (recorderToStop !== null) {
+            try {
+              await recorderToStop.stop();
+            } catch (err) {
+              console.log('GC_BOOT_DIRTY_STATE_RECORDER_STOP_FAILED', {
+                err: err instanceof Error ? err.message : String(err),
+              });
+            }
+          }
+          // 2. For each live chunker, run its final pass (captures the
+          //    tail of whatever the recorder wrote up to the stop) and
+          //    mark the session closed. The worker further down picks
+          //    them up and drains the queue. `stopChunkerForSession`
+          //    handles its own internal gating (finalizing flag, await
+          //    inflight) and deletes the entry from `chunkerStates`.
+          //    `queueMarkRecordingClosed` is idempotent and just sets
+          //    the persisted flag; we read `emitted_base64_length` /
+          //    `next_chunk_index` from the queue entry so the worker
+          //    has the same view it would after a normal stopRecording.
+          for (const sid of Array.from(chunkerStates.keys())) {
+            const state = chunkerStates.get(sid);
+            if (!state) continue;
+            try {
+              await stopChunkerForSession(sid, state.fileUri);
+              // Pull the post-final-pass counters so the persisted
+              // close mirrors what `stopRecording` writes after the
+              // user taps PARAR. Best-effort: if the entry vanished
+              // we just skip the persistence step (the worker will
+              // reap on its own).
+              const q = await queueRead();
+              const entry = q.find(e => e.session_id === sid);
+              if (entry) {
+                await queueMarkRecordingClosed(
+                  sid,
+                  state.fileUri,
+                  entry.emitted_base64_length,
+                  entry.next_chunk_index,
+                );
+              }
+              console.log('GC_BOOT_DIRTY_STATE_SESSION_CLOSED', {
+                session_id: sid,
+              });
+            } catch (err) {
+              console.log('GC_BOOT_DIRTY_STATE_CHUNKER_STOP_FAILED', {
+                session_id: sid,
+                err: err instanceof Error ? err.message : String(err),
+              });
+            }
+          }
+        }
+
         // Recovery on app open. The legacy single-session PENDING_RETRY_KEY
         // (PendingState shape) is migrated in place to the new array shape
         // (PendingQueueEntry[]). Then the worker drains every entry —
@@ -4002,6 +4157,19 @@ export default function Index() {
           console.log('GC_QUEUE recovery finalize-prep failed', err);
         }
 
+        // Closing window over. Every prior session is now
+        // `recording_closed=true` (the queueMutate above is the
+        // authoritative flip) and the in-memory dirty state was cleared
+        // by the dirty-cleanup block. The rest of recovery — reap,
+        // reconcile, register loop, drain, foreground-service start —
+        // operates on a sane queue and MUST NOT block GRABAR per the
+        // product rule "subir en paralelo, no hacer esperar al usuario
+        // por red lenta". The `finally` below remains as a safety net
+        // for an unexpected throw between Edit A and here.
+        if (closingPriorSession) {
+          setIsRecovering(false);
+        }
+
         // Reap entries that already finished (session_completed=true,
         // no pending chunks) so the recovery banner does not advertise
         // work that does not exist. Worker would do this anyway on its
@@ -4050,7 +4218,13 @@ export default function Index() {
 
         const queueAtBoot = await queueRead();
         if (queueAtBoot.length > 0) {
-          setIsRecovering(true);
+          // NOTE: this branch USED to call `setIsRecovering(true)` here.
+          // That was wrong — it blocked GRABAR during the upload drain
+          // of already-closed sessions, violating the parallel-upload
+          // product rule. The closing window is now gated by the
+          // `closingPriorSession` flag set in Edit A and cleared in
+          // Edit B above; this stretch runs AFTER the flip and may
+          // overlap with a new recording the user starts in parallel.
           const pendingChunks = queueAtBoot.reduce(
             (sum, e) =>
               sum + e.chunks.filter(c => c.status === 'pending').length,
@@ -4098,7 +4272,7 @@ export default function Index() {
             startBackgroundProtection({
               drain: () => uploadDrainLoop(),
               isRecordingActive: () =>
-                recordingRef.current !== null ||
+                activeAudioRecorder !== null ||
                 videoRecordPromiseRef.current !== null ||
                 postStopChunkingInFlightRef.current,
               hasPendingWork: hasPendingUploadWork,
@@ -4129,7 +4303,7 @@ export default function Index() {
     perfLog('GC_PERF_START_RECORDING_ENTER');
     if (
       isStartingRef.current ||
-      recordingRef.current ||
+      activeAudioRecorder ||
       videoRecordPromiseRef.current
     ) {
       console.log('REC START ignored — already starting or recording');
@@ -4184,13 +4358,13 @@ export default function Index() {
     // `await sleep` is at the END of the loop, not the start). With
     // Phase 1 parallelization, that first tick can fall in the window
     // BEFORE the recorder is live and BEFORE `queueAppendNewSession`
-    // has run — i.e. with `recordingRef`/`videoRecordPromiseRef` null
+    // has run — i.e. with `activeAudioRecorder`/`videoRecordPromiseRef` null
     // AND queue empty. Without `isStartingRef`, the predicate would
     // return false, `hasPendingWork` would return false, and the
     // service would auto-STOP via `no_pending_work` before the
     // recorder ever needs it. Including `isStartingRef.current` keeps
     // the service alive until startRecording's finally block
-    // (success or error path) flips it false; by then recordingRef is
+    // (success or error path) flips it false; by then activeAudioRecorder is
     // either set (success) or the queue / cleanup correctly indicate
     // no work, so the auto-stop semantics outside the start window
     // are byte-identical to the previous behaviour.
@@ -4202,7 +4376,7 @@ export default function Index() {
       drain: () => uploadDrainLoop(),
       isRecordingActive: () =>
         isStartingRef.current ||
-        recordingRef.current !== null ||
+        activeAudioRecorder !== null ||
         videoRecordPromiseRef.current !== null ||
         postStopChunkingInFlightRef.current,
       hasPendingWork: hasPendingUploadWork,
@@ -4283,7 +4457,7 @@ export default function Index() {
       // ----- CRITICAL PATH — only what the recorder strictly needs -----
       console.log('REC START — manual trigger', { mode: recordingMode });
 
-      const perm = await Audio.requestPermissionsAsync();
+      const perm = await requestRecordingPermissionsAsync();
       if (!perm.granted) throw new Error('RECORD_AUDIO permission denied');
 
       if (recordingMode === 'video') {
@@ -4293,29 +4467,44 @@ export default function Index() {
         if (!cam.granted) throw new Error('CAMERA permission denied');
       }
 
-      await Audio.setAudioModeAsync({
-        allowsRecordingIOS: true,
-        playsInSilentModeIOS: true,
-        // Keep the audio session alive across activity backgrounding.
-        // Without this flag both iOS and Android would treat a minimised
-        // app as "stop capturing". With it, the OS-level audio session
-        // continues; combined with the foreground service installed in
-        // Tier 2, the recorder keeps writing samples while the user has
-        // the app off-screen.
-        staysActiveInBackground: true,
+      await setAudioModeAsync({
+        // iOS-only on expo-av (`allowsRecordingIOS`/`playsInSilentModeIOS`).
+        // expo-audio collapses those into platform-neutral keys; on
+        // Android they are no-ops, matching the previous behaviour.
+        allowsRecording: true,
+        playsInSilentMode: true,
+        // Keep the audio session alive across activity backgrounding —
+        // 1:1 replacement for expo-av's `staysActiveInBackground: true`.
+        shouldPlayInBackground: true,
+        // expo-audio-specific: without this flag the module's
+        // `OnActivityEntersBackground` lifecycle hook auto-pauses any
+        // active recorder. Setting it true keeps the recorder writing
+        // samples while the user has the app off-screen, which matches
+        // the prior expo-av behaviour and preserves the
+        // "subida durante grabación" invariant.
+        allowsBackgroundRecording: true,
       });
 
       let cacheUri: string;
       if (recordingMode === 'audio') {
-        const recording = new Audio.Recording();
+        // expo-audio exposes the recorder class via the lazy
+        // `AudioModule.AudioRecorder` (no `createAudioRecorder` helper is
+        // exported at runtime — only the `useAudioRecorder` hook is).
+        // Calling the constructor + `prepareToRecordAsync` here mirrors
+        // the prior expo-av `new Audio.Recording(); prepareToRecordAsync()`
+        // sequence. `record()` is synchronous in expo-audio — no `await`.
+        const recording = new AudioModule.AudioRecorder(RECORDING_OPTIONS);
         await recording.prepareToRecordAsync(RECORDING_OPTIONS);
         perfLog('GC_PERF_RECORDER_START_START', { mode: 'audio' });
-        await recording.startAsync();
+        recording.record();
         perfLog('GC_PERF_RECORDER_STARTED', { mode: 'audio' });
-        recordingRef.current = recording;
+        activeAudioRecorder = recording;
 
-        const audioUri = recording.getURI();
-        if (!audioUri) throw new Error('Recording URI is null after startAsync');
+        // `uri` is a property (was `getURI()` in expo-av). The Android
+        // native side fills it during `prepareToRecordAsync`, so it is
+        // safe to read here and pass to the live chunker.
+        const audioUri = recording.uri;
+        if (!audioUri) throw new Error('Recording URI is null after record()');
         cacheUri = audioUri;
       } else {
         // === Video branch ===
@@ -4495,13 +4684,13 @@ export default function Index() {
       // path, including offline/deferred). Cleanup keeps the OS-level
       // audio session from leaking and matches the pre-Phase-1 catch
       // semantics now that the user-visible "Grabando" was never shown.
-      if (recordingRef.current) {
+      if (activeAudioRecorder) {
         try {
-          await recordingRef.current.stopAndUnloadAsync();
+          await activeAudioRecorder.stop();
         } catch {
           /* ignore — best effort */
         }
-        recordingRef.current = null;
+        activeAudioRecorder = null;
       }
       // Make sure no half-started video state leaks if we threw after
       // recordAsync was invoked.
@@ -4522,7 +4711,7 @@ export default function Index() {
   }
 
   async function stopRecording() {
-    const audioRecording = recordingRef.current;
+    const audioRecording = activeAudioRecorder;
     const videoPromise = videoRecordPromiseRef.current;
     if (!audioRecording && !videoPromise) {
       setTestStatus('ERROR REC: no active recording');
@@ -4554,10 +4743,13 @@ export default function Index() {
 
       let maybeUri: string | null;
       if (audioRecording) {
-        await audioRecording.stopAndUnloadAsync();
+        // expo-audio renames `stopAndUnloadAsync` to `stop`. The native
+        // implementation still flushes the file to disk before resolving,
+        // so the chunker's final pass can read the completed bytes.
+        await audioRecording.stop();
         console.log('GC_DIAG: STOP_AND_UNLOAD_RETURNED');
-        maybeUri = audioRecording.getURI();
-        recordingRef.current = null;
+        maybeUri = audioRecording.uri;
+        activeAudioRecorder = null;
       } else {
         // === Video stop ===
         // 1. Tell camera to stop. recordAsync resolves with the final URI.
@@ -4651,7 +4843,7 @@ export default function Index() {
         size_matches_pre_move: postMoveSize === preMoveSize,
       });
     } catch (error) {
-      recordingRef.current = null;
+      activeAudioRecorder = null;
       videoRecordPromiseRef.current = null;
       videoRecordingUriRef.current = null;
       setIsRecording(false);
@@ -4760,7 +4952,7 @@ export default function Index() {
       (async () => {
         try {
           const stillRecording =
-            recordingRef.current !== null ||
+            activeAudioRecorder !== null ||
             videoRecordPromiseRef.current !== null ||
             postStopChunkingInFlightRef.current;
           const pending = await hasPendingUploadWork();
@@ -4951,7 +5143,7 @@ export default function Index() {
   useEffect(() => {
     const sub = AppState.addEventListener('change', nextState => {
       const wasRecording =
-        recordingRef.current !== null ||
+        activeAudioRecorder !== null ||
         videoRecordPromiseRef.current !== null;
       console.log('GC_BACKGROUND_STATE_CHANGE', {
         next: nextState,
@@ -5092,7 +5284,7 @@ export default function Index() {
         : guardianStatus === 'subiendo'
           ? subiendoLabel
           : guardianStatus === 'recuperando'
-            ? 'Recuperando'
+            ? 'Cerrando grabación anterior…'
             : guardianStatus === 'protegido'
               ? 'Protegido'
               : guardianStatus === 'error'

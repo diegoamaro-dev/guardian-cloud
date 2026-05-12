@@ -9,7 +9,7 @@
  *
  * 2. Stub every native / Expo module that `mobile/app/index.tsx`
  *    imports at module load. Without these stubs the file cannot be
- *    evaluated in Node — `expo-av`, `expo-camera`, `react-native`, etc.
+ *    evaluated in Node — `expo-audio`, `expo-camera`, `react-native`, etc.
  *    all assume a React Native runtime. Test files that need real
  *    behavior from a specific stub (typically AsyncStorage to seed the
  *    queue) override these with their own per-file `vi.mock(...)`.
@@ -47,27 +47,28 @@ vi.mock('react-native', () => ({
 }));
 
 // --- Expo modules ---------------------------------------------------
-vi.mock('expo-av', () => ({
-  Audio: {
-    Recording: class {
+// `app/index.tsx` now imports `expo-audio` (was `expo-av`). The shape
+// below mirrors the previous expo-av mock 1:1 — class shell with the
+// methods/properties the screen reads at module-load and at start/stop.
+// The recorder is never exercised in tests; this stub only has to
+// satisfy import-time access.
+vi.mock('expo-audio', () => ({
+  AudioModule: {
+    AudioRecorder: class {
       prepareToRecordAsync = vi.fn();
-      startAsync = vi.fn();
-      stopAndUnloadAsync = vi.fn();
-      getURI = vi.fn(() => null);
+      record = vi.fn();
+      stop = vi.fn();
+      uri: string | null = null;
     },
-    setAudioModeAsync: vi.fn(),
-    requestPermissionsAsync: vi.fn(async () => ({ granted: true })),
-    // Read at module-load time by `app/index.tsx` to spread into
-    // RECORDING_OPTIONS. Empty object is fine — the spread just adds
-    // no fields, and tests never exercise the actual recorder.
-    RecordingOptionsPresets: {
-      HIGH_QUALITY: {},
-      LOW_QUALITY: {},
-    },
-    AndroidOutputFormat: {},
-    AndroidAudioEncoder: {},
-    IOSOutputFormat: {},
-    IOSAudioQuality: {},
+  },
+  setAudioModeAsync: vi.fn(),
+  requestRecordingPermissionsAsync: vi.fn(async () => ({ granted: true })),
+  // Read at module-load time by `app/index.tsx` to spread into
+  // RECORDING_OPTIONS. Empty object is fine — the spread just adds
+  // no fields, and tests never exercise the actual recorder.
+  RecordingPresets: {
+    HIGH_QUALITY: {},
+    LOW_QUALITY: {},
   },
 }));
 
