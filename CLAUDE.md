@@ -239,3 +239,56 @@ If this is skipped:
 → the task is invalid
 
 DO NOT write code until this is done.
+
+---
+
+# CRITICAL DEBUGGING RULES
+
+Before modifying ANY recording, recovery, upload or lifecycle logic, read:
+
+- docs/KNOWN_LIMITS.md
+- docs/DEBUGGING_RULES.md
+- docs/BETA_STABLE_BASELINE.md
+
+These documents are mandatory context.
+
+Do NOT attempt aggressive fixes on:
+- recovery
+- upload worker
+- foreground service
+- chunkers
+- start/stop recording lifecycle
+
+without first validating:
+1. reproducible scenario
+2. exact logs
+3. affected invariant
+4. rollback path
+
+Important:
+expo-av has a validated limitation with orphaned Audio.Recording instances after swipe-close during active recording.
+
+This is a KNOWN LIMITATION, not a queue/recovery bug.
+
+Do NOT try to fix this by:
+- changing recovery behavior
+- adding lifecycle resets
+- stopping recording on AppState background
+- adding multiple refs/flags blindly
+- modifying upload pipeline
+
+Recovery stability is more important than audio-perfect lifecycle hacks.
+
+If debugging breaks:
+- recovery
+- chunk uploads
+- background upload
+- session completion
+- queue consistency
+
+ROLL BACK IMMEDIATELY to:
+
+beta-preview-v0.3.1
+(commit a9e6e23)
+
+This tag is the current stable baseline.
