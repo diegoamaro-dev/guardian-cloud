@@ -932,21 +932,40 @@ export default function SessionDetailScreen() {
           lineHeight: 16,
         }}
       >
-        La exportación descarga cada chunk desde tu Google Drive, verifica
-        su integridad con sha256 y los concatena en orden. Si algún chunk
-        falta o está corrupto, el archivo se marca como parcial.
+        Estamos recuperando los fragmentos protegidos desde tu Google
+        Drive y reconstruyendo el archivo. Si falta alguna parte, se
+        generará la versión disponible.
       </Text>
     </ScrollView>
   );
 }
 
 function ProgressBlock({ progress }: { progress: ExportProgress | null }) {
-  const label = useMemo(() => {
-    if (!progress) return 'Preparando…';
-    if (progress.currentIndex < 0) {
-      return `Finalizando… ${progress.done}/${progress.total}`;
+  // Decoupled into two strings — `primary` (human copy) and
+  // `counter` (raw numeric progress) — so the layout can stack them
+  // vertically and keep the counter readable on narrow screens.
+  // Previously both lived in a single concatenated label, which on
+  // narrow widths either overflowed to the right or wrapped at an
+  // arbitrary point that broke "8/14" across two lines.
+  //
+  // `counter` is `null` for the "Preparando…" state where there are
+  // no numbers to show yet; the JSX below skips the second line when
+  // it is null so the spinner row stays tight in that case.
+  const { primary, counter } = useMemo<{
+    primary: string;
+    counter: string | null;
+  }>(() => {
+    if (!progress) {
+      return { primary: 'Preparando…', counter: null };
     }
-    return `Descargando chunk ${progress.currentIndex + 1}… ${progress.done}/${progress.total}`;
+    const ratio = `${progress.done}/${progress.total}`;
+    if (progress.currentIndex < 0) {
+      return { primary: 'Finalizando…', counter: ratio };
+    }
+    return {
+      primary: 'Descargando fragmentos desde Google Drive…',
+      counter: ratio,
+    };
   }, [progress]);
 
   return (
@@ -963,9 +982,21 @@ function ProgressBlock({ progress }: { progress: ExportProgress | null }) {
       }}
     >
       <ActivityIndicator color="#c9d1d9" />
-      <Text style={{ color: '#c9d1d9', marginLeft: 10, fontSize: 13 }}>
-        {label}
-      </Text>
+      {/* `flex: 1` lets this column take the remaining width inside
+          the row, so the primary string can wrap naturally instead
+          of pushing the counter off-screen. The counter sits on its
+          own line below in a dimmer style so it reads as secondary
+          info rather than competing with the action label. */}
+      <View style={{ flex: 1, marginLeft: 10 }}>
+        <Text style={{ color: '#c9d1d9', fontSize: 13 }}>
+          {primary}
+        </Text>
+        {counter !== null && (
+          <Text style={{ color: '#8b949e', fontSize: 12, marginTop: 2 }}>
+            {counter}
+          </Text>
+        )}
+      </View>
     </View>
   );
 }
