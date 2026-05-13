@@ -20,6 +20,7 @@ import {
   Pressable,
   ScrollView,
   Text,
+  TextInput,
   View,
 } from 'react-native';
 import { router, useLocalSearchParams } from 'expo-router';
@@ -40,6 +41,7 @@ import {
   type SessionStatusSummary,
   deriveSessionStatus,
   readHistory,
+  updateHistoryEntryTitle,
 } from '@/api/history';
 import {
   findLocalRecordingUri,
@@ -238,6 +240,19 @@ export default function SessionDetailScreen() {
   // the history entry is missing — both treated as "unknown" by the
   // fragment extension picker.
   const [sessionMode, setSessionMode] = useState<SessionMode | null>(null);
+  // Optional user-supplied title for this session. UX-only metadata,
+  // persisted via `updateHistoryEntryTitle`. Empty string is the
+  // "no title yet" state in this component; an empty trimmed value
+  // collapses to `null` on persistence (the storage layer drops the
+  // field entirely so old-shape entries and freshly-cleared entries
+  // look identical on disk).
+  const [draftTitle, setDraftTitle] = useState<string>('');
+  // Wall-clock of the last user keystroke in the title input. Combined
+  // with a setTimeout below this becomes the debounce: writes hit
+  // AsyncStorage 600ms after the last edit, NOT on every character.
+  // Avoids storage thrash while typing and keeps the recording flow
+  // free of any concurrent write storm.
+  const titleDirtyRef = useRef<boolean>(false);
   // Per-session upload destination, fetched once on mount via
   // GET /sessions/:id (no new endpoint). Cached so future copy /
   // diagnostics can branch on it without a second fetch. The export
@@ -408,6 +423,12 @@ export default function SessionDetailScreen() {
   // caches its mode for both the cloud export and the partial-fragments
   // downloader. Failures fold into `null` (treated as unknown). The
   // lookup never blocks UI — both consumers tolerate `null` / undefined.
+  //
+  // The same read also hydrates the optional `title` field into the
+  // local `draftTitle` state — one AsyncStorage read for both pieces
+  // of metadata. `titleDirtyRef` stays `false` after the hydration so
+  // the debounce effect below does NOT trigger a write that would
+  // round-trip the same value through storage.
   useEffect(() => {
     if (!sessionId) return;
     let cancelled = false;
@@ -415,7 +436,11 @@ export default function SessionDetailScreen() {
       try {
         const list = await readHistory();
         const entry = list.find((e) => e.session_id === sessionId);
-        if (!cancelled) setSessionMode(entry?.mode ?? null);
+        if (!cancelled) {
+          setSessionMode(entry?.mode ?? null);
+          setDraftTitle(entry?.title ?? '');
+          titleDirtyRef.current = false;
+        }
       } catch {
         if (!cancelled) setSessionMode(null);
       }
@@ -424,6 +449,21 @@ export default function SessionDetailScreen() {
       cancelled = true;
     };
   }, [sessionId]);
+
+  // Debounced title write. Only fires after the user has actually
+  // edited the field (`titleDirtyRef` flipped on each onChangeText),
+  // so the hydration step above cannot trigger a redundant write.
+  // 600ms idle after the last keystroke → persist; trimmed empty
+  // string → `null` (the storage helper drops the field).
+  useEffect(() => {
+    if (!sessionId) return;
+    if (!titleDirtyRef.current) return;
+    const handle = setTimeout(() => {
+      const trimmed = draftTitle.trim();
+      updateHistoryEntryTitle(sessionId, trimmed.length === 0 ? null : trimmed);
+    }, 600);
+    return () => clearTimeout(handle);
+  }, [draftTitle, sessionId]);
 
   // Two independent enablers for the button. The user only needs ONE
   // to be true:
@@ -753,6 +793,42 @@ export default function SessionDetailScreen() {
       {/* Live status header. All fields derived strictly from the
           chunks list returned by the backend — never optimistic. */}
       <StatusHeader summary={statusSummary} />
+
+      {/* Optional user-supplied label for this session. UX-only:
+          persisted via `updateHistoryEntryTitle` (debounced 600ms
+          in the effect above). Empty trimmed string clears the
+          field on disk. Bounded to 80 characters by `maxLength` —
+          consistent with the cap documented in HistoryEntry.title.
+          NEVER affects export, uploads, recovery, or the chunk
+          pipeline. */}
+      <View style={{ marginBottom: 14 }}>
+        <TextInput
+          value={draftTitle}
+          onChangeText={(next) => {
+            titleDirtyRef.current = true;
+            setDraftTitle(next);
+          }}
+          placeholder="Añadir título"
+          placeholderTextColor="#6e7681"
+          maxLength={80}
+          // Single-line so a long paste cannot push the export
+          // button below the fold on small devices.
+          multiline={false}
+          // Soft return collapses to commit on Android; we keep the
+          // value in state regardless so this is mostly cosmetic.
+          returnKeyType="done"
+          style={{
+            color: '#c9d1d9',
+            fontSize: 14,
+            paddingHorizontal: 12,
+            paddingVertical: 10,
+            borderWidth: 1,
+            borderColor: '#30363d',
+            borderRadius: 8,
+            backgroundColor: '#161b22',
+          }}
+        />
+      </View>
 
       <Pressable
         onPress={handleExport}

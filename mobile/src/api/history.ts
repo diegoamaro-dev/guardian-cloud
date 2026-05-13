@@ -41,6 +41,22 @@ export interface HistoryEntry {
   /** ISO-8601 timestamp captured client-side at append time. */
   created_at: string;
   mode: SessionMode;
+  /**
+   * Optional user-supplied label for the session. UX-only metadata —
+   * never used by the export pipeline, upload worker, recovery, or
+   * backend. Persisted in the same AsyncStorage blob as the rest of
+   * the entry (`history.sessions`). Trimmed before write; an empty
+   * string after trim is stored as `undefined` (the field is omitted
+   * entirely) so old entries without a title and new entries whose
+   * title was cleared look identical on disk.
+   *
+   * Length cap is enforced by the UI (TextInput maxLength=80), not
+   * by this layer — the storage path stays dumb on purpose.
+   *
+   * Optional for backward compatibility: entries written by older
+   * builds do not have this field and continue to round-trip cleanly.
+   */
+  title?: string;
 }
 
 /**
@@ -72,6 +88,56 @@ export async function appendHistoryEntry(entry: HistoryEntry): Promise<void> {
     // Swallow — never block recording on a side observation.
     // eslint-disable-next-line no-console
     console.log('HISTORY appendHistoryEntry failed', err);
+  }
+}
+
+/**
+ * Update the optional `title` on a single existing entry. Idempotent
+ * and best-effort: a missing entry, corrupt storage, or write failure
+ * is swallowed (logged), exactly like `appendHistoryEntry`. The
+ * recording flow MUST NOT be affected by a title-write hiccup.
+ *
+ * `null` (or empty after trim) removes the field rather than storing
+ * an empty string — keeps on-disk entries minimal and avoids two
+ * representations of "no title" coexisting.
+ *
+ * Does NOT touch `session_id`, `created_at`, or `mode`. Does NOT
+ * insert a new entry when the session_id is unknown (only
+ * `appendHistoryEntry` creates entries — keeping a single writer of
+ * new entries is intentional).
+ */
+export async function updateHistoryEntryTitle(
+  sessionId: string,
+  title: string | null,
+): Promise<void> {
+  try {
+    const raw = await AsyncStorage.getItem(HISTORY_KEY);
+    if (!raw) return;
+    let list: HistoryEntry[] = [];
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      if (Array.isArray(parsed)) list = parsed as HistoryEntry[];
+    } catch {
+      return;
+    }
+    let mutated = false;
+    const next = list.map((e) => {
+      if (e.session_id !== sessionId) return e;
+      mutated = true;
+      const trimmed = (title ?? '').trim();
+      if (trimmed.length === 0) {
+        // Drop the field entirely so the on-disk shape collapses to
+        // the same canonical form as never-titled entries.
+        const { title: _drop, ...rest } = e;
+        return rest as HistoryEntry;
+      }
+      return { ...e, title: trimmed };
+    });
+    if (!mutated) return;
+    await AsyncStorage.setItem(HISTORY_KEY, JSON.stringify(next));
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.log('HISTORY updateHistoryEntryTitle failed', err);
   }
 }
 

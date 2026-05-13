@@ -15,7 +15,7 @@
  * recording / queue / Drive state happens here.
  */
 
-import { useEffect, useState } from 'react';
+import { useCallback, useState } from 'react';
 import {
   ActivityIndicator,
   FlatList,
@@ -24,11 +24,12 @@ import {
   Text,
   View,
 } from 'react-native';
-import { router, Stack } from 'expo-router';
+import { router, Stack, useFocusEffect } from 'expo-router';
 
 import { listSessionChunks } from '@/api/export';
 import {
   type HistoryEntry,
+  type SessionMode,
   type SessionStatusSummary,
   deriveSessionStatus,
   readHistory,
@@ -38,6 +39,14 @@ interface Row {
   entry: HistoryEntry;
   /** null = still loading; summary = resolved (incl. 'unknown' on fetch fail). */
   summary: SessionStatusSummary | null;
+  /**
+   * Number of chunks still in `status='pending'` server-side. Used
+   * by `statusBadge` to distinguish "in progress" (Subiendo) from
+   * "final partial result" (Protección parcial) — same backend
+   * `partial` status, two very different things to a human.
+   * `null` while loading.
+   */
+  pendingCount: number | null;
 }
 
 function formatTimestamp(iso: string): string {
@@ -58,29 +67,77 @@ function formatTimestamp(iso: string): string {
   return `${datePart} · ${timePart}`;
 }
 
-function statusBadge(summary: SessionStatusSummary | null): {
+/**
+ * Maps the backend-derived `SessionStatusSummary` + the live pending
+ * count to a single human-readable badge. Six possible labels, no
+ * technical vocabulary, no chunk counters.
+ *
+ * Decision table:
+ *   loading (summary === null)                → "Cargando…"
+ *   unknown (fetch failed)                    → "Sin conexión"
+ *   empty (backend returned [])               → "Sin grabación"
+ *   complete (everything uploaded)            → "Protegido"
+ *   failed + pending > 0                      → "Subiendo" (starting,
+ *                                                nothing uploaded yet)
+ *   failed + pending === 0                    → "Error" (every chunk
+ *                                                attempted, none ok)
+ *   partial + pending > 0 + failed === 0      → "Subiendo" (still
+ *                                                progressing, no
+ *                                                permanent failures)
+ *   partial otherwise                         → "Protección parcial"
+ *                                                (final result has
+ *                                                gaps or failures)
+ *
+ * Lives in this file because it is presentation only. The underlying
+ * `deriveSessionStatus` logic in `@/api/history` is NOT changed —
+ * we only collapse its output to user-facing copy.
+ */
+function statusBadge(
+  summary: SessionStatusSummary | null,
+  pendingCount: number | null,
+): {
   label: string;
   color: string;
   bg: string;
 } {
-  // null = the chunks fetch hasn't started/finished yet for this row.
-  // Distinct from `status === 'unknown'` (fetch finished but failed)
-  // and from `status === 'empty'` (fetch succeeded with []).
   if (summary === null) {
     return { label: 'Cargando…', color: '#8b949e', bg: '#161b22' };
   }
   switch (summary.status) {
-    case 'complete':
-      return { label: 'Completa', color: '#56d364', bg: '#0a2a14' };
-    case 'partial':
-      return { label: 'Parcial', color: '#e3b341', bg: '#2d1f06' };
-    case 'failed':
-      return { label: 'Fallida', color: '#f85149', bg: '#2d0d12' };
-    case 'empty':
-      return { label: 'Sin chunks', color: '#8b949e', bg: '#161b22' };
     case 'unknown':
-      return { label: 'Error de conexión', color: '#f85149', bg: '#2d0d12' };
+      return { label: 'Sin conexión', color: '#f85149', bg: '#2d0d12' };
+    case 'empty':
+      return { label: 'Sin grabación', color: '#8b949e', bg: '#161b22' };
+    case 'complete':
+      return { label: 'Protegido', color: '#56d364', bg: '#0a2a14' };
+    case 'failed': {
+      // `failed` in backend semantics means uploaded === 0. That can
+      // happen because every chunk truly failed (Error) OR because
+      // every chunk is still pending (Subiendo). The pending count
+      // is the only thing that lets the UI tell them apart.
+      const stillTrying = (pendingCount ?? 0) > 0;
+      return stillTrying
+        ? { label: 'Subiendo', color: '#58a6ff', bg: '#0c1e3a' }
+        : { label: 'Error', color: '#f85149', bg: '#2d0d12' };
+    }
+    case 'partial': {
+      const stillTrying =
+        (pendingCount ?? 0) > 0 && summary.failed === 0;
+      return stillTrying
+        ? { label: 'Subiendo', color: '#58a6ff', bg: '#0c1e3a' }
+        : { label: 'Protección parcial', color: '#e3b341', bg: '#2d1f06' };
+    }
   }
+}
+
+/** Icon + human label for the recording mode. Emoji-only — no asset
+ *  dependency, no native font. Width difference between 🎤 and 🎥 is
+ *  negligible on Android system font stacks, so the row layout stays
+ *  consistent. */
+function modeBadge(mode: SessionMode): { icon: string; label: string } {
+  return mode === 'video'
+    ? { icon: '🎥', label: 'Vídeo' }
+    : { icon: '🎤', label: 'Audio' };
 }
 
 export default function HistoryScreen() {
@@ -92,7 +149,11 @@ export default function HistoryScreen() {
     // Initialise with `summary: null` so the FlatList renders
     // immediately with a "Cargando…" state per row instead of a blank
     // screen while we fetch.
-    const initial: Row[] = entries.map((entry) => ({ entry, summary: null }));
+    const initial: Row[] = entries.map((entry) => ({
+      entry,
+      summary: null,
+      pendingCount: null,
+    }));
     setRows(initial);
 
     // Fetch each row's real status in parallel. If any single fetch
@@ -102,18 +163,40 @@ export default function HistoryScreen() {
       entries.map(async (entry) => {
         try {
           const chunks = await listSessionChunks(entry.session_id);
-          return { entry, summary: deriveSessionStatus(chunks) };
+          // Raw `pending` count, kept alongside the derived summary so
+          // `statusBadge` can tell "Subiendo" apart from "Protección
+          // parcial" / "Error" without changing `deriveSessionStatus`.
+          const pendingCount = chunks.filter(
+            (c) => c.status === 'pending',
+          ).length;
+          return {
+            entry,
+            summary: deriveSessionStatus(chunks),
+            pendingCount,
+          };
         } catch {
-          return { entry, summary: deriveSessionStatus(null) };
+          return {
+            entry,
+            summary: deriveSessionStatus(null),
+            pendingCount: null,
+          };
         }
       }),
     );
     setRows(results);
   }
 
-  useEffect(() => {
-    load();
-  }, []);
+  // Reload on every focus, not just mount. The detail screen lets the
+  // user edit a session title; this guarantees the new label shows up
+  // the next time the user lands back on the list, without requiring a
+  // manual pull-to-refresh. Cheap: read of AsyncStorage + N parallel
+  // `listSessionChunks` calls already gated by the existing per-row
+  // try/catch.
+  useFocusEffect(
+    useCallback(() => {
+      load();
+    }, []),
+  );
 
   async function onRefresh() {
     setRefreshing(true);
@@ -180,54 +263,49 @@ export default function HistoryScreen() {
 }
 
 function HistoryRow({ row }: { row: Row }) {
-  const badge = statusBadge(row.summary);
-  // The counter line is auxiliary detail — the badge already carries
-  // the truthful state. Only render the X / Y counter when chunks
-  // actually exist; for loading / empty / unknown states the badge
-  // alone says everything that's known. No more "Sin chunks
-  // registrados" generic fallback that conflicted with "Sin datos".
-  const counter =
-    row.summary && row.summary.total > 0
-      ? `${row.summary.uploaded} / ${row.summary.total} chunks`
-      : null;
+  const badge = statusBadge(row.summary, row.pendingCount);
+  const mode = modeBadge(row.entry.mode);
+  // Trim defensively at render time so a stale entry stored before
+  // the trim guarantee in `updateHistoryEntryTitle` cannot leak
+  // surrounding whitespace into the row.
+  const title = (row.entry.title ?? '').trim();
+  const navigate = () => router.push(`/session/${row.entry.session_id}`);
 
   return (
     <Pressable
-      onPress={() => router.push(`/session/${row.entry.session_id}`)}
+      onPress={navigate}
       style={{
         backgroundColor: '#161b22',
         borderWidth: 1,
         borderColor: '#30363d',
-        borderRadius: 8,
-        padding: 12,
+        borderRadius: 10,
+        padding: 16,
       }}
     >
+      {/* Header row: mode icon + label on the left, status badge
+          aligned right. The two halves never wrap because the title
+          and timestamp live on their own lines below. */}
       <View
         style={{
           flexDirection: 'row',
           justifyContent: 'space-between',
-          alignItems: 'flex-start',
+          alignItems: 'center',
         }}
       >
-        <View style={{ flex: 1, paddingRight: 8 }}>
-          <Text style={{ color: '#c9d1d9', fontSize: 13, fontWeight: '600' }}>
-            {formatTimestamp(row.entry.created_at)}
+        <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+          <Text style={{ fontSize: 18, marginRight: 8 }}>{mode.icon}</Text>
+          <Text
+            style={{ color: '#c9d1d9', fontSize: 14, fontWeight: '600' }}
+          >
+            {mode.label}
           </Text>
-          <Text style={{ color: '#8b949e', fontSize: 11, marginTop: 4 }}>
-            Modo: {row.entry.mode}
-          </Text>
-          {counter !== null && (
-            <Text style={{ color: '#8b949e', fontSize: 11, marginTop: 2 }}>
-              {counter}
-            </Text>
-          )}
         </View>
 
         <View
           style={{
-            paddingHorizontal: 8,
+            paddingHorizontal: 10,
             paddingVertical: 4,
-            borderRadius: 4,
+            borderRadius: 999,
             borderWidth: 1,
             borderColor: badge.color,
             backgroundColor: badge.bg,
@@ -240,6 +318,65 @@ function HistoryRow({ row }: { row: Row }) {
           </Text>
         </View>
       </View>
+
+      {/* Optional title — only rendered when the user has set one.
+          Trimmed empty string collapses to "no title" so we never
+          show a blank line. */}
+      {title.length > 0 && (
+        <Text
+          style={{
+            color: '#c9d1d9',
+            fontSize: 15,
+            fontWeight: '500',
+            marginTop: 10,
+          }}
+          numberOfLines={2}
+        >
+          {title}
+        </Text>
+      )}
+
+      {/* Timestamp — sits below the title (or below the header when
+          there is no title). Dimmer than the title to avoid competing
+          with it visually. */}
+      <Text
+        style={{
+          color: '#8b949e',
+          fontSize: 12,
+          marginTop: title.length > 0 ? 4 : 10,
+        }}
+      >
+        {formatTimestamp(row.entry.created_at)}
+      </Text>
+
+      {/* Export CTA. Tapping it navigates to the detail screen which
+          already owns the export flow (progress, result, share, and
+          integrity verdict). Intentionally NOT a direct trigger —
+          the detail screen's UI is the right place for that
+          interaction.
+
+          React Native's `Pressable` does NOT bubble events to the
+          outer `Pressable`, so a tap on this button does not also
+          trigger the row-level `navigate`. Touches outside this
+          button still hit the outer Pressable and navigate. */}
+      <Pressable
+        onPress={navigate}
+        style={{
+          marginTop: 14,
+          alignSelf: 'flex-start',
+          paddingVertical: 10,
+          paddingHorizontal: 16,
+          borderRadius: 8,
+          borderWidth: 1,
+          borderColor: '#30363d',
+          backgroundColor: '#21262d',
+        }}
+        hitSlop={6}
+      >
+        <Text style={{ color: '#c9d1d9', fontSize: 13, fontWeight: '600' }}>
+          Exportar
+        </Text>
+      </Pressable>
     </Pressable>
   );
 }
