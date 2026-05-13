@@ -253,6 +253,20 @@ export default function SessionDetailScreen() {
   // Avoids storage thrash while typing and keeps the recording flow
   // free of any concurrent write storm.
   const titleDirtyRef = useRef<boolean>(false);
+  // Mirror of the last value successfully handed to
+  // `updateHistoryEntryTitle`, normalised to the on-disk shape
+  // (`string` non-empty trimmed, or `null` when the field is dropped).
+  // Used as the dedupe key for `persistTitle` below so the two write
+  // paths — the 600ms debounce and the immediate onBlur flush —
+  // cannot redundantly hit AsyncStorage with the same value, and
+  // cannot race each other: whichever path enters `persistTitle`
+  // first updates the ref synchronously before awaiting the write,
+  // so the loser short-circuits without a duplicate write.
+  //
+  // Hydrated by the same `readHistory` effect that loads
+  // `draftTitle`, so a freshly-mounted detail screen that opens an
+  // already-titled session knows the on-disk state from the start.
+  const lastPersistedTitleRef = useRef<string | null>(null);
   // Per-session upload destination, fetched once on mount via
   // GET /sessions/:id (no new endpoint). Cached so future copy /
   // diagnostics can branch on it without a second fetch. The export
@@ -438,8 +452,17 @@ export default function SessionDetailScreen() {
         const entry = list.find((e) => e.session_id === sessionId);
         if (!cancelled) {
           setSessionMode(entry?.mode ?? null);
-          setDraftTitle(entry?.title ?? '');
+          const stored = entry?.title ?? '';
+          setDraftTitle(stored);
           titleDirtyRef.current = false;
+          // Normalise to the same shape `updateHistoryEntryTitle`
+          // writes: empty / whitespace-only → null, otherwise the
+          // trimmed string. This is the canonical on-disk
+          // representation, which `persistTitle` compares against
+          // to decide whether a write is needed.
+          const trimmedStored = stored.trim();
+          lastPersistedTitleRef.current =
+            trimmedStored.length === 0 ? null : trimmedStored;
         }
       } catch {
         if (!cancelled) setSessionMode(null);
@@ -450,17 +473,45 @@ export default function SessionDetailScreen() {
     };
   }, [sessionId]);
 
+  // Single write path for the title, shared by the 600ms debounce
+  // below AND the immediate `onBlur` flush on the TextInput. The
+  // helper:
+  //   1. Normalises `value` to the on-disk shape (trimmed string or
+  //      `null`).
+  //   2. Compares against `lastPersistedTitleRef.current`. Equal →
+  //      return without touching AsyncStorage.
+  //   3. Updates the ref OPTIMISTICALLY before awaiting the write,
+  //      so any concurrent dispatcher (the about-to-fire debounce,
+  //      or a second blur) sees the new value and short-circuits.
+  //   4. Fires the write as fire-and-forget. `updateHistoryEntryTitle`
+  //      already swallows errors — a write failure leaves the ref
+  //      "lying" until the next distinct value arrives. Acceptable
+  //      under the existing best-effort contract of the helper.
+  //
+  // Closes over `sessionId` and the refs — never over `draftTitle`,
+  // so the caller passes the value explicitly. This matches both
+  // call sites: the debounce already has `draftTitle` in its
+  // dependency array, and the onBlur reads the current state at the
+  // moment the user leaves the field.
+  function persistTitle(value: string) {
+    if (!sessionId) return;
+    const trimmed = value.trim();
+    const normalised = trimmed.length === 0 ? null : trimmed;
+    if (lastPersistedTitleRef.current === normalised) return;
+    lastPersistedTitleRef.current = normalised;
+    updateHistoryEntryTitle(sessionId, normalised);
+  }
+
   // Debounced title write. Only fires after the user has actually
   // edited the field (`titleDirtyRef` flipped on each onChangeText),
   // so the hydration step above cannot trigger a redundant write.
-  // 600ms idle after the last keystroke → persist; trimmed empty
-  // string → `null` (the storage helper drops the field).
+  // 600ms idle after the last keystroke → `persistTitle`, which
+  // handles the dedupe and the empty→null normalisation.
   useEffect(() => {
     if (!sessionId) return;
     if (!titleDirtyRef.current) return;
     const handle = setTimeout(() => {
-      const trimmed = draftTitle.trim();
-      updateHistoryEntryTitle(sessionId, trimmed.length === 0 ? null : trimmed);
+      persistTitle(draftTitle);
     }, 600);
     return () => clearTimeout(handle);
   }, [draftTitle, sessionId]);
@@ -808,6 +859,16 @@ export default function SessionDetailScreen() {
             titleDirtyRef.current = true;
             setDraftTitle(next);
           }}
+          // Hardening: immediate persistence on focus loss. Without
+          // this, a user who edits the title and leaves the screen
+          // faster than the 600ms debounce would lose the last
+          // change. `persistTitle` dedupes against
+          // `lastPersistedTitleRef`, so a blur after the debounce
+          // already wrote the same value is a no-op. A blur after
+          // editing forwards to AsyncStorage immediately AND
+          // updates the ref synchronously, so the still-armed
+          // debounce (if any) short-circuits when its 600ms expire.
+          onBlur={() => persistTitle(draftTitle)}
           placeholder="Añadir título"
           placeholderTextColor="#6e7681"
           maxLength={80}
