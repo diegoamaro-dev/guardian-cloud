@@ -31,6 +31,7 @@ import { listChunksForSession } from '../services/chunks.service.js';
 import { getDestinationWithSecretForUser } from '../services/destinations.service.js';
 import { downloadFile, withDriveRetry } from '../services/drive.service.js';
 import { downloadChunk as webdavDownloadChunk } from '../adapters/webdav.adapter.js';
+import { tryGenerateManifest } from '../services/manifest.service.js';
 import { logger } from '../utils/logger.js';
 
 const router = Router();
@@ -124,7 +125,25 @@ router.post(
 
       const sessionId = req.params.id as string;
 
-const result = await completeSession(req.user.id, sessionId);
+      const result = await completeSession(req.user.id, sessionId);
+
+      // Best-effort cross-device manifest. `tryGenerateManifest` never
+      // throws — the defensive try/catch here is a seatbelt against a
+      // future bug in the service. Whatever happens inside, the client
+      // gets the same 200 OK + completion payload it received before
+      // this line existed. See `services/manifest.service.ts`.
+      try {
+        await tryGenerateManifest(req.user.id, sessionId, result);
+      } catch (err) {
+        logger.warn(
+          {
+            op: 'manifest.generate',
+            sessionId,
+            err: err instanceof Error ? err.message : String(err),
+          },
+          'GC_MANIFEST_UNEXPECTED_THROW',
+        );
+      }
 
       res.status(200).json(result);
     } catch (err) {
