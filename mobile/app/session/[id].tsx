@@ -17,6 +17,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  Platform,
   Pressable,
   ScrollView,
   Text,
@@ -66,6 +67,214 @@ async function handleShare(filePath: string) {
   } finally {
     isSharing = false;
   }
+}
+
+/**
+ * Map the exported file's extension to a MIME type the Android
+ * Storage Access Framework recognises. Used by `handleSaveToDevice`
+ * when calling `createFileAsync(parentUri, fileName, mimeType)`.
+ *
+ * Matches the four extensions `exportSession` can produce today:
+ *   '.aac' — AAC ADTS audio
+ *   '.m4a' — MP4-container audio
+ *   '.mp4' — MP4 video (forced when caller passes `mode='video'`)
+ *   '.bin' — forensic dump (sniff matched neither)
+ *
+ * Anything else collapses to `application/octet-stream` so an
+ * unrecognised extension still saves correctly even if Android's
+ * Files app cannot preview it.
+ */
+function mimeForExtension(ext: string): string {
+  switch (ext.toLowerCase()) {
+    case '.aac':
+      return 'audio/aac';
+    case '.m4a':
+      return 'audio/mp4';
+    case '.mp4':
+      return 'video/mp4';
+    case '.bin':
+      return 'application/octet-stream';
+    default:
+      return 'application/octet-stream';
+  }
+}
+
+// Single-flight lock for the SAF save flow. The picker is modal, so
+// a second tap before the picker closes would either be ignored by
+// the OS or queue a duplicate dialog. Local boolean keeps the JS
+// side in sync regardless of OEM behaviour. Mirrors the `isSharing`
+// pattern above.
+let isSavingToDevice = false;
+
+/**
+ * Save the already-exported file at `filePath` to a user-chosen
+ * location via the Android Storage Access Framework.
+ *
+ * Flow:
+ *   1. Ask Android for a directory permission (system folder picker).
+ *      User picks Downloads / Documents / anywhere they want.
+ *   2. Read the existing exported file from sandbox as base64.
+ *   3. Create a new file inside the chosen directory with the same
+ *      base name + extension, MIME type from `mimeForExtension`.
+ *   4. Write the base64 to the new file URI.
+ *
+ * Resolves to:
+ *   'saved'      — file written successfully.
+ *   'cancelled'  — user dismissed the picker (NOT an error).
+ *   'unsupported'— platform is not Android (button hidden in iOS UI,
+ *                  but the helper itself is defensive).
+ *   'error'      — anything else (logged via console.log 'SAVE ERROR').
+ *
+ * Does NOT touch `exportSession`, the export pipeline, the queue,
+ * the worker, recovery, or the backend. The sandbox copy of the
+ * file stays exactly where `exportSession` wrote it — this helper
+ * only adds a second copy at a user-visible location.
+ */
+async function handleSaveToDevice(
+  filePath: string,
+  extension: string,
+): Promise<'saved' | 'cancelled' | 'unsupported' | 'error'> {
+  if (Platform.OS !== 'android') return 'unsupported';
+  if (isSavingToDevice) return 'cancelled';
+  isSavingToDevice = true;
+  try {
+    const SAF = FileSystem.StorageAccessFramework;
+    // Picker. Returns { granted: boolean, directoryUri?: string }.
+    // User-cancel collapses to `granted: false`.
+    const perm = await SAF.requestDirectoryPermissionsAsync();
+    if (!perm.granted || !perm.directoryUri) {
+      return 'cancelled';
+    }
+
+    // File name derived from the source path so the saved copy keeps
+    // the same `guardian_export_{sessionId}` identifier the user
+    // already saw in `result.filePath`. Defensive split: anything
+    // weird collapses to a sensible default.
+    const lastSlash = filePath.lastIndexOf('/');
+    const fileName =
+      lastSlash >= 0 && lastSlash < filePath.length - 1
+        ? filePath.substring(lastSlash + 1)
+        : `guardian_export${extension}`;
+
+    const mime = mimeForExtension(extension);
+
+    // SAF returns the URI of the freshly-created file. We then write
+    // the base64 payload into it. Read + write are sequential — fine
+    // for MVP-size sessions (a few MB); for very large files we'd
+    // stream, tracked as TODO(save-streaming) but out of scope here.
+    const targetUri = await SAF.createFileAsync(
+      perm.directoryUri,
+      fileName,
+      mime,
+    );
+    const base64 = await FileSystem.readAsStringAsync(filePath, {
+      encoding: FileSystem.EncodingType.Base64,
+    });
+    await FileSystem.writeAsStringAsync(targetUri, base64, {
+      encoding: FileSystem.EncodingType.Base64,
+    });
+
+    return 'saved';
+  } catch (e) {
+    console.log('SAVE ERROR', e);
+    return 'error';
+  } finally {
+    isSavingToDevice = false;
+  }
+}
+
+/**
+ * Save-to-device CTA. Encapsulates the SAF flow + transient label
+ * feedback so the three result blocks (`'complete'`, `'partial'`,
+ * `LocalFallbackBlock`) can drop in `<SaveToDeviceButton .. />`
+ * without re-implementing the state machine each time.
+ *
+ * States:
+ *   idle    → "Guardar en el dispositivo"
+ *   saving  → "Guardando…"            (disabled while picker open)
+ *   saved   → "Guardado ✓"            (~2s, then back to idle)
+ *   error   → "No se pudo guardar"    (~3s, then back to idle)
+ *
+ * Cancellation by the user (picker dismissed) returns silently to
+ * idle without any flash of feedback — matches the rule "no error
+ * visible if the user cancels".
+ *
+ * Hidden entirely on non-Android platforms: SAF is the only path
+ * we support today; iOS would need a different mechanism and is
+ * out of scope for the MVP.
+ */
+function SaveToDeviceButton({
+  filePath,
+  extension,
+}: {
+  filePath: string;
+  extension: string;
+}) {
+  const [state, setState] = useState<'idle' | 'saving' | 'saved' | 'error'>(
+    'idle',
+  );
+
+  if (Platform.OS !== 'android') return null;
+
+  const labels: Record<typeof state, string> = {
+    idle: 'Guardar en el dispositivo',
+    saving: 'Guardando…',
+    saved: 'Guardado ✓',
+    error: 'No se pudo guardar',
+  };
+
+  const palette =
+    state === 'saved'
+      ? { border: '#238636', bg: '#0a2a14', color: '#56d364' }
+      : state === 'error'
+        ? { border: '#f85149', bg: '#2d0d12', color: '#f85149' }
+        : { border: '#1f6feb', bg: '#0c1e3a', color: '#c9d1d9' };
+
+  return (
+    <Pressable
+      onPress={async () => {
+        if (state !== 'idle') return;
+        setState('saving');
+        const outcome = await handleSaveToDevice(filePath, extension);
+        if (outcome === 'cancelled') {
+          // Silent return — user dismissed the picker on purpose.
+          setState('idle');
+          return;
+        }
+        if (outcome === 'unsupported') {
+          // Defensive: the button is hidden on non-Android, this
+          // branch should be unreachable. Still, fail silent rather
+          // than show a misleading error label.
+          setState('idle');
+          return;
+        }
+        setState(outcome === 'saved' ? 'saved' : 'error');
+        // Auto-revert so the button is usable again without
+        // navigating away. 2s for success (long enough to read),
+        // 3s for error (long enough to register).
+        const revertMs = outcome === 'saved' ? 2000 : 3000;
+        setTimeout(() => setState('idle'), revertMs);
+      }}
+      disabled={state !== 'idle'}
+      style={{
+        marginTop: 10,
+        paddingVertical: 10,
+        paddingHorizontal: 14,
+        borderWidth: 1,
+        borderColor: palette.border,
+        borderRadius: 6,
+        backgroundColor: palette.bg,
+        alignItems: 'center',
+        opacity: state === 'saving' ? 0.85 : 1,
+      }}
+    >
+      <Text
+        style={{ color: palette.color, fontSize: 13, fontWeight: '600' }}
+      >
+        {labels[state]}
+      </Text>
+    </Pressable>
+  );
 }
 
 // Local copy of the same chunked-base64 encoder used inside
@@ -1037,6 +1246,13 @@ function LocalExportBlock() {
  * file via `expo-sharing`, identical to the cloud success path.
  */
 function LocalFallbackBlock({ filePath }: { filePath: string }) {
+  // The local-fallback path does not carry an `ExportResult`, so the
+  // extension has to be derived from the file name. The recording
+  // flow writes `.aac`, `.m4a`, or `.mp4` depending on mode; anything
+  // else collapses to `.bin`, which `mimeForExtension` already
+  // handles as `application/octet-stream`.
+  const extMatch = filePath.match(/\.[a-z0-9]+$/i);
+  const extension = extMatch ? extMatch[0] : '.bin';
   return (
     <View
       style={{
@@ -1054,6 +1270,7 @@ function LocalFallbackBlock({ filePath }: { filePath: string }) {
       <Text style={{ color: '#c9d1d9', fontSize: 12, marginTop: 6 }}>
         Sin conexión: se ha exportado directamente desde el dispositivo.
       </Text>
+      <SaveToDeviceButton filePath={filePath} extension={extension} />
       <Pressable
         onPress={() => handleShare(filePath)}
         style={{
@@ -1312,25 +1529,35 @@ function ResultBlock({
           </View>
         )}
         {result.filePath && (
-          <Pressable
-            onPress={() => handleShare(result.filePath as string)}
-            style={{
-              marginTop: 10,
-              paddingVertical: 10,
-              paddingHorizontal: 14,
-              borderWidth: 1,
-              borderColor: '#30363d',
-              borderRadius: 6,
-              backgroundColor: '#161b22',
-              alignItems: 'center',
-            }}
-          >
-            <Text
-              style={{ color: '#c9d1d9', fontSize: 13, fontWeight: '500' }}
+          <>
+            <SaveToDeviceButton
+              filePath={result.filePath}
+              extension={
+                result.extension ??
+                result.filePath.match(/\.[a-z0-9]+$/i)?.[0] ??
+                '.bin'
+              }
+            />
+            <Pressable
+              onPress={() => handleShare(result.filePath as string)}
+              style={{
+                marginTop: 10,
+                paddingVertical: 10,
+                paddingHorizontal: 14,
+                borderWidth: 1,
+                borderColor: '#30363d',
+                borderRadius: 6,
+                backgroundColor: '#161b22',
+                alignItems: 'center',
+              }}
             >
-              Compartir archivo
-            </Text>
-          </Pressable>
+              <Text
+                style={{ color: '#c9d1d9', fontSize: 13, fontWeight: '500' }}
+              >
+                Compartir archivo
+              </Text>
+            </Pressable>
+          </>
         )}
       </View>
     );
@@ -1434,27 +1661,39 @@ function ResultBlock({
             The pipeline now writes only the contiguous valid prefix —
             sharing it gives the user the recoverable evidence even
             when format-level reproducibility is uncertain (MP4 without
-            moov atom, .bin forensic dump, etc.). */}
+            moov atom, .bin forensic dump, etc.). The save-to-device
+            CTA sits above share so the user sees "guardarlo aquí" as
+            the primary action and "compartirlo" as the alternative. */}
         {result.filePath && (
-          <Pressable
-            onPress={() => handleShare(result.filePath as string)}
-            style={{
-              marginTop: 10,
-              paddingVertical: 10,
-              paddingHorizontal: 14,
-              borderWidth: 1,
-              borderColor: '#30363d',
-              borderRadius: 6,
-              backgroundColor: '#161b22',
-              alignItems: 'center',
-            }}
-          >
-            <Text
-              style={{ color: '#c9d1d9', fontSize: 13, fontWeight: '500' }}
+          <>
+            <SaveToDeviceButton
+              filePath={result.filePath}
+              extension={
+                result.extension ??
+                result.filePath.match(/\.[a-z0-9]+$/i)?.[0] ??
+                '.bin'
+              }
+            />
+            <Pressable
+              onPress={() => handleShare(result.filePath as string)}
+              style={{
+                marginTop: 10,
+                paddingVertical: 10,
+                paddingHorizontal: 14,
+                borderWidth: 1,
+                borderColor: '#30363d',
+                borderRadius: 6,
+                backgroundColor: '#161b22',
+                alignItems: 'center',
+              }}
             >
-              Compartir archivo
-            </Text>
-          </Pressable>
+              <Text
+                style={{ color: '#c9d1d9', fontSize: 13, fontWeight: '500' }}
+              >
+                Compartir archivo
+              </Text>
+            </Pressable>
+          </>
         )}
 
         {/* Qualitative advisory: extension sniff fell back to .bin —
