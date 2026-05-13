@@ -56,6 +56,15 @@ import {
 import {
   startBackgroundProtection,
   stopBackgroundProtection,
+  // OEM diagnostics — read-only helpers consumed by GC_OEM_BG_STATUS
+  // and GC_OEM_BG_DELAYED_READY emissions below. None of these mutate
+  // engine state, request permissions, or start services. They exist
+  // so a Xiaomi / Samsung regression can be discriminated from logcat
+  // without coupling app/index.tsx to platform-specific APIs.
+  checkPostNotifications,
+  getOemFingerprint,
+  getBackgroundLibIsRunning,
+  isBackgroundProtectionRunning,
 } from '@/recording/backgroundService';
 import { usePermissionsStore } from '@/permissions/permissionsStore';
 import { humanizeFailure } from '@/errors/humanError';
@@ -4261,6 +4270,33 @@ export default function Index() {
 
         // No pending state — ready for a manual Phase 1 trigger.
         setTestStatus('READY');
+
+        // OEM diagnostics — boot-end snapshot. Read-only: captures
+        // device fingerprint, the current POST_NOTIFICATIONS state,
+        // both the FG-service "is alive" views (library + wrapper),
+        // and what the React permissions store currently thinks. The
+        // operator correlates this against the
+        // `GC_BOOT_BACKGROUND_SERVICE_START` log emitted just above
+        // (when boot decided to start the FG service for pending
+        // chunks). Fire-and-forget IIFE so the await on
+        // `checkPostNotifications` cannot delay `setIsRecovering(false)`
+        // in the finally below.
+        (async () => {
+          try {
+            console.log('GC_OEM_BG_STATUS', {
+              ts: Date.now(),
+              where: 'boot_end',
+              post_notifications: await checkPostNotifications(),
+              bg_lib_isRunning: getBackgroundLibIsRunning(),
+              bg_wrapper_isRunning: isBackgroundProtectionRunning(),
+              notificationDenied_store:
+                usePermissionsStore.getState().notificationDenied,
+              ...getOemFingerprint(),
+            });
+          } catch {
+            /* diagnostics must never break boot */
+          }
+        })();
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         setTestStatus(`ZZ_ERROR_CATCHALL: ${message || '<no message>'}`);
@@ -5145,6 +5181,50 @@ export default function Index() {
             });
           }
         });
+
+        // OEM diagnostics — foreground-resume snapshot. Same payload
+        // shape as the boot-end variant; lets the operator see whether
+        // the POST_NOTIFICATIONS state has shifted between cold boot
+        // and the user coming back to the app (hypothesis A: user
+        // granted the permission in system Settings while the app was
+        // backgrounded; hypothesis B: OEM permission propagation
+        // delay). Fire-and-forget IIFE — must not block the AppState
+        // handler or the drain kick above.
+        //
+        // If the React store still reports the notification as denied
+        // but the runtime check now says granted, also emit
+        // GC_OEM_BG_DELAYED_READY. That second log is the smoking gun
+        // for "store stale after Settings grant" (hypothesis A). We
+        // do NOT call setNotificationDenied here — the rule is
+        // diagnose-only. The fix lands in a separate pass once we
+        // have device evidence.
+        (async () => {
+          try {
+            const postNotif = await checkPostNotifications();
+            const storeBlocked =
+              usePermissionsStore.getState().notificationDenied;
+            console.log('GC_OEM_BG_STATUS', {
+              ts: Date.now(),
+              where: 'foreground_resume',
+              post_notifications: postNotif,
+              bg_lib_isRunning: getBackgroundLibIsRunning(),
+              bg_wrapper_isRunning: isBackgroundProtectionRunning(),
+              notificationDenied_store: storeBlocked,
+              ...getOemFingerprint(),
+            });
+            if (storeBlocked && postNotif === 'granted') {
+              console.log('GC_OEM_BG_DELAYED_READY', {
+                ts: Date.now(),
+                reason: 'store_says_blocked_but_perm_granted',
+                notificationDenied_store: true,
+                post_notifications: 'granted',
+                ...getOemFingerprint(),
+              });
+            }
+          } catch {
+            /* diagnostics must never break the AppState handler */
+          }
+        })();
       }
     });
     return () => sub.remove();

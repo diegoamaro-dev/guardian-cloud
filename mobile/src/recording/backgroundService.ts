@@ -39,6 +39,17 @@
  */
 
 import { PermissionsAndroid, Platform } from 'react-native';
+// Typed view into the Android-only `Platform.constants` fields used
+// by the OEM diagnostics helpers below. Keeping the type local
+// avoids a hard dep on react-native's internal `PlatformConstants`
+// definition (which is private and version-shifty). All accesses
+// downstream use `?? null` so missing fields collapse cleanly.
+type AndroidPlatformConstants = {
+  Manufacturer?: string;
+  Model?: string;
+  Brand?: string;
+  Release?: string;
+};
 import BackgroundActions, {
   type BackgroundTaskOptions,
 } from 'react-native-background-actions';
@@ -224,6 +235,23 @@ async function ensureNotificationPermission(): Promise<boolean> {
       result,
       granted,
     });
+    // OEM diagnostics: emit a structured "notification blocked" log
+    // when the user denied (or chose Don't-ask-again). Lets a Xiaomi /
+    // Samsung session be discriminated from logcat without coupling
+    // the gate logic to the diagnostic. Read-only — does NOT change
+    // the return value or the existing log key.
+    if (!granted) {
+      const reason =
+        result === PermissionsAndroid.RESULTS.NEVER_ASK_AGAIN
+          ? 'permission_never_ask_again'
+          : 'permission_denied';
+      console.log('GC_OEM_BG_NOTIF_BLOCKED', {
+        ts: Date.now(),
+        reason,
+        result_raw: result,
+        ...getOemFingerprint(),
+      });
+    }
     return granted;
   } catch (err) {
     error('GC_BACKGROUND_UPLOAD_ERROR', {
@@ -274,9 +302,37 @@ export async function startBackgroundProtection(
     interval_ms: TICK_INTERVAL_MS,
     notif_permission_granted: notifGranted,
   });
+  // OEM diagnostics: pre-start snapshot. Lets the operator correlate
+  // a Xiaomi/Samsung session against the existing
+  // `GC_BACKGROUND_CALL_START_BEGIN` (startRecording) or
+  // `GC_BOOT_BACKGROUND_SERVICE_START` (boot) logs by timestamp, and
+  // see the exact runtime permission state at the moment we are about
+  // to ask Android to start the foreground service. Read-only.
+  console.log('GC_OEM_BG_START', {
+    ts: Date.now(),
+    bg_lib_isRunning_pre: BackgroundActions.isRunning(),
+    bg_wrapper_isRunning_pre: isRunning,
+    post_notifications_pre: await checkPostNotifications(),
+    ...getOemFingerprint(),
+  });
+  const tStart = Date.now();
   try {
     await BackgroundActions.start(makeTaskBody(cb), baseOptions);
     isRunning = true;
+    // OEM diagnostics: post-start snapshot. `elapsed_ms_since_start`
+    // is the latency between asking Android to start and the promise
+    // resolving — relevant for hypothesis C (Android 14+ FGS
+    // upgrade-to-foreground delays under FGS_BG_START_RESTRICTION).
+    // `bg_lib_isRunning_post` should normally be true here; if it is
+    // false despite `start()` resolving, the OEM rejected the foreground
+    // upgrade silently. Read-only.
+    console.log('GC_OEM_BG_READY', {
+      ts: Date.now(),
+      elapsed_ms_since_start: Date.now() - tStart,
+      bg_lib_isRunning_post: BackgroundActions.isRunning(),
+      post_notifications_post: await checkPostNotifications(),
+      ...getOemFingerprint(),
+    });
     log('GC_BACKGROUND_UPLOAD_STARTED', {
       ok: true,
       lib_isRunning: BackgroundActions.isRunning(),
@@ -323,4 +379,111 @@ export async function stopBackgroundProtection(reason: string): Promise<void> {
  */
 export function isBackgroundProtectionRunning(): boolean {
   return isRunning;
+}
+
+// =============================================================================
+// OEM DIAGNOSTICS (read-only)
+// -----------------------------------------------------------------------------
+// Small helpers used by the GC_OEM_BG_* logs to fingerprint the device
+// and check the current POST_NOTIFICATIONS state without touching the
+// permission gate or the background-service lifecycle. None of these
+// helpers persist anything, mutate state, request permissions, start
+// services, or schedule retries. They exist solely so a Xiaomi /
+// Samsung / OEM regression can be diagnosed from logcat without
+// shipping additional native modules.
+//
+// Triggered from:
+//   - `startBackgroundProtection` (GC_OEM_BG_START / GC_OEM_BG_READY)
+//   - `ensureNotificationPermission` (GC_OEM_BG_NOTIF_BLOCKED)
+//   - app/index.tsx boot effect end (GC_OEM_BG_STATUS where='boot_end')
+//   - app/index.tsx AppState 'active' resume (GC_OEM_BG_STATUS
+//     where='foreground_resume' and conditionally GC_OEM_BG_DELAYED_READY)
+//
+// Removing these helpers must NOT change any pipeline behaviour. They
+// are purely observational.
+// =============================================================================
+
+export type OemFingerprint = {
+  manufacturer: string | null;
+  model: string | null;
+  brand: string | null;
+  android_release: string | null;
+  android_api: number | string | null;
+};
+
+/**
+ * Snapshot of device identifiers good enough to discriminate OEM
+ * cohorts (Xiaomi vs Samsung vs stock AOSP) without adding a native
+ * device-info dependency. Reads only `Platform.constants` and
+ * `Platform.Version`, both of which are populated synchronously by
+ * react-native at module-load time on Android. `null` on iOS.
+ */
+export function getOemFingerprint(): OemFingerprint {
+  if (Platform.OS !== 'android') {
+    return {
+      manufacturer: null,
+      model: null,
+      brand: null,
+      android_release: null,
+      android_api: null,
+    };
+  }
+  const consts = (Platform.constants ?? {}) as AndroidPlatformConstants;
+  return {
+    manufacturer: consts.Manufacturer ?? null,
+    model: consts.Model ?? null,
+    brand: consts.Brand ?? null,
+    android_release: consts.Release ?? null,
+    android_api: Platform.Version ?? null,
+  };
+}
+
+export type PostNotifStatus =
+  | 'granted'
+  | 'denied'
+  | 'not_applicable'
+  | 'unknown';
+
+/**
+ * Read-only check of the current POST_NOTIFICATIONS state.
+ *
+ * Returns `'not_applicable'` on iOS and Android < 13 (the permission
+ * does not exist there, so the foreground-service notification has no
+ * runtime gate). Returns `'unknown'` if the platform constant for the
+ * permission name is missing (older RN bundles) or if the call throws.
+ *
+ * Crucially distinct from `ensureNotificationPermission`: this helper
+ * NEVER requests the permission. It only reads the current state.
+ * Safe to call from any context, including AppState resume.
+ */
+export async function checkPostNotifications(): Promise<PostNotifStatus> {
+  if (Platform.OS !== 'android') return 'not_applicable';
+  if (typeof Platform.Version !== 'number' || Platform.Version < 33) {
+    return 'not_applicable';
+  }
+  type AndroidPermission = Parameters<typeof PermissionsAndroid.check>[0];
+  const permsAny = PermissionsAndroid.PERMISSIONS as unknown as Record<
+    string,
+    AndroidPermission | undefined
+  >;
+  const perm = permsAny.POST_NOTIFICATIONS;
+  if (!perm) return 'unknown';
+  try {
+    const granted = await PermissionsAndroid.check(perm);
+    return granted ? 'granted' : 'denied';
+  } catch {
+    return 'unknown';
+  }
+}
+
+/**
+ * Read-only proxy of the background-actions library's own "is the
+ * native service alive" flag. Distinct from
+ * `isBackgroundProtectionRunning()`, which only reflects the wrapper's
+ * local `isRunning` boolean — the wrapper flag can drift from reality
+ * when an OEM force-kills the FG service externally, and the OEM
+ * diagnostics need to see both views to detect that drift.
+ */
+export function getBackgroundLibIsRunning(): boolean {
+  return BackgroundActions.isRunning();
 }
