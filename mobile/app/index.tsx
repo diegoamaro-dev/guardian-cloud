@@ -3480,6 +3480,27 @@ export default function Index() {
    */
   const [protectedShownAt, setProtectedShownAt] = useState<number | null>(null);
   /**
+   * "El vídeo se detuvo porque la aplicación dejó de estar visible" sticky
+   * notice timestamp.
+   *
+   * Stamped by `stopVideoForBackground` (AppState 'background' branch in
+   * the lifecycle effect below) AFTER the existing `stopRecording()`
+   * sequence has finished its clean shutdown. The paired auto-dismiss
+   * effect clears it after VIDEO_BG_BANNER_MS, mirroring the
+   * `protectedShownAt` pattern next door.
+   *
+   * Pure UI state — never read by `deriveGuardianStatus`, never gates
+   * upload / recovery / export / chunking / queue. The single source of
+   * truth for system status stays `guardianStatus`. This banner only
+   * tells the user *why* the recording stopped (honest mode: video is
+   * foreground-only). Audio is unaffected — `configureAudioMode` keeps
+   * `shouldPlayInBackground` + `allowsBackgroundRecording` true and the
+   * audio path survives the same transition unchanged.
+   */
+  const [videoBackgroundStopAt, setVideoBackgroundStopAt] = useState<
+    number | null
+  >(null);
+  /**
    * Persisted UI preference: "Inicio rápido" (panic mode prep).
    *
    * When true:
@@ -4972,6 +4993,128 @@ export default function Index() {
     }
   }
 
+  /**
+   * "Video is foreground-only" clean shutdown.
+   *
+   * Invoked from the AppState listener when the app transitions to
+   * `'background'` while a video session is live. Reuses the existing
+   * `stopRecording()` pipeline — does NOT touch the recording / queue /
+   * worker / recovery internals.
+   *
+   * Guard rails (all read via refs so the closure captured by the
+   * listener at mount time always sees fresh values; mirrors how the
+   * existing listener reads `videoRecordPromiseRef.current` and
+   * `recordingModeRef.current`):
+   *
+   *   - mode must be 'video' — audio path is untouched
+   *     (`configureAudioMode` allows audio in background)
+   *   - `videoRecordPromiseRef.current` must be non-null — no live
+   *     recording means nothing to stop (also rules out the catch
+   *     path inside startRecording, which nulls the ref before the
+   *     finally clears isStartingRef)
+   *   - `isStartingRef.current` must be false — per the design
+   *     decision we defer rather than racing the start sequence
+   *   - `postStopChunkingInFlightRef.current` must be false — a
+   *     user-tap-stop already in flight handles teardown itself; we
+   *     skip to avoid a double-stop race
+   *
+   * stopRecording() is itself idempotent (`if (!hadAudio && !videoPromise)
+   * return;` at top) so even if guards lapse the second call is a no-op,
+   * but the explicit guards keep the log story clean: we emit
+   * `VIDEO_BACKGROUND_DETECTED` only when we actually act.
+   *
+   * Logs (matches the spec):
+   *   - VIDEO_BACKGROUND_DETECTED        — guards passed, about to stop
+   *   - VIDEO_RECORDING_STOPPED_BACKGROUND — stopRecording returned
+   *     (whether cleanly or via its own caught error)
+   *   - VIDEO_RECORDING_CLEAN_SHUTDOWN   — UI notice set, helper done
+   *
+   * Sticky banner is set unconditionally on shutdown so the user always
+   * gets the honest message; the auto-dismiss timer clears it after
+   * VIDEO_BG_BANNER_MS.
+   */
+  async function stopVideoForBackground(): Promise<void> {
+    // Guard 1: only fire for video sessions. Audio path is intentionally
+    // untouched — `configureAudioMode` configures the audio session to
+    // survive background, and `shouldPlayInBackground=true` keeps the
+    // OS-level recorder alive across this same transition.
+    if (recordingModeRef.current !== 'video') return;
+    // Guard 2: there must actually be a live recording. The ref is the
+    // single source of truth that startRecording succeeded past
+    // `recordAsync()` and stopRecording has not yet captured the promise.
+    if (videoRecordPromiseRef.current === null) return;
+    // Guard 3: defer if start is still in flight. Two outcomes are both
+    // acceptable per the design decision:
+    //   - start succeeds → user can stop manually, OR a later background
+    //     event re-fires this helper with isStartingRef false
+    //   - start fails → catch path nulls the ref and the next background
+    //     event sees `videoRecordPromiseRef.current === null` (Guard 2)
+    //     and skips
+    if (isStartingRef.current) {
+      console.log('VIDEO_BACKGROUND_DETECTED', {
+        deferred: true,
+        reason: 'is_starting',
+        ts: Date.now(),
+      });
+      return;
+    }
+    // Guard 4: skip if a user-tap-stop is already in flight. The
+    // post-stop chunking flag is set at the very top of stopRecording
+    // (before any await), so this guard wins the race when both a user
+    // tap and a background event arrive in the same tick.
+    if (postStopChunkingInFlightRef.current) return;
+
+    // Capture session id BEFORE stopRecording's finally clears it, so
+    // the post-stop logs can still correlate against the session.
+    const sid = sessionIdRef.current;
+    console.log('VIDEO_BACKGROUND_DETECTED', {
+      session_id: sid,
+      ts: Date.now(),
+    });
+
+    try {
+      // Reuse the existing teardown:
+      //   - cameraRef.current?.stopRecording()      → releases camera
+      //   - await videoRecordPromiseRef.current     → final URI
+      //   - moveAsync (cache → docDir)              → durability
+      //   - getController().chunkVideoFile(uri)     → emit whatever
+      //     bytes were captured before background
+      //   - queueMarkRecordingClosed                → close the entry
+      //     (the worker finalises the session — recovery is happy)
+      //
+      // The pipeline owns its own try/catch and writes any user-visible
+      // error to `testStatus` via the inner catch block. If the file is
+      // corrupted past chunkFile's tolerance, chunkFile throws, the
+      // inner catch logs ERROR REC STOP, and the queue entry is left
+      // with whatever chunks (possibly zero) reached the queue — the
+      // worker / recovery still finalise the session.
+      await stopRecording();
+      console.log('VIDEO_RECORDING_STOPPED_BACKGROUND', {
+        session_id: sid,
+        ts: Date.now(),
+      });
+    } catch (err) {
+      // Defensive: stopRecording handles its own errors internally, so
+      // reaching this catch implies a throw from an unexpected layer
+      // (e.g. a setState-after-unmount race on the host component
+      // tearing down). Mark the marker log so the operator can
+      // distinguish a clean shutdown from this rare exceptional path.
+      console.log('VIDEO_RECORDING_STOPPED_BACKGROUND', {
+        session_id: sid,
+        ts: Date.now(),
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+
+    // Surface the honest message to the user. The banner auto-dismisses
+    // after VIDEO_BG_BANNER_MS via the paired effect above.
+    setVideoBackgroundStopAt(Date.now());
+    console.log('VIDEO_RECORDING_CLEAN_SHUTDOWN', {
+      session_id: sid,
+      ts: Date.now(),
+    });
+  }
+
   // UI-only mirror of the upload queue progress. Polls every 500ms while
   // the user-perceived flow is active (recording, recovering, or stopping
   // — the worker may still be draining after STOP). The worker itself is
@@ -5155,6 +5298,32 @@ export default function Index() {
           session_id: sessionIdRef.current,
         });
       }
+      // Video is foreground-only (honest mode). If the app went to
+      // background during a video session, run a clean shutdown so the
+      // user gets a real verdict instead of a "Grabando" pill on a dead
+      // recorder. Strict `nextState === 'background'` (NOT 'inactive')
+      // to avoid stopping on transient interruptions — system picker,
+      // control center, brief permission prompts — which only push us
+      // to 'inactive' and back. 'background' is the durable signal.
+      //
+      // Audio path is intentionally untouched here. The audio engine
+      // configures `shouldPlayInBackground=true` /
+      // `allowsBackgroundRecording=true`; the foreground service keeps
+      // the JS runtime alive; the queue keeps draining. Nothing changes
+      // for audio across this transition.
+      //
+      // The helper has its own guards (mode/recording/starting/stopping)
+      // and falls through silently when they fail. Errors are logged
+      // inside the helper; this top-level catch defends only against an
+      // unrelated throw from the promise chain itself (e.g. setState
+      // after unmount during shutdown).
+      if (nextState === 'background') {
+        stopVideoForBackground().catch(err => {
+          console.log('VIDEO_BACKGROUND_STOP_FAILED', {
+            err: err instanceof Error ? err.message : String(err),
+          });
+        });
+      }
       if (nextState === 'active') {
         // Recovery-first: if the cold-boot destinations check failed
         // (offline at app open) `destinationResolved` stays false and
@@ -5291,6 +5460,23 @@ export default function Index() {
     }, remaining);
     return () => clearTimeout(timer);
   }, [protectedShownAt]);
+  // Auto-dismiss for the "video se detuvo por background" notice. Same
+  // shape as the `protectedShownAt` timer above. 5_000ms gives the user
+  // one extra second over the protected banner to register the message
+  // (it carries information the user may not have expected). The guard
+  // against a newer stamp racing with the timer fires is identical.
+  const VIDEO_BG_BANNER_MS = 5_000;
+  useEffect(() => {
+    if (videoBackgroundStopAt === null) return;
+    const elapsed = Date.now() - videoBackgroundStopAt;
+    const remaining = Math.max(0, VIDEO_BG_BANNER_MS - elapsed);
+    const timer = setTimeout(() => {
+      setVideoBackgroundStopAt(prev =>
+        prev === videoBackgroundStopAt ? null : prev,
+      );
+    }, remaining);
+    return () => clearTimeout(timer);
+  }, [videoBackgroundStopAt]);
   // The banner is independent of the current session's status: when
   // ANY session completes (current OR background) we want the user to
   // see the protected moment, even if other sessions are still
@@ -5301,6 +5487,7 @@ export default function Index() {
   // contradicts the system's truth — `guardianStatus` keeps its meaning
   // and `deriveGuardianStatus` is unchanged.
   const showProtectedBanner = protectedShownAt !== null;
+  const showVideoBackgroundStop = videoBackgroundStopAt !== null;
   // Subiendo label is conditional on whether at least one chunk has
   // physically uploaded:
   //   - uploadedCount === 0  → "Protegiendo evidencia"  — first chunk
@@ -5530,6 +5717,59 @@ export default function Index() {
             }}
           >
             Guardada fuera de tu móvil
+          </Text>
+        </View>
+      ) : null}
+
+      {/* Honest-mode notice when video stopped because the app left the
+          foreground. Amber palette to read as a non-fatal warning (not
+          green / success, not red / error). Time-bounded by the
+          `videoBackgroundStopAt` auto-dismiss effect — the visual lives
+          for VIDEO_BG_BANNER_MS then clears. Strictly UI: never gates
+          logic, never read by `deriveGuardianStatus`, never touches the
+          upload / recovery / export / queue pipelines.
+
+          Can render alongside `showProtectedBanner` and the dot/label
+          below — they describe different facts (this session was cut
+          short by background; chunks already uploaded remain protected;
+          new sessions can start normally). */}
+      {showVideoBackgroundStop ? (
+        <View
+          style={{
+            alignItems: 'center',
+            justifyContent: 'center',
+            paddingVertical: 14,
+            paddingHorizontal: 18,
+            borderRadius: 10,
+            backgroundColor: '#2d2204',
+            borderWidth: 1,
+            borderColor: '#d29922',
+            marginBottom: 12,
+            alignSelf: 'stretch',
+          }}
+        >
+          <Text
+            style={{
+              color: '#d29922',
+              fontSize: 15,
+              fontWeight: '700',
+              letterSpacing: 0.3,
+              textAlign: 'center',
+            }}
+          >
+            El vídeo se detuvo
+          </Text>
+          <Text
+            style={{
+              color: '#e8c97a',
+              fontSize: 13,
+              fontWeight: '400',
+              marginTop: 4,
+              textAlign: 'center',
+              lineHeight: 18,
+            }}
+          >
+            La aplicación dejó de estar visible.
           </Text>
         </View>
       ) : null}
