@@ -142,10 +142,37 @@ export default function OAuthDriveCallback() {
 
   // Auto-return to Settings after a brief success moment so the user
   // can confirm the new "Conectado" status without manually navigating.
+  //
+  // Why `back()` over `replace('/settings')` in the warm path:
+  //
+  // The deep link `guardiancloud://oauth/drive` arrives while Settings
+  // is the active screen (the user tapped "Connect" there a moment
+  // ago). Expo Router resolves the link by PUSHING `/oauth/drive` on
+  // top of the live stack → `[Home, Settings, OAuthDrive]`. A naked
+  // `router.replace('/settings')` only replaces the TOP entry, leaving
+  // the original Settings underneath → `[Home, Settings, Settings]` →
+  // the user has to tap "Volver" twice to escape Settings. The
+  // duplicate also confuses any code that introspects the stack.
+  //
+  // `back()` pops OAuthDrive cleanly and returns to the original
+  // Settings → `[Home, Settings]`. The previous Settings instance
+  // re-runs its focus / mount effects (refreshState etc.) and shows
+  // the new "Conectado" status without any duplicate. The error path
+  // below uses the same idiom for the same reason.
+  //
+  // Cold-start fallback: when the OS launches the app directly via the
+  // deep link there may be no previous screen on the stack. In that
+  // case `canGoBack()` is false and we fall back to the original
+  // `replace('/settings')` so the user still lands on Settings rather
+  // than on a now-stale OAuth confirmation screen.
   useEffect(() => {
     if (status !== 'success') return;
     const t = setTimeout(() => {
-      router.replace('/settings');
+      if (router.canGoBack()) {
+        router.back();
+      } else {
+        router.replace('/settings');
+      }
     }, 900);
     return () => clearTimeout(t);
   }, [status]);
@@ -235,7 +262,17 @@ export default function OAuthDriveCallback() {
             </Text>
           )}
           <Pressable
-            onPress={() => router.replace('/settings')}
+            onPress={() => {
+              // Same stack reasoning as the success path above: `back()`
+              // pops this OAuth screen and returns to the original
+              // Settings (warm path); the `canGoBack` guard covers the
+              // cold-start case where there is no previous screen.
+              if (router.canGoBack()) {
+                router.back();
+              } else {
+                router.replace('/settings');
+              }
+            }}
             style={{
               backgroundColor: '#1f6feb',
               paddingVertical: 12,
