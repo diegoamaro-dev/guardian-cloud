@@ -193,5 +193,50 @@ Motivo:
 ---
 
 ### Regla de diseño
+## Cross-device recovery architecture
 
-> La evidencia debe poder usarse fuera del sistema, aunque el dispositivo original no exista
+Recovery source of truth:
+- Drive manifests
+- Drive chunks
+
+Recovery NO depende del estado local del dispositivo.
+
+El dispositivo original puede:
+- perderse
+- destruirse
+- resetearse
+- desinstalar la app
+
+Mientras:
+- el manifest exista
+- los chunks existan
+- el usuario conecte el mismo Drive
+
+la evidencia puede reconstruirse.
+
+### Flujo
+
+Device A
+→ upload realtime
+→ manifest generation
+→ Drive
+
+Device B
+→ discovery
+→ manifest validation
+→ chunk reconstruction
+→ export local
+
+### Importante
+
+Recovery cross-device es aditivo.
+
+NO reemplaza:
+- recovery local
+- GC_QUEUE
+- upload worker
+- background persistence
+
+El objetivo sigue siendo:
+
+> subir evidencia DURANTE la grabación

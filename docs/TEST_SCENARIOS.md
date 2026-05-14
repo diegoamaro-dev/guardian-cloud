@@ -151,3 +151,84 @@ verificar:
 resultado esperado:
 
 > el usuario puede usar el sistema completo sin asistencia
+
+Añadir:
+
+Esperado:
+- sesión visible
+- fecha correcta
+- icono correcto
+- estado Protegido
+
+---
+
+### Caso 2 — Recovery A → B
+
+1. móvil A graba
+2. móvil B inicia sesión
+3. conectar mismo Drive
+4. abrir recovery
+5. reconstruir
+
+Esperado:
+- archivo reproducible
+- save/share operativo
+
+---
+
+### Caso 3 — Partial recovery
+
+1. borrar chunk manualmente en Drive
+2. ejecutar recovery
+
+Esperado:
+- estado Protección parcial
+- archivo truncado
+- save/share habilitado
+
+---
+
+### Caso 4 — Manifest missing
+
+1. borrar manifest
+2. abrir recovery detail
+
+Esperado:
+- error claro
+- no crash
+
+---
+
+### Caso 5 — Export regression
+
+1. grabar sesión normal
+2. exportar desde History
+
+Esperado:
+- mismo comportamiento previo
+- mismo filename
+- mismo pipeline
+
+---
+
+### Caso 6 — Drive disconnected
+
+1. desconectar Drive
+2. abrir recovery
+
+Esperado:
+- drive_not_connected
+- CTA a configuración
+
+---
+
+### Caso 7 — Save/share
+
+1. recovery completo
+2. guardar en dispositivo
+3. compartir
+
+Esperado:
+- archivo accesible
+- Android SAF operativo
+- share sheet operativo

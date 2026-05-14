@@ -140,3 +140,27 @@ Permitir:
 * debe ser idempotente
 * no duplicar datos
 * no introducir estado adicional
+
+## Recovery
+
+### GET /recovery/manifests
+
+Lista manifests recuperables del usuario.
+
+Response:
+
+```json
+{
+  "drive_not_connected": false,
+  "manifests": [
+    {
+      "session_id": "uuid",
+      "mode": "audio",
+      "created_at": "2026-05-14T10:00:00.000Z",
+      "completed_at": "2026-05-14T10:05:00.000Z",
+      "chunk_count": 5,
+      "protection_status": "complete",
+      "manifest_file_id": "drive_file_id"
+    }
+  ]
+}

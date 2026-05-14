@@ -50,3 +50,13 @@ Not:
 * new features
 * advanced security
 * system expansion
+
+## Cross-device recovery
+
+Estado: VALIDADO EN CONDICIONES REALES
+
+Capacidades:
+- discovery cross-device
+- reconstruction from manifest
+- partial recovery
+- export from recovered evidence
