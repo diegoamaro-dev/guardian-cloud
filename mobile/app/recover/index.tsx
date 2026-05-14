@@ -25,6 +25,10 @@
  * Pull-to-refresh re-runs the same fetch. The screen is on-demand: nothing
  * runs until the user navigates here, nothing keeps running after they
  * leave.
+ *
+ * Route file lives at `app/recover/index.tsx` (not `app/recover.tsx`) so it
+ * is an unambiguous sibling of `app/recover/[id].tsx`. Expo Router resolves
+ * `/recover` here and `/recover/<id>` to the detail screen.
  */
 
 import { useCallback, useEffect, useState } from 'react';
