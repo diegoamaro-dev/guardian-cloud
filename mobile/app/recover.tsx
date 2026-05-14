@@ -121,10 +121,13 @@ export default function RecoverScreen() {
     // expo-router's path parsing — the detail screen does a defensive
     // `decodeURIComponent` on read. The detail screen is the only
     // consumer of this opaque id; it never reaches the UI.
-    router.push({
-      pathname: '/recover/[id]',
-      params: { id: encodeURIComponent(manifestFileId) },
-    });
+    //
+    // String-template form (not `{ pathname: '/recover/[id]', params }`)
+    // because the object form requires typed routes to substitute the
+    // `[id]` placeholder; without them expo-router fails to resolve and
+    // falls back to the unmatched-route screen. Mirrors `/session/<id>`
+    // navigation in history.tsx.
+    router.push(`/recover/${encodeURIComponent(manifestFileId)}`);
   }
 
   return (
