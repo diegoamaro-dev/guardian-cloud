@@ -38,10 +38,13 @@
 
 import { Buffer } from 'node:buffer';
 
+import { AppError } from '../errors/AppError.js';
 import { logger } from '../utils/logger.js';
 import { getDestinationWithSecretForUser } from './destinations.service.js';
 import {
   downloadFile,
+  ensureRootFolder,
+  findFileByName,
   listFilesInFolder,
   withDriveRetry,
 } from './drive.service.js';
@@ -79,6 +82,20 @@ const MANIFEST_SCHEMA = 'guardian-cloud.manifest.v1';
  */
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MANIFEST_NAME_REGEX = /^[0-9a-f-]{36}_manifest\.json$/i;
+/**
+ * Deterministic chunk filename pattern. Must match the formula written
+ * by `manifest.service.ts:chunkFileName` and `destinations.routes.ts`
+ * (upload proxy). Used to defensively validate `file_name` fields inside
+ * a manifest before trusting them as Drive lookup keys.
+ */
+const CHUNK_FILE_NAME_REGEX =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}_[0-9]{6}_[0-9a-f]{12}\.chunk$/i;
+/**
+ * Hex sha256 guard (lowercase, 64 chars). Same shape `chunks.service.ts`
+ * enforces server-side on upload, so any manifest with a hash outside
+ * this shape is structurally invalid.
+ */
+const HEX_SHA256_REGEX = /^[a-f0-9]{64}$/i;
 
 /**
  * Parsed manifest shape — mirrors what `manifest.service.ts` emits but
@@ -352,4 +369,399 @@ export async function listDriveManifests(
   );
 
   return { drive_not_connected: false, manifests };
+}
+
+// ===========================================================================
+// COMMIT 3 — manifest-driven export support
+// ===========================================================================
+//
+// `parseManifest` above is a discovery-only validator: it intentionally
+// ignores the `chunks` array because the recovery LIST endpoint never
+// surfaces chunk-level data to the UI. COMMIT 3 needs the chunks too —
+// the mobile recovery exporter walks them in `chunk_index` order, asks
+// the backend for each chunk's bytes, verifies sha256, concatenates,
+// and writes a file.
+//
+// To avoid coupling the discovery code path to chunk validation we add
+// a SECOND validator (`parseManifestFull`) and TWO new entry points
+// (`getManifestByFileId`, `downloadManifestChunk`). The route layer
+// owns HTTP-shaped errors via AppError; the service throws those when
+// it cannot satisfy the caller. This is the ONLY place in recovery.*
+// that throws — `listDriveManifests` above remains never-throwing per
+// COMMIT 2 contract.
+
+export interface ManifestChunkRef {
+  chunk_index: number;
+  hash: string;
+  size: number;
+  file_name: string;
+}
+
+export interface FullManifest {
+  manifest_file_id: string;
+  session_id: string;
+  mode: 'audio' | 'video';
+  created_at: string;
+  completed_at: string;
+  chunk_count: number;
+  chunks: ManifestChunkRef[];
+}
+
+/**
+ * Strict JSON validator for the FULL manifest blob, including the
+ * `chunks` array. Same rejection semantics as `parseManifest`: returns
+ * null on ANY shape problem and never throws.
+ *
+ * Differences from `parseManifest`:
+ *   - validates `chunks` is an array of `{chunk_index, hash, size,
+ *     file_name}` each passing the same shape checks the upload proxy
+ *     enforces server-side
+ *   - cross-checks `chunks.length === chunk_count` (manifest builder
+ *     guarantees this, so a divergence is a tampering signal)
+ *   - cross-checks every chunk's `file_name` starts with the same
+ *     `session_id` prefix as the manifest claims (defense against a
+ *     manifest pointing at chunks of a different session)
+ *
+ * Exposed for unit testing.
+ */
+export function parseManifestFull(
+  raw: unknown,
+  manifestFileId: string,
+): FullManifest | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const m = raw as Record<string, unknown>;
+
+  if (m.schema !== MANIFEST_SCHEMA) return null;
+  if (typeof m.session_id !== 'string' || !UUID_REGEX.test(m.session_id)) {
+    return null;
+  }
+  if (m.mode !== 'audio' && m.mode !== 'video') return null;
+  if (typeof m.created_at !== 'string' || m.created_at.length < 10) return null;
+  if (typeof m.completed_at !== 'string' || m.completed_at.length < 10) {
+    return null;
+  }
+  if (
+    typeof m.chunk_count !== 'number' ||
+    !Number.isFinite(m.chunk_count) ||
+    m.chunk_count < 0
+  ) {
+    return null;
+  }
+  if (!Array.isArray(m.chunks)) return null;
+
+  // Strict chunks validation. We do NOT accept any chunk that fails the
+  // shape check — a partial parse would hide tampering. The session_id
+  // prefix check defends against a manifest pointing at chunks of a
+  // different session by name reuse (file_name starts with the
+  // session_id UUID by construction in `manifest.service.ts`).
+  const sessionId = m.session_id;
+  const chunks: ManifestChunkRef[] = [];
+  const seenIndexes = new Set<number>();
+  for (const c of m.chunks) {
+    if (!c || typeof c !== 'object') return null;
+    const cc = c as Record<string, unknown>;
+    if (
+      typeof cc.chunk_index !== 'number' ||
+      !Number.isInteger(cc.chunk_index) ||
+      cc.chunk_index < 0
+    ) {
+      return null;
+    }
+    if (typeof cc.hash !== 'string' || !HEX_SHA256_REGEX.test(cc.hash)) {
+      return null;
+    }
+    if (
+      typeof cc.size !== 'number' ||
+      !Number.isInteger(cc.size) ||
+      cc.size <= 0
+    ) {
+      return null;
+    }
+    if (typeof cc.file_name !== 'string' || !CHUNK_FILE_NAME_REGEX.test(cc.file_name)) {
+      return null;
+    }
+    if (!cc.file_name.startsWith(`${sessionId}_`)) return null;
+    if (seenIndexes.has(cc.chunk_index)) return null; // duplicate index
+    seenIndexes.add(cc.chunk_index);
+    chunks.push({
+      chunk_index: cc.chunk_index,
+      hash: cc.hash,
+      size: cc.size,
+      file_name: cc.file_name,
+    });
+  }
+
+  if (chunks.length !== m.chunk_count) return null;
+
+  // Sort ascending so callers (route response, chunk lookup) get a
+  // deterministic order regardless of how Drive stored them.
+  chunks.sort((a, b) => a.chunk_index - b.chunk_index);
+
+  return {
+    manifest_file_id: manifestFileId,
+    session_id: sessionId,
+    mode: m.mode,
+    created_at: m.created_at,
+    completed_at: m.completed_at,
+    chunk_count: m.chunk_count,
+    chunks,
+  };
+}
+
+/**
+ * Resolve the user's Drive destination + refresh token, or throw an
+ * AppError the route layer can translate. Shared by `getManifestByFileId`
+ * and `downloadManifestChunk`.
+ *
+ * Distinct from `listDriveManifests` which folds the same failure modes
+ * into an in-band `drive_not_connected: true` payload — COMMIT 2 wanted
+ * that for the LIST screen, COMMIT 3 wants explicit errors so the
+ * detail screen can show "Esta evidencia ya no está disponible" rather
+ * than silently rendering an empty state.
+ */
+async function resolveDriveContext(
+  userId: string,
+): Promise<{ refreshToken: string; folderId: string | null }> {
+  const dest = await getDestinationWithSecretForUser(userId, 'drive');
+  if (!dest || dest.status !== 'connected' || !dest.refresh_token) {
+    throw new AppError(
+      503,
+      'DRIVE_NOT_CONNECTED',
+      'No connected Google Drive destination for this user',
+    );
+  }
+  return { refreshToken: dest.refresh_token, folderId: dest.folder_id };
+}
+
+/**
+ * Download a manifest from Drive, validate it with `parseManifestFull`,
+ * and return the structured projection. Throws:
+ *   - 503 DRIVE_NOT_CONNECTED
+ *   - 404 MANIFEST_NOT_FOUND     (Drive deleted the file)
+ *   - 404 MANIFEST_INVALID       (schema check failed / corrupt JSON)
+ *   - propagates withDriveRetry's underlying error otherwise
+ *
+ * Used by both new endpoints; the chunk download endpoint calls this
+ * (re-validating each time) instead of trusting an open-ended cache —
+ * keep the code simple, optimise if a real load profile demands it.
+ */
+export async function getManifestByFileId(
+  userId: string,
+  manifestFileId: string,
+): Promise<FullManifest> {
+  const { refreshToken } = await resolveDriveContext(userId);
+
+  let manifest: FullManifest | null = null;
+  try {
+    manifest = await withDriveRetry(refreshToken, async (accessToken) => {
+      let bytes: Buffer;
+      try {
+        bytes = await downloadFile(accessToken, manifestFileId);
+      } catch (err) {
+        if (err instanceof AppError && err.code === 'DRIVE_FILE_NOT_FOUND') {
+          throw new AppError(
+            404,
+            'MANIFEST_NOT_FOUND',
+            'Manifest file no longer exists in Drive',
+          );
+        }
+        throw err;
+      }
+
+      let json: unknown;
+      try {
+        json = JSON.parse(bytes.toString('utf8'));
+      } catch (err) {
+        logger.warn(
+          {
+            op: 'recovery.manifest_fetch',
+            userId,
+            manifest_file_id: manifestFileId,
+            reason: 'invalid_json',
+            err: err instanceof Error ? err.message : String(err),
+          },
+          'GC_RECOVERY_MANIFEST_INVALID',
+        );
+        throw new AppError(
+          404,
+          'MANIFEST_INVALID',
+          'Manifest file is not valid JSON',
+        );
+      }
+
+      const parsed = parseManifestFull(json, manifestFileId);
+      if (!parsed) {
+        logger.warn(
+          {
+            op: 'recovery.manifest_fetch',
+            userId,
+            manifest_file_id: manifestFileId,
+            reason: 'schema_invalid_or_unknown',
+          },
+          'GC_RECOVERY_MANIFEST_INVALID',
+        );
+        throw new AppError(
+          404,
+          'MANIFEST_INVALID',
+          'Manifest schema check failed',
+        );
+      }
+
+      return parsed;
+    });
+  } catch (err) {
+    // AppError percolates up unchanged — the route handler translates
+    // it to the proper HTTP response. Anything else is wrapped so we
+    // never leak Drive internals.
+    if (err instanceof AppError) throw err;
+    logger.warn(
+      {
+        op: 'recovery.manifest_fetch',
+        userId,
+        manifest_file_id: manifestFileId,
+        err: err instanceof Error ? err.message : String(err),
+      },
+      'GC_RECOVERY_MANIFEST_FETCH_FAILED',
+    );
+    throw new AppError(
+      502,
+      'DRIVE_API_FAILED',
+      'Failed to read manifest from Drive',
+    );
+  }
+
+  logger.info(
+    {
+      op: 'recovery.manifest_fetch',
+      userId,
+      manifest_file_id: manifestFileId,
+      session_id: manifest.session_id,
+      chunk_count: manifest.chunk_count,
+    },
+    'GC_RECOVERY_MANIFEST_OK',
+  );
+  return manifest;
+}
+
+/**
+ * Result of `downloadManifestChunk` — raw bytes plus the chunk's
+ * canonical hash so the route can stream both back to the client. The
+ * client recomputes the sha256 over the bytes and compares against
+ * `hash`; the hash itself is sourced from the manifest, which the user
+ * already owns.
+ */
+export interface ManifestChunkBytes {
+  bytes: Buffer;
+  hash: string;
+  size: number;
+}
+
+/**
+ * Download a single chunk of a manifest from Drive. Composition:
+ *
+ *   1. Re-resolve Drive destination (auth)
+ *   2. `getManifestByFileId` re-validates the manifest end-to-end
+ *      (cheap; the file is small JSON)
+ *   3. Look up `chunks[i]` by chunk_index
+ *   4. Resolve the chunk's `file_name` to a Drive file_id via
+ *      `findFileByName` against the user's GuardianCloud folder
+ *   5. `downloadFile` returns the bytes
+ *   6. Return bytes + hash for the route to stream
+ *
+ * Throws:
+ *   - 503 DRIVE_NOT_CONNECTED         (auth gate)
+ *   - 404 MANIFEST_NOT_FOUND          (manifest gone)
+ *   - 404 MANIFEST_INVALID            (schema check failed)
+ *   - 404 CHUNK_INDEX_NOT_IN_MANIFEST (i out of range)
+ *   - 404 CHUNK_FILE_NOT_FOUND        (chunk file gone from Drive)
+ *   - 502 DRIVE_API_FAILED            (anything else from Drive)
+ *
+ * The N+1 pattern (one manifest fetch per chunk download) mirrors the
+ * existing `/sessions/:id/chunks/:idx/download` endpoint (which does a
+ * `listChunksForSession` per call). Same cost profile as the export
+ * path the mobile client already tolerates.
+ */
+export async function downloadManifestChunk(
+  userId: string,
+  manifestFileId: string,
+  chunkIndex: number,
+): Promise<ManifestChunkBytes> {
+  if (!Number.isInteger(chunkIndex) || chunkIndex < 0) {
+    throw new AppError(400, 'INVALID_CHUNK_INDEX', 'Invalid chunk index');
+  }
+
+  // Re-validate the manifest. `getManifestByFileId` covers
+  // DRIVE_NOT_CONNECTED / MANIFEST_NOT_FOUND / MANIFEST_INVALID and
+  // the route handler turns those into proper HTTP errors.
+  const manifest = await getManifestByFileId(userId, manifestFileId);
+
+  const target = manifest.chunks.find((c) => c.chunk_index === chunkIndex);
+  if (!target) {
+    throw new AppError(
+      404,
+      'CHUNK_INDEX_NOT_IN_MANIFEST',
+      'Manifest does not list a chunk with this index',
+    );
+  }
+
+  // Resolve folder + token + lookup-by-name + download in one
+  // withDriveRetry envelope. Same pattern as the manifest fetch.
+  const { refreshToken, folderId: cachedFolderId } =
+    await resolveDriveContext(userId);
+
+  try {
+    const bytes = await withDriveRetry(refreshToken, async (accessToken) => {
+      // Self-heal: if `destinations.folder_id` is missing we resolve via
+      // `ensureRootFolder` rather than failing. We do NOT persist here —
+      // the chunk upload path owns that responsibility.
+      const folderId =
+        cachedFolderId ?? (await ensureRootFolder(accessToken));
+
+      const driveFileId = await findFileByName(
+        accessToken,
+        folderId,
+        target.file_name,
+      );
+      if (!driveFileId) {
+        throw new AppError(
+          404,
+          'CHUNK_FILE_NOT_FOUND',
+          'Chunk file referenced by the manifest is no longer in Drive',
+        );
+      }
+      return await downloadFile(accessToken, driveFileId);
+    });
+
+    logger.info(
+      {
+        op: 'recovery.chunk_download',
+        userId,
+        manifest_file_id: manifestFileId,
+        session_id: manifest.session_id,
+        chunk_index: chunkIndex,
+        size: bytes.length,
+      },
+      'GC_RECOVERY_CHUNK_OK',
+    );
+
+    return { bytes, hash: target.hash, size: target.size };
+  } catch (err) {
+    if (err instanceof AppError) throw err;
+    logger.warn(
+      {
+        op: 'recovery.chunk_download',
+        userId,
+        manifest_file_id: manifestFileId,
+        session_id: manifest.session_id,
+        chunk_index: chunkIndex,
+        err: err instanceof Error ? err.message : String(err),
+      },
+      'GC_RECOVERY_CHUNK_FAILED',
+    );
+    throw new AppError(
+      502,
+      'DRIVE_API_FAILED',
+      'Failed to download chunk from Drive',
+    );
+  }
 }

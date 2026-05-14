@@ -325,110 +325,73 @@ export async function verifyHash(
 }
 
 /**
- * Orchestrator. Never throws — any failure is folded into the result.
+ * Minimal shape the shared exporter needs to identify each chunk: index,
+ * expected sha256, expected size. The data source for chunk metadata is
+ * caller-specific (DB-backed `ChunkMeta` for normal export, manifest for
+ * cross-device recovery export); both collapse to this small struct
+ * before entering `exportFromChunkRefs`.
  *
- * The write-to-disk step happens ONCE at the end with the concatenated
- * bytes, not per-chunk. Per-chunk append would require either the
- * modern `FileSystem.File` API (different import) or a read-modify-write
- * loop, both of which are out of scope for the MVP.
- *
- * Memory: accumulates ~O(N) bytes for the session plus ~4N/3 for the
- * terminal base64 encoding. For MVP-size sessions (a few MB) this is
- * fine; large sessions are covered by TODO(export-large).
+ * Exposed for the recovery exporter — see `mobile/src/api/recoveryExport.ts`.
  */
-export async function exportSession(
+export interface ChunkRef {
+  chunk_index: number;
+  hash: string;
+  size: number;
+}
+
+/**
+ * Shared exporter primitive. Walks the longest contiguous prefix of
+ * `chunks`, downloads each via `downloadFn`, verifies sha256, concats,
+ * sniffs the output container (or honours `mode='video'`), writes the
+ * file as base64 under `${docDir}${filenamePrefix}_${sessionId}${ext}`,
+ * and returns an `ExportResult` shaped exactly like the legacy
+ * `exportSession` did before the refactor.
+ *
+ * Both callers — `exportSession` (DB-backed) and `exportRecoveredSession`
+ * (manifest-backed) — funnel through this function so the survival
+ * rules (longest valid prefix, stop at first gap) and the diagnostic
+ * logs stay literally identical.
+ *
+ * The function does NOT do:
+ *   - the upstream list/fetch (caller's job)
+ *   - the empty-set early return (caller's job — exportSession needs to
+ *     report `chunks.length` for the legacy "no_uploaded_chunks" branch,
+ *     which is data-source-specific)
+ *   - any persistence beyond the on-disk file
+ *
+ * Behaviour-preserving contract with the pre-refactor `exportSession`:
+ *   - same log keys: `EXPORT STOPPED AT GAP`, `EXPORT CHUNK DOWNLOADED`,
+ *     `EXPORT CHUNK CORRUPT`, `GC_EXPORT_HASH_MISMATCH`,
+ *     `EXPORT PREFIX SUMMARY`, `EXPORT ERROR`, `EXPORT EXT SNIFF`,
+ *     `EXPORT COMPLETE`, `EXPORT PARTIAL`, `GC_EXPORT_RESULT`,
+ *     `GC_EXPORT_DIAG_RAW`, `GC_EXPORT_DEBUG_CORRUPTED_CHUNK`
+ *   - same `ExportResult` shape, same status semantics
+ *   - same byte-sniff (.aac / .m4a / .mp4 / .bin), same video override
+ *   - same on-disk path: `${docDir}${filenamePrefix}_${sessionId}${ext}`
+ *   - `filenamePrefix === 'guardian_export'` reproduces the legacy
+ *     filename; recovery uses `'guardian_recovered'` to coexist without
+ *     overwriting prior normal exports.
+ *
+ * Never throws — every failure mode is folded into the result.
+ */
+export async function exportFromChunkRefs(
   sessionId: string,
+  filenamePrefix: 'guardian_export' | 'guardian_recovered',
+  chunks: ChunkRef[],
+  downloadFn: (chunkIndex: number) => Promise<{
+    bytes: Uint8Array;
+    headerHash: string;
+  }>,
   onProgress?: (p: ExportProgress) => void,
-  /**
-   * Optional recording mode. When 'video', the output extension is forced
-   * to '.mp4' regardless of what the byte-sniff would say (an MP4 video
-   * starts with `ftyp`, which the sniff classifies as `.m4a` — wrong for
-   * video). When 'audio' or undefined the existing sniff runs unchanged
-   * (audio sessions are AAC ADTS or legacy MP4-audio; both are correctly
-   * classified by `hasAacSync` / `hasFtyp`).
-   *
-   * Optional so existing audio-only callers do not need to change. The
-   * caller (session detail screen) reads the mode from the local history
-   * index, which records `mode` per session at creation time.
-   */
   mode?: SessionMode,
 ): Promise<ExportResult> {
-  log('EXPORT START', { sessionId, mode });
-
-  let chunks: ChunkMeta[];
-  try {
-    chunks = await listSessionChunks(sessionId);
-  } catch (err) {
-    error('EXPORT ERROR', {
-      sessionId,
-      phase: 'list',
-      err: err instanceof Error ? err.message : String(err),
-    });
-    log('GC_EXPORT_DIAG_RAW', {
-      sessionId,
-      phase: 'list_failed',
-      status: 'failed',
-      totalChunks: 0,
-      validChunks: 0,
-      missingCount: 0,
-      corruptCount: 0,
-      stoppedAt: null,
-      stopReason: null,
-      extension: null,
-    });
-    return {
-      status: 'failed',
-      filePath: null,
-      totalChunks: 0,
-      validChunks: 0,
-      missingIndexes: [],
-      corruptIndexes: [],
-      extension: null,
-      stoppedAt: null,
-      stopReason: null,
-    };
-  }
-
-  const uploaded = chunks
-    .filter((c) => c.status === 'uploaded' && !!c.remote_reference)
-    .sort((a, b) => a.chunk_index - b.chunk_index);
-
-  if (uploaded.length === 0) {
-    error('EXPORT ERROR', {
-      sessionId,
-      phase: 'filter',
-      reason: 'no_uploaded_chunks',
-      total: chunks.length,
-    });
-    log('GC_EXPORT_DIAG_RAW', {
-      sessionId,
-      phase: 'no_uploaded_chunks',
-      status: 'failed',
-      totalChunks: chunks.length,
-      validChunks: 0,
-      missingCount: chunks.length,
-      corruptCount: 0,
-      stoppedAt: null,
-      stopReason: null,
-      extension: null,
-    });
-    return {
-      status: 'failed',
-      filePath: null,
-      totalChunks: chunks.length,
-      validChunks: 0,
-      missingIndexes: chunks.map((c) => c.chunk_index),
-      corruptIndexes: [],
-      extension: null,
-      stoppedAt: null,
-      stopReason: null,
-    };
-  }
-
-  const lastIndex = uploaded[uploaded.length - 1]!.chunk_index;
+  // Caller guarantees `chunks` is already filtered + sorted asc by
+  // chunk_index. We re-derive lastIndex / totalChunks / missingIndexes
+  // from the input so the helper has a single source of truth.
+  const lastIndex = chunks[chunks.length - 1]!.chunk_index;
   const totalChunks = lastIndex + 1;
 
-  const presentIndexes = new Set(uploaded.map((c) => c.chunk_index));
+  const presentIndexes = new Set(chunks.map((c) => c.chunk_index));
   const missingIndexes: number[] = [];
   for (let i = 0; i < totalChunks; i++) {
     if (!presentIndexes.has(i)) missingIndexes.push(i);
@@ -475,7 +438,7 @@ export async function exportSession(
   //
   // TODO(recording-format): guardar formato/extensión por sesión en el
   // backend para no depender de sniff binario al exportar.
-  let filePath = `${docDir}guardian_export_${sessionId}.m4a`;
+  let filePath = `${docDir}${filenamePrefix}_${sessionId}.m4a`;
 
   const corruptIndexes: number[] = [];
   const accumulated: Uint8Array[] = [];
@@ -500,7 +463,8 @@ export async function exportSession(
   // Survival rule: the recoverable evidence is the LONGEST CONTIGUOUS
   // PREFIX of valid chunks starting at chunk_index 0. A "hole" is any
   // index that is either:
-  //   (a) missing from the backend listing (not yet 'uploaded'), or
+  //   (a) missing from the input set (not yet 'uploaded' / not in
+  //       manifest), or
   //   (b) downloaded but failed sha256 verification, or
   //   (c) failed to download (network / 4xx / 5xx).
   // At the first hole we STOP the loop. We do NOT continue downloading
@@ -509,11 +473,11 @@ export async function exportSession(
   // archivo perfecto". The skipped indexes remain visible in the result
   // (`missingIndexes` was computed up-front; corrupt-at-cut goes into
   // `corruptIndexes` so the integrity report stays honest).
-  const byIndex = new Map(uploaded.map((c) => [c.chunk_index, c]));
+  const byIndex = new Map(chunks.map((c) => [c.chunk_index, c]));
   for (let idx = 0; idx < totalChunks; idx++) {
     const meta = byIndex.get(idx);
 
-    // (a) Missing from the listing — stop. The exact set of missing
+    // (a) Missing from the input set — stop. The exact set of missing
     // indexes was already pre-populated in `missingIndexes` above;
     // this is just the boundary observation.
     if (!meta) {
@@ -530,7 +494,7 @@ export async function exportSession(
     onProgress?.({ total: totalChunks, done: idx, currentIndex: idx });
 
     try {
-      const { bytes, headerHash } = await downloadChunk(sessionId, idx);
+      const { bytes, headerHash } = await downloadFn(idx);
 
       // DEBUG-only corruption — see DEBUG_CORRUPT_EXPORT_CHUNK_INDEX.
       // Flips byte 0 so verifyHash below trips and the chunk is treated
@@ -686,7 +650,7 @@ export async function exportSession(
         ((fullBytes[1] ?? 0) & 0xf6) === 0xf0;
       extension = hasFtyp ? '.m4a' : hasAacSync ? '.aac' : '.bin';
     }
-    filePath = `${docDir}guardian_export_${sessionId}${extension}`;
+    filePath = `${docDir}${filenamePrefix}_${sessionId}${extension}`;
     // Mirror to the function-scope variable so every return path
     // (including the write_final catch below) can include it in the
     // diagnostic payload. The narrowing is exhaustive — the assigns
@@ -796,6 +760,140 @@ export async function exportSession(
     stoppedAt,
     stopReason,
   };
+}
+
+/**
+ * Orchestrator. Never throws — any failure is folded into the result.
+ *
+ * The write-to-disk step happens ONCE at the end with the concatenated
+ * bytes, not per-chunk. Per-chunk append would require either the
+ * modern `FileSystem.File` API (different import) or a read-modify-write
+ * loop, both of which are out of scope for the MVP.
+ *
+ * Memory: accumulates ~O(N) bytes for the session plus ~4N/3 for the
+ * terminal base64 encoding. For MVP-size sessions (a few MB) this is
+ * fine; large sessions are covered by TODO(export-large).
+ *
+ * COMMIT 3 refactor: the body that walks chunks, verifies, concats,
+ * sniffs and writes lives in `exportFromChunkRefs` so both this function
+ * and the recovery exporter share it. This wrapper handles the data
+ * source (backend chunks listing) + the source-specific empty-result
+ * branch ("no_uploaded_chunks") that depends on the raw DB count rather
+ * than the filtered set. Behaviour-preserving — no external observable
+ * difference vs. the pre-refactor implementation.
+ */
+export async function exportSession(
+  sessionId: string,
+  onProgress?: (p: ExportProgress) => void,
+  /**
+   * Optional recording mode. When 'video', the output extension is forced
+   * to '.mp4' regardless of what the byte-sniff would say (an MP4 video
+   * starts with `ftyp`, which the sniff classifies as `.m4a` — wrong for
+   * video). When 'audio' or undefined the existing sniff runs unchanged
+   * (audio sessions are AAC ADTS or legacy MP4-audio; both are correctly
+   * classified by `hasAacSync` / `hasFtyp`).
+   *
+   * Optional so existing audio-only callers do not need to change. The
+   * caller (session detail screen) reads the mode from the local history
+   * index, which records `mode` per session at creation time.
+   */
+  mode?: SessionMode,
+): Promise<ExportResult> {
+  log('EXPORT START', { sessionId, mode });
+
+  let chunks: ChunkMeta[];
+  try {
+    chunks = await listSessionChunks(sessionId);
+  } catch (err) {
+    error('EXPORT ERROR', {
+      sessionId,
+      phase: 'list',
+      err: err instanceof Error ? err.message : String(err),
+    });
+    log('GC_EXPORT_DIAG_RAW', {
+      sessionId,
+      phase: 'list_failed',
+      status: 'failed',
+      totalChunks: 0,
+      validChunks: 0,
+      missingCount: 0,
+      corruptCount: 0,
+      stoppedAt: null,
+      stopReason: null,
+      extension: null,
+    });
+    return {
+      status: 'failed',
+      filePath: null,
+      totalChunks: 0,
+      validChunks: 0,
+      missingIndexes: [],
+      corruptIndexes: [],
+      extension: null,
+      stoppedAt: null,
+      stopReason: null,
+    };
+  }
+
+  const uploaded = chunks
+    .filter((c) => c.status === 'uploaded' && !!c.remote_reference)
+    .sort((a, b) => a.chunk_index - b.chunk_index);
+
+  if (uploaded.length === 0) {
+    // Data-source-specific empty branch: the DB may carry chunks in
+    // pending/failed state that the manifest path never sees, and the
+    // legacy `GC_EXPORT_DIAG_RAW` payload reports the RAW count
+    // (`chunks.length`) plus every raw chunk_index as missing. Keeping
+    // this branch in the wrapper preserves byte-identical telemetry
+    // for normal export consumers.
+    error('EXPORT ERROR', {
+      sessionId,
+      phase: 'filter',
+      reason: 'no_uploaded_chunks',
+      total: chunks.length,
+    });
+    log('GC_EXPORT_DIAG_RAW', {
+      sessionId,
+      phase: 'no_uploaded_chunks',
+      status: 'failed',
+      totalChunks: chunks.length,
+      validChunks: 0,
+      missingCount: chunks.length,
+      corruptCount: 0,
+      stoppedAt: null,
+      stopReason: null,
+      extension: null,
+    });
+    return {
+      status: 'failed',
+      filePath: null,
+      totalChunks: chunks.length,
+      validChunks: 0,
+      missingIndexes: chunks.map((c) => c.chunk_index),
+      corruptIndexes: [],
+      extension: null,
+      stoppedAt: null,
+      stopReason: null,
+    };
+  }
+
+  // Project ChunkMeta → ChunkRef. The shared helper does not need
+  // status / remote_reference (already filtered) and only consumes
+  // chunk_index / hash / size.
+  const refs: ChunkRef[] = uploaded.map((c) => ({
+    chunk_index: c.chunk_index,
+    hash: c.hash,
+    size: c.size,
+  }));
+
+  return exportFromChunkRefs(
+    sessionId,
+    'guardian_export',
+    refs,
+    (idx) => downloadChunk(sessionId, idx),
+    onProgress,
+    mode,
+  );
 }
 
 // TODO(export-history): the entry point to reach this flow is only the

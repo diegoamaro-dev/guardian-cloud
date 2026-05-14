@@ -17,6 +17,7 @@ import {
   classifyProtection,
   dedupAndSort,
   parseManifest,
+  parseManifestFull,
 } from '../../src/services/recovery.service.js';
 
 const SID_A = '11111111-1111-1111-1111-111111111111';
@@ -224,6 +225,236 @@ describe('dedupAndSort', () => {
       'mode',
       'protection_status',
       'session_id',
+    ]);
+  });
+});
+
+// ===========================================================================
+// COMMIT 3 — parseManifestFull
+// ===========================================================================
+
+const MANIFEST_FILE_ID = 'driveManifestFileId123456';
+const HASH_A = 'a'.repeat(64);
+const HASH_B = 'b'.repeat(64);
+const HASH_C = 'c'.repeat(64);
+
+function validChunk(
+  sessionId: string,
+  chunkIndex: number,
+  hash: string,
+  size = 16384,
+): unknown {
+  const paddedIndex = String(chunkIndex).padStart(6, '0');
+  const shortHash = hash.slice(0, 12);
+  return {
+    chunk_index: chunkIndex,
+    hash,
+    size,
+    file_name: `${sessionId}_${paddedIndex}_${shortHash}.chunk`,
+  };
+}
+
+function validFullManifest(
+  overrides: Record<string, unknown> = {},
+): unknown {
+  return {
+    schema: 'guardian-cloud.manifest.v1',
+    session_id: SID_A,
+    mode: 'audio',
+    destination_type: 'drive',
+    created_at: '2026-05-14T10:00:00.000Z',
+    completed_at: '2026-05-14T10:05:00.000Z',
+    chunk_count: 3,
+    chunks: [
+      validChunk(SID_A, 0, HASH_A),
+      validChunk(SID_A, 1, HASH_B),
+      validChunk(SID_A, 2, HASH_C),
+    ],
+    ...overrides,
+  };
+}
+
+describe('parseManifestFull', () => {
+  it('accepts a valid v1 manifest with chunks and returns the full projection', () => {
+    const parsed = parseManifestFull(validFullManifest(), MANIFEST_FILE_ID);
+    expect(parsed).not.toBeNull();
+    expect(parsed!.manifest_file_id).toBe(MANIFEST_FILE_ID);
+    expect(parsed!.session_id).toBe(SID_A);
+    expect(parsed!.mode).toBe('audio');
+    expect(parsed!.created_at).toBe('2026-05-14T10:00:00.000Z');
+    expect(parsed!.completed_at).toBe('2026-05-14T10:05:00.000Z');
+    expect(parsed!.chunk_count).toBe(3);
+    expect(parsed!.chunks).toHaveLength(3);
+  });
+
+  it('returns chunks sorted by chunk_index ascending regardless of input order', () => {
+    const m = validFullManifest({
+      chunks: [
+        validChunk(SID_A, 2, HASH_C),
+        validChunk(SID_A, 0, HASH_A),
+        validChunk(SID_A, 1, HASH_B),
+      ],
+    });
+    const parsed = parseManifestFull(m, MANIFEST_FILE_ID);
+    expect(parsed!.chunks.map((c) => c.chunk_index)).toEqual([0, 1, 2]);
+  });
+
+  it('rejects unknown schema versions', () => {
+    expect(
+      parseManifestFull(validFullManifest({ schema: 'v2' }), MANIFEST_FILE_ID),
+    ).toBeNull();
+  });
+
+  it('rejects non-object inputs', () => {
+    expect(parseManifestFull(null, MANIFEST_FILE_ID)).toBeNull();
+    expect(parseManifestFull('nope', MANIFEST_FILE_ID)).toBeNull();
+    expect(parseManifestFull(42, MANIFEST_FILE_ID)).toBeNull();
+  });
+
+  it('rejects malformed session_id', () => {
+    expect(
+      parseManifestFull(
+        validFullManifest({ session_id: 'not-a-uuid' }),
+        MANIFEST_FILE_ID,
+      ),
+    ).toBeNull();
+  });
+
+  it('rejects unknown mode', () => {
+    expect(
+      parseManifestFull(
+        validFullManifest({ mode: 'photo' }),
+        MANIFEST_FILE_ID,
+      ),
+    ).toBeNull();
+  });
+
+  it('rejects when chunks is not an array', () => {
+    expect(
+      parseManifestFull(
+        validFullManifest({ chunks: 'not-an-array' }),
+        MANIFEST_FILE_ID,
+      ),
+    ).toBeNull();
+  });
+
+  it('rejects a chunk with malformed hash', () => {
+    expect(
+      parseManifestFull(
+        validFullManifest({
+          chunks: [validChunk(SID_A, 0, 'short-hash')],
+          chunk_count: 1,
+        }),
+        MANIFEST_FILE_ID,
+      ),
+    ).toBeNull();
+  });
+
+  it('rejects a chunk with non-positive size', () => {
+    expect(
+      parseManifestFull(
+        validFullManifest({
+          chunks: [{ ...(validChunk(SID_A, 0, HASH_A) as object), size: 0 }],
+          chunk_count: 1,
+        }),
+        MANIFEST_FILE_ID,
+      ),
+    ).toBeNull();
+  });
+
+  it('rejects a chunk with negative chunk_index', () => {
+    expect(
+      parseManifestFull(
+        validFullManifest({
+          chunks: [{ ...(validChunk(SID_A, 0, HASH_A) as object), chunk_index: -1 }],
+          chunk_count: 1,
+        }),
+        MANIFEST_FILE_ID,
+      ),
+    ).toBeNull();
+  });
+
+  it('rejects a chunk whose file_name does not match the format', () => {
+    expect(
+      parseManifestFull(
+        validFullManifest({
+          chunks: [
+            {
+              ...(validChunk(SID_A, 0, HASH_A) as object),
+              file_name: 'arbitrary-name.chunk',
+            },
+          ],
+          chunk_count: 1,
+        }),
+        MANIFEST_FILE_ID,
+      ),
+    ).toBeNull();
+  });
+
+  it('rejects a chunk whose file_name belongs to a different session_id', () => {
+    // file_name with SID_B prefix while the manifest claims SID_A — this
+    // is the cross-session tampering defense.
+    expect(
+      parseManifestFull(
+        validFullManifest({
+          chunks: [validChunk(SID_B, 0, HASH_A)],
+          chunk_count: 1,
+        }),
+        MANIFEST_FILE_ID,
+      ),
+    ).toBeNull();
+  });
+
+  it('rejects duplicate chunk_index entries', () => {
+    expect(
+      parseManifestFull(
+        validFullManifest({
+          chunks: [
+            validChunk(SID_A, 0, HASH_A),
+            validChunk(SID_A, 0, HASH_B),
+          ],
+          chunk_count: 2,
+        }),
+        MANIFEST_FILE_ID,
+      ),
+    ).toBeNull();
+  });
+
+  it('rejects when chunks.length disagrees with chunk_count', () => {
+    expect(
+      parseManifestFull(
+        validFullManifest({
+          chunks: [validChunk(SID_A, 0, HASH_A)],
+          chunk_count: 5,
+        }),
+        MANIFEST_FILE_ID,
+      ),
+    ).toBeNull();
+  });
+
+  it('accepts a manifest with chunk_count=0 and empty chunks', () => {
+    const parsed = parseManifestFull(
+      validFullManifest({ chunks: [], chunk_count: 0 }),
+      MANIFEST_FILE_ID,
+    );
+    expect(parsed).not.toBeNull();
+    expect(parsed!.chunks).toEqual([]);
+    expect(parsed!.chunk_count).toBe(0);
+  });
+
+  it('returns chunk shape with exactly (chunk_index, hash, size, file_name) per entry', () => {
+    const parsed = parseManifestFull(
+      validFullManifest({
+        chunks: [validChunk(SID_A, 0, HASH_A)],
+        chunk_count: 1,
+      }),
+      MANIFEST_FILE_ID,
+    );
+    expect(Object.keys(parsed!.chunks[0]!).sort()).toEqual([
+      'chunk_index',
+      'file_name',
+      'hash',
+      'size',
     ]);
   });
 });

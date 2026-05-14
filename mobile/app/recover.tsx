@@ -30,7 +30,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
   ActivityIndicator,
-  Alert,
   Pressable,
   RefreshControl,
   ScrollView,
@@ -51,10 +50,6 @@ type ScreenState =
   | { kind: 'drive_not_connected' }
   | { kind: 'empty' }
   | { kind: 'list'; sessions: RecoverableSession[] };
-
-const COMING_SOON_TITLE = 'Próximamente';
-const COMING_SOON_BODY =
-  'La recuperación estará disponible en el siguiente paso. Por ahora puedes ver qué sesiones quedan respaldadas en tu Drive.';
 
 function formatDate(iso: string): string {
   // Locale-aware human format; fallback to the raw ISO if Date parsing
@@ -120,8 +115,16 @@ export default function RecoverScreen() {
     load(true);
   }, [load]);
 
-  function handleRecover() {
-    Alert.alert(COMING_SOON_TITLE, COMING_SOON_BODY);
+  function handleRecover(manifestFileId: string) {
+    // The route param is the Drive `file_id` of the manifest. We
+    // URL-encode here so file_ids containing `-`, `_`, etc. survive
+    // expo-router's path parsing — the detail screen does a defensive
+    // `decodeURIComponent` on read. The detail screen is the only
+    // consumer of this opaque id; it never reaches the UI.
+    router.push({
+      pathname: '/recover/[id]',
+      params: { id: encodeURIComponent(manifestFileId) },
+    });
   }
 
   return (
@@ -353,7 +356,7 @@ export default function RecoverScreen() {
                 </Text>
               </View>
               <Pressable
-                onPress={handleRecover}
+                onPress={() => handleRecover(s.manifest_file_id)}
                 style={{
                   backgroundColor: '#1f6feb',
                   padding: 12,
