@@ -799,6 +799,76 @@ export interface DriveUploadResult {
 }
 
 /**
+ * Lightweight projection of a Drive file returned by `files.list`. Only
+ * the fields actually consumed by `recovery.service.ts` are surfaced;
+ * adding more here just requires extending the `fields` query string.
+ */
+export interface DriveFileListing {
+  id: string;
+  name: string;
+  modifiedTime: string;
+}
+
+export interface ListFilesOptions {
+  /** Drive `q` parameter — filters by name. Substring match, not regex. */
+  nameContains?: string | undefined;
+  /** Page size cap per Drive request. Defaults to 100 (Drive max 1000). */
+  pageSize?: number | undefined;
+  /** Hard cap on pages followed to bound the call. Defaults to 10. */
+  maxPages?: number | undefined;
+}
+
+/**
+ * List files under `folderId` that this app created, optionally filtered
+ * by a name substring. Paginates with `nextPageToken` up to `maxPages` to
+ * bound the worst case, then stops. Returns the raw Drive projection;
+ * callers do their own regex / shape validation.
+ *
+ * Scope-safe: `drive.file` only ever surfaces files the app created, so
+ * this query cannot enumerate user content outside that set.
+ *
+ * The only Drive primitive this helper exposes beyond what `findFileByName`
+ * already does is pagination + multi-result return — kept narrow so future
+ * callers do not start synthesising arbitrary Drive queries from outside
+ * the service module.
+ */
+export async function listFilesInFolder(
+  accessToken: string,
+  folderId: string,
+  options: ListFilesOptions = {},
+): Promise<DriveFileListing[]> {
+  const { nameContains, pageSize = 100, maxPages = 10 } = options;
+
+  const safeFolder = folderId.replace(/'/g, "\\'");
+  let qParts = [`'${safeFolder}' in parents`, 'trashed = false'];
+  if (nameContains) {
+    const safeNeedle = nameContains.replace(/'/g, "\\'");
+    qParts.push(`name contains '${safeNeedle}'`);
+  }
+  const q = encodeURIComponent(qParts.join(' and '));
+  const fields = encodeURIComponent('files(id,name,modifiedTime),nextPageToken');
+
+  const all: DriveFileListing[] = [];
+  let pageToken: string | undefined;
+  for (let page = 0; page < maxPages; page++) {
+    const tokenParam = pageToken
+      ? `&pageToken=${encodeURIComponent(pageToken)}`
+      : '';
+    const path =
+      `/files?q=${q}&fields=${fields}` +
+      `&pageSize=${pageSize}&spaces=drive${tokenParam}`;
+    const res = await driveGet<{
+      files?: DriveFileListing[];
+      nextPageToken?: string;
+    }>(accessToken, path);
+    if (Array.isArray(res.files)) all.push(...res.files);
+    if (!res.nextPageToken) return all;
+    pageToken = res.nextPageToken;
+  }
+  return all;
+}
+
+/**
  * Upload `content` to Drive under `folderId` as `fileName` using the
  * simple multipart upload path (Drive's "one shot" upload, suitable for
  * small files — which is exactly what our chunks are at 16 KB).

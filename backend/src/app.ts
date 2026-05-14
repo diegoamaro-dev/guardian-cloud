@@ -27,6 +27,7 @@ import { errorHandler } from './middleware/errorHandler.js';
 import chunksRoutes from './routes/chunks.routes.js';
 import { destinationsRouter, oauthCallbackRouter } from './routes/destinations.routes.js';
 import { healthRouter } from './routes/health.routes.js';
+import { recoveryRouter } from './routes/recovery.routes.js';
 import { sessionsRouter } from './routes/sessions.routes.js';
 import { logger } from './utils/logger.js';
 
@@ -120,6 +121,10 @@ export function createApp(): express.Express {
   app.use('/sessions', sessionsRouter);
   app.use('/chunks', chunksRoutes);
   app.use('/destinations', destinationsRouter);
+  // Cross-device discovery (manifest listing). Endpoint is read-only and
+  // never throws on Drive-not-connected — the service surfaces that
+  // state in-band so the UI can render a guided empty view.
+  app.use('/recovery', recoveryRouter);
 
   // Google's registered redirect_uri is `/auth/drive/callback` at the
   // ROOT of the backend (see GOOGLE_REDIRECT_URI in backend/.env). The

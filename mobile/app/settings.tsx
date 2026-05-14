@@ -660,6 +660,54 @@ export default function SettingsScreen() {
         cuenta de Google.
       </Text>
 
+      {/* Cross-device recovery entry point — opens the "Recuperar
+          evidencia" screen which discovers manifests stored on the
+          connected Drive. Pure navigation: no Drive API calls happen
+          here, no GC_QUEUE / worker / chunking / recovery / export /
+          background / AudioEngine reads or writes from this row. The
+          target screen is on-demand and isolated. */}
+      <Text
+        style={{
+          color: '#8b949e',
+          fontSize: 12,
+          letterSpacing: 1,
+          marginTop: 28,
+          marginBottom: 8,
+        }}
+      >
+        RECUPERACIÓN
+      </Text>
+      <Pressable
+        onPress={() => router.push('/recover')}
+        style={{
+          padding: 14,
+          borderWidth: 1,
+          borderColor: '#30363d',
+          borderRadius: 8,
+          backgroundColor: '#161b22',
+        }}
+      >
+        <Text style={{ color: '#c9d1d9', fontSize: 14, fontWeight: '600' }}>
+          Recuperar evidencia de otro dispositivo
+        </Text>
+        <Text
+          style={{ color: '#6e7681', fontSize: 11, marginTop: 4, lineHeight: 15 }}
+        >
+          Si grabaste con Guardian Cloud en otro móvil y conectaste el
+          mismo Google Drive, busca aquí las sesiones respaldadas.
+        </Text>
+        <Text
+          style={{
+            color: '#58a6ff',
+            fontSize: 12,
+            fontWeight: '600',
+            marginTop: 10,
+          }}
+        >
+          Abrir →
+        </Text>
+      </Pressable>
+
       {/* Modo pánico — persisted user preference. When ON, the home
           screen renders an "Inicio rápido activado" pill near the
           GRABAR AHORA button and, on a returning-user cold start,
