@@ -5603,27 +5603,63 @@ export default function Index() {
       <Stack.Screen options={{ headerShown: false }} />
 
       {/* Hidden CameraView — mounted ONLY during a video session so
-          audio recordings never spin up the camera. Positioned offscreen
-          (1×1 px, opacity 0). The recordAsync() call in startRecording
-          writes to a growing .mp4 in cacheDirectory; the chunker reads
-          slices from it the same way it reads the audio cache file. */}
+          audio recordings never spin up the camera. The recordAsync()
+          call in startRecording writes to a growing .mp4 in
+          cacheDirectory; the chunker reads slices from it the same way
+          it reads the audio cache file.
+
+          Why the wrapper View (and not inline styles on CameraView):
+
+          On release APK builds, the Android `TextureView` that backs
+          expo-camera's CameraView allocates its drawing Surface at the
+          camera's preferred preview size (full-width × ~16:9) before
+          the React Native layout pass commits the inline `width: 1`
+          /`height: 1` styles. The Surface renders black until the first
+          camera frame arrives, leaving a visible black band at the
+          bottom of the screen. In dev / Expo Go this is intermittent
+          because additional layout passes re-apply the inline style;
+          in release with Hermes + RN optimizations the native Surface
+          wins and the band stays.
+
+          The standard fix is to clip the native Surface via a wrapper
+          with `overflow: 'hidden'`. The Surface is still allocated at
+          its preferred size by Camera2, but the parent ViewGroup clips
+          its drawing to the wrapper's 1×1 bounds. Belt-and-braces:
+              - `top: -1000, left: -1000` pushes the wrapper off-screen
+                so even if a future expo-camera version stops honoring
+                overflow:hidden the Surface lands outside the viewport
+              - `opacity: 0` keeps the JS-side composite hidden
+              - `pointerEvents="none"` makes the invisible region inert
+          CameraView inner style stays minimal (1×1) — the wrapper
+          handles all positioning / clipping / hiding.
+
+          Strictly visual — no change to mount condition, ref wiring,
+          props (mode / videoQuality / videoBitrate), recordAsync flow,
+          queue, worker, recovery, export, or AudioEngine. Pure
+          presentation layer. */}
       {mode === 'video' && (isStarting || isRecording) ? (
-        <CameraView
-          ref={(r) => {
-            cameraRef.current = r;
-          }}
-          mode="video"
-          videoQuality={VIDEO_RECORDING_QUALITY}
-          videoBitrate={VIDEO_RECORDING_BITRATE_BPS}
+        <View
+          pointerEvents="none"
           style={{
             position: 'absolute',
-            top: 0,
-            left: 0,
+            top: -1000,
+            left: -1000,
             width: 1,
             height: 1,
+            overflow: 'hidden',
             opacity: 0,
           }}
-        />
+        >
+          <CameraView
+            ref={(r) => {
+              cameraRef.current = r;
+            }}
+            mode="video"
+            videoQuality={VIDEO_RECORDING_QUALITY}
+            videoBitrate={VIDEO_RECORDING_BITRATE_BPS}
+            style={{ width: 1, height: 1 }}
+          />
+        </View>
       ) : null}
 
       {/* Top shortcuts — Configuración (right) and Historial (left).
