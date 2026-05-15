@@ -577,17 +577,30 @@ export interface QueueChunk {
    */
   byteLength?: number | undefined;
   /**
-   * VIDEO post-stop path only. Absolute filesystem URI of a file that
-   * holds this chunk's base64 (under
-   * `documentDirectory/chunks/{sessionId}/{chunk_index}.b64`). Set at
-   * emit time by `videoChunkSink`; deleted after a successful upload
-   * and on `reapEntry`. Persisting the base64 OUT of AsyncStorage is
-   * how the queue avoids the SQLite CursorWindow ~2 MB per-row limit
-   * for video sessions — the in-queue row stays metadata-only.
+   * Absolute filesystem URI of a file that holds this chunk's base64
+   * (under `documentDirectory/chunks/{sessionId}/{chunk_index}.b64`).
+   * Persisting the base64 OUT of AsyncStorage is how the queue avoids
+   * the Android SQLite CursorWindow ~2 MB per-row limit — the
+   * in-queue row stays metadata-only regardless of session length.
    *
-   * Mutually exclusive with `base64Slice`: a chunk has either the
-   * in-queue audio payload or the on-disk video payload, never both.
-   * `rehydrateChunkSlice` branches on field presence.
+   * Set at emit time by:
+   *   - `videoChunkSink`  — video post-stop path (original caller).
+   *   - `emitChunk`       — audio live-emit path (added post-2026-05-15
+   *                          hotfix; previously stored `base64Slice`
+   *                          inline, which tripped CursorWindow on
+   *                          long audio sessions).
+   *
+   * Deleted after a successful upload (post-200-OK cleanup in
+   * `uploadDrainLoop`) and as part of the `chunks/{sessionId}/`
+   * directory wipe in `reapEntry`. Both paths apply to audio and
+   * video without code branching.
+   *
+   * Mutually exclusive with `base64Slice` in practice: a chunk created
+   * by the current code has either `base64Slice` (legacy queue entries
+   * persisted before the hotfix) OR `local_uri` (new entries). The
+   * worker tolerates both shapes — `rehydrateChunkSlice` short-circuits
+   * on `base64Slice` first, then falls through to `local_uri`, so
+   * legacy entries continue to upload without migration.
    */
   local_uri?: string | undefined;
   /** Set when the upload to Drive returned a file_id we should use as remote_reference on /chunks. */
@@ -2795,13 +2808,63 @@ async function emitChunk(
   const hash = bytesDigestToHex(
     await Crypto.digest(Crypto.CryptoDigestAlgorithm.SHA256, bytes),
   );
+  // -----------------------------------------------------------------
+  // Disk-backed payload (post-2026-05-15 hotfix).
+  //
+  // Previously this function persisted `base64Slice` inline in the
+  // queue JSON. On a long audio session (~200 chunks at ~22 KB base64
+  // each) the accumulated payload pushed the GC_QUEUE row past the
+  // Android SQLite CursorWindow ~2 MB per-row limit. Once that
+  // happened, every `queueRead`/`queueMutate` started taking >80 s to
+  // return (verified via GC_PERF_DRAIN_PICK at chunk_index 105/199),
+  // which manifested as "the upload worker froze" — but the worker
+  // itself was healthy, AsyncStorage was the bottleneck.
+  //
+  // The fix mirrors the video post-stop path:
+  //   1. Write base64 to a per-chunk file under
+  //      `documentDirectory/chunks/{sessionId}/{chunk_index}.b64`.
+  //   2. Persist ONLY `local_uri` (plus chunk_index/hash/size/status/
+  //      attempts) in the queue row. The queue stays tiny regardless
+  //      of session length.
+  //   3. `rehydrateChunkSlice` already reads from `local_uri` for the
+  //      video post-stop path — audio inherits that behaviour for
+  //      free with no worker change.
+  //   4. Post-200-OK already deletes the `local_uri` file. Reap
+  //      already deletes the whole `chunks/{sessionId}/` directory.
+  //      Both apply to audio now with zero new code.
+  //
+  // Legacy queue entries persisted BEFORE this hotfix still carry
+  // `base64Slice`; rehydrateChunkSlice short-circuits on that field
+  // before reading from disk, so old entries continue to upload
+  // exactly as before — no migration needed.
+  //
+  // Write order is intentional: disk first, queue row second. A throw
+  // from `writeAsStringAsync` propagates out of this function without
+  // creating a metadata row that points at a file that does not
+  // exist. The chunker's tick body catches the throw and the same
+  // chunk_index will be re-emitted on the next tick (idempotent
+  // dedup in queueAppendChunk handles the re-emit race).
+  // -----------------------------------------------------------------
+  const local_uri = videoChunkLocalUri(sessionId, chunk_index);
+  const sessionDir = `${FileSystem.documentDirectory}chunks/${sessionId}/`;
+  try {
+    await FileSystem.makeDirectoryAsync(sessionDir, { intermediates: true });
+  } catch {
+    // Directory may already exist — best-effort create. Subsequent
+    // writeAsStringAsync will throw if the directory genuinely is not
+    // writable, and that throw surfaces to the chunker.
+  }
+  await FileSystem.writeAsStringAsync(local_uri, base64Slice, {
+    encoding: FileSystem.EncodingType.Base64,
+  });
+
   const chunk: QueueChunk = {
     chunk_index,
     hash,
     size: bytes.length,
     status: 'pending',
     attempts: 0,
-    base64Slice,
+    local_uri,
   };
   await queueAppendChunk(sessionId, chunk, emittedAfter, chunk_index + 1);
   if (DEBUG_QUEUE) {
@@ -2816,6 +2879,7 @@ async function emitChunk(
     chunk_index,
     size: bytes.length,
     hash_short: hash.substring(0, 12),
+    local_uri,
   });
   if (chunk_index === 0) {
     perfLog('GC_PERF_FIRST_CHUNK_EMITTED', {
@@ -2923,11 +2987,29 @@ async function emitVideoChunk(
 
 /**
  * Build the per-chunk file path under `documentDirectory/chunks/...`.
- * Used by the video post-stop path so chunk payloads live on disk
- * instead of inside the AsyncStorage JSON blob (which trips the SQLite
- * CursorWindow ~2 MB per-row limit for anything bigger than a couple
- * of chunks). Audio is unaffected — audio's `emitChunk` keeps writing
- * `base64Slice` straight into the queue exactly as before.
+ *
+ * Used by BOTH paths that persist chunk payloads to disk instead of
+ * inside the AsyncStorage JSON blob:
+ *
+ *   - Video post-stop (`videoChunkSink`) — the original caller.
+ *   - Audio live-emit (`emitChunk`) — added after the 2026-05-15
+ *     incident where a ~200-chunk audio session pushed the inline
+ *     `base64Slice` accumulation past the SQLite CursorWindow ~2 MB
+ *     per-row limit and froze `queueRead` at 84 s per call, stalling
+ *     the upload worker at chunk_index 105/199. Audio now mirrors the
+ *     video shape: write each chunk's base64 to its own file, persist
+ *     only `local_uri` in the queue row.
+ *
+ * `rehydrateChunkSlice` already reads from `local_uri` (it was wired
+ * for the video post-stop path) so the upload worker needs no change
+ * to consume audio chunks emitted this way. `reapEntry` already
+ * deletes the whole `chunks/{sessionId}/` directory at session close,
+ * and the post-200-OK path already deletes each `local_uri` file as
+ * soon as the chunk is acknowledged — both behaviours apply to audio
+ * chunks now too, again with no code change.
+ *
+ * The function name retains the historical `video` prefix to keep the
+ * diff for this hotfix surgical; it is otherwise mode-agnostic.
  */
 function videoChunkLocalUri(sessionId: string, chunk_index: number): string {
   const docDir = FileSystem.documentDirectory;
