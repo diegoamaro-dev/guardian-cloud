@@ -50,6 +50,12 @@ import { hardResetAppState } from '@/dev/reset';
 import type { ChunkPayload } from '@/recording/chunkProducer';
 import { RecordingController } from '@/recording/recordingController';
 import {
+  scanOrphans,
+  formatAgeHuman,
+  AUDIO_ORPHAN_MAX_BYTES,
+  type OrphanFile,
+} from '@/recording/orphanScan';
+import {
   deriveGuardianStatus,
   type GuardianStatus,
 } from '@/recording/deriveGuardianStatus';
@@ -649,6 +655,38 @@ const CHUNK_UPLOAD_TIMEOUT_MS = 60_000;
 
 let writeChain: Promise<void> = Promise.resolve();
 
+/**
+ * Last `GC_QUEUE_PERSIST_OK` payload, deduped so the log only emits
+ * when something meaningful changed. Without this dedup the log fires
+ * on every `queueMutate` call (chunk append, status update, requeue,
+ * mark-closed, ...) — easily many per second during recording — and
+ * floods logcat with identical "entries:0, size_bytes:2" lines from
+ * background reads of an empty queue.
+ *
+ * Emit policy (see queueMutate):
+ *   - first persist ever (lastQueuePersistLog === null)
+ *   - entries count changed
+ *   - size_bytes changed
+ *   - size_bytes > GC_QUEUE_PERSIST_HIGH_WATER_BYTES — always logged
+ *     so an approaching CursorWindow trip cannot be missed in
+ *     logcat noise filtering
+ *
+ * Diagnostic-only mutation. Never read by the queue / worker /
+ * recovery / chunking / export pipelines.
+ */
+let lastQueuePersistLog: { entries: number; size_bytes: number } | null =
+  null;
+
+/**
+ * Above this serialized queue size, log every persist regardless of
+ * dedup. 500 KB is well below the Android SQLite CursorWindow ~2 MB
+ * per-row limit but high enough that idle steady-state operation
+ * never hits it. The threshold gives the operator a "this is the
+ * danger zone" signal in logcat even when payload size oscillates
+ * around a constant.
+ */
+const GC_QUEUE_PERSIST_HIGH_WATER_BYTES = 500_000;
+
 export async function queueMutate<T>(
   fn: (queue: PendingQueueEntry[]) => T | Promise<T>,
 ): Promise<T> {
@@ -703,7 +741,46 @@ export async function queueMutate<T>(
         }
       }
       result = await fn(queue);
-      await AsyncStorage.setItem(PENDING_RETRY_KEY, JSON.stringify(queue));
+      const serialized = JSON.stringify(queue);
+      await AsyncStorage.setItem(PENDING_RETRY_KEY, serialized);
+      // Diagnostic: surfaces the size of every queue write so a future
+      // "queue empty after restart" symptom can be correlated against the
+      // last known persist size. `size_bytes` also gives early warning of
+      // approach to the Android SQLite CursorWindow per-row limit (~2 MB):
+      // values trending above ~1.5 MB mean a subsequent getItem may start
+      // throwing CursorWindow on this row.
+      //
+      // Dedup against `lastQueuePersistLog` so logcat is not flooded by
+      // identical lines when queueMutate runs many times per second on
+      // an unchanged queue (idle reads, status updates that do not
+      // touch the entry count, etc.). We always log:
+      //   - the first persist ever (no previous baseline)
+      //   - any change in entry count (sessions appended / reaped)
+      //   - any change in serialized byte size (chunk added /
+      //     uploaded / pruned)
+      //   - any persist above the high-water threshold, dedup
+      //     bypassed, so an approaching CursorWindow trip stays
+      //     visible even if the size oscillates around a constant
+      // Read-only — no schema change, no behavioural change. The
+      // setItem above already ran; the log only governs whether we
+      // emit a line.
+      const nextEntries = queue.length;
+      const nextBytes = serialized.length;
+      const shouldLog =
+        !lastQueuePersistLog ||
+        lastQueuePersistLog.entries !== nextEntries ||
+        lastQueuePersistLog.size_bytes !== nextBytes ||
+        nextBytes > GC_QUEUE_PERSIST_HIGH_WATER_BYTES;
+      if (shouldLog) {
+        console.log('GC_QUEUE_PERSIST_OK', {
+          size_bytes: nextBytes,
+          entries: nextEntries,
+        });
+        lastQueuePersistLog = {
+          entries: nextEntries,
+          size_bytes: nextBytes,
+        };
+      }
     });
   await writeChain;
   return result;
@@ -777,7 +854,31 @@ export async function queueAppendChunk(
 ): Promise<void> {
   await queueMutate(q => {
     const e = q.find(x => x.session_id === sessionId);
-    if (!e) return;
+    if (!e) {
+      // Diagnostic: surfaces a silent blind-spot. Today the caller
+      // (`emitChunk`) logs `GC_QUEUE chunk emitted` unconditionally
+      // AFTER the await on this function, so a no-op return here is
+      // invisible — the system appears to be emitting chunks while
+      // nothing actually persists. This log catches the gap.
+      //
+      // We keep the early return (no behavioural change) so a missing
+      // session entry never throws into the recording path; the log is
+      // pure observability. Investigated case where this could fire:
+      //   - queueAppendNewSession never ran for this session
+      //   - the queue entry was reaped (e.g. session_completed=true)
+      //     before the chunker's final pass landed
+      //   - the queue was externally wiped between session create and
+      //     this append (Clear Data / OS / dev reset)
+      // The `queue_session_ids` array is bounded by the in-memory queue
+      // size (typically <10 entries) so the log stays readable.
+      console.log('GC_QUEUE_APPEND_CHUNK_NO_SESSION', {
+        sessionId,
+        chunk_index: chunk.chunk_index,
+        queue_entries: q.length,
+        queue_session_ids: q.map(x => x.session_id),
+      });
+      return;
+    }
     // Idempotent guard: if a chunk with this index already exists in the
     // queue, do NOT push a second one. This is the last-line defence
     // against a race window we just patched (in-flight regular tick + final
@@ -3501,6 +3602,46 @@ export default function Index() {
     number | null
   >(null);
   /**
+   * Orphan recovery state — populated by `scanOrphans()` at boot. An
+   * "orphan" is a `guardian_recording_*.{aac,m4a,mp4}` file in
+   * `documentDirectory` with no matching entry in GC_QUEUE. The 2026-05-15
+   * incident (verified `.aac` of 3,760,704 bytes on disk while
+   * `entries: 0` in queue after AsyncStorage was wiped) is the
+   * canonical failure mode this state closes.
+   *
+   *   - `orphanRecoverable`     — files the user can recover via the
+   *                                banner CTA. Drained one-at-a-time
+   *                                by `handleRecoverOrphans`.
+   *   - `orphanOversizedCount`  — separate counter for audio files
+   *                                exceeding `AUDIO_ORPHAN_MAX_BYTES`.
+   *                                Surfaced in the banner copy but
+   *                                NEVER recovered (the existing audio
+   *                                chunker stores base64 inline and
+   *                                large files re-trip CursorWindow,
+   *                                which is the very corruption that
+   *                                produced the orphan in the first
+   *                                place).
+   *   - `orphanBusy`            — re-entrancy guard for the recover
+   *                                handler. Mirrors the
+   *                                `isStarting`/`isStopping` pattern.
+   *   - `orphanProgress`        — { current, total } shown in the
+   *                                banner during serial recovery so
+   *                                the user sees "Recuperando
+   *                                evidencia 2/3…". null when idle.
+   *
+   * All four are UI-only mirrors. None gate the queue, worker,
+   * recovery cross-device, export, manifests, AudioEngine, chunking,
+   * or backgroundService. The single source of truth for the system
+   * remains `guardianStatus` + GC_QUEUE.
+   */
+  const [orphanRecoverable, setOrphanRecoverable] = useState<OrphanFile[]>([]);
+  const [orphanOversizedCount, setOrphanOversizedCount] = useState(0);
+  const [orphanBusy, setOrphanBusy] = useState(false);
+  const [orphanProgress, setOrphanProgress] = useState<{
+    current: number;
+    total: number;
+  } | null>(null);
+  /**
    * Persisted UI preference: "Inicio rápido" (panic mode prep).
    *
    * When true:
@@ -3888,8 +4029,28 @@ export default function Index() {
         let bootstrapSession = (await supabase.auth.getSession()).data
           .session;
         if (!bootstrapSession) {
+          // Capture the pre-signin user id (if any survived the legacy
+          // purge above). For the common cold-boot case `existingSession`
+          // was already null and `prev_sub` will be null too. The
+          // meaningful diagnostic case is when `prev_sub` is a real UUID
+          // that differs from `new_sub` — that combination means the
+          // device's persisted auth was lost between runs, which lines
+          // up 1:1 with the "GC_QUEUE entries=0 after restart" symptom
+          // (Clear Data / OS data-pressure wipe / uninstall+reinstall
+          // would clear both Supabase tokens AND the queue key).
+          const prevSub = existingSession?.user?.id ?? null;
+          const legacyPurged =
+            existingSession?.user?.email === HARDCODED_LEGACY_EMAIL;
           const { data: anonData, error: anonError } =
             await supabase.auth.signInAnonymously();
+          // Diagnostic-only — fires regardless of success/failure so a
+          // failed sign-in (with prev_sub captured) is also visible.
+          console.log('GC_ANON_SIGNIN', {
+            prev_sub: prevSub,
+            new_sub: anonData?.user?.id ?? null,
+            legacy_purged: legacyPurged,
+            error: anonError ? anonError.message : null,
+          });
           if (anonError || !anonData.session) {
             setTestStatus('No se pudo iniciar sesión anónima');
             console.log('AUTH ANON_SIGNIN_FAIL', {
@@ -4061,6 +4222,123 @@ export default function Index() {
         // running in the background is acceptable so the screen renders
         // "RECOVERING N chunks" while it drains the obvious cases.
         console.log('GC_BOOT_RECOVERY_START', { ts: Date.now() });
+
+        // -----------------------------------------------------------
+        // Diagnostic boot snapshots (read-only, no mutation).
+        //
+        // These three logs answer "did AsyncStorage / docDir survive
+        // the previous run, or was something wiped externally?". Each
+        // is wrapped in its own try/catch so a single failure does not
+        // block recovery; the existing flow continues regardless.
+        //
+        // They were added after a long-audio session lost evidence
+        // post-restart with `entries: 0` in GC_BOOT_QUEUE_PENDING. The
+        // hypothesis to confirm is "all of AsyncStorage was cleared at
+        // OS level"; these snapshots give that question definitive
+        // answers in logcat instead of requiring debug builds. None of
+        // them touch backend, recovery cross-device, export, manifests,
+        // AudioEngine, the worker, or the queue shape.
+        // -----------------------------------------------------------
+
+        // GC_BOOT_STORAGE_KEYS — enumerate every key currently in
+        // AsyncStorage. If `sb-*-auth-token` is missing AND
+        // `test.pending_retry` is missing → app data was wiped (Clear
+        // Data, OS storage-pressure cleanup, uninstall/reinstall). If
+        // only `test.pending_retry` is missing while `sb-*` survived
+        // → something inside Guardian Cloud wiped the queue. The
+        // distinction matters: external wipe is "user/OS action",
+        // internal wipe is "our bug".
+        try {
+          const keys = await AsyncStorage.getAllKeys();
+          console.log('GC_BOOT_STORAGE_KEYS', {
+            count: keys.length,
+            keys,
+          });
+        } catch (err) {
+          console.log('GC_BOOT_STORAGE_KEYS', {
+            err: err instanceof Error ? err.message : String(err),
+          });
+        }
+
+        // GC_BOOT_RAW_QUEUE_LEN — raw getItem result of the queue key
+        // BEFORE any parse / migrate. Distinguishes three boot-time
+        // queue states:
+        //   raw_null=true                   → key never written or
+        //                                     externally removed
+        //   raw_null=false, raw_len=2       → JSON `[]` — queue was
+        //                                     reset to empty by code
+        //   raw_null=false, raw_len > 2     → real queue data exists,
+        //                                     and `entries: 0` from
+        //                                     GC_BOOT_QUEUE_PENDING
+        //                                     would point to a parse
+        //                                     issue, not a wipe
+        try {
+          const raw = await AsyncStorage.getItem(PENDING_RETRY_KEY);
+          console.log('GC_BOOT_RAW_QUEUE_LEN', {
+            raw_null: raw === null,
+            raw_len: raw === null ? null : raw.length,
+          });
+        } catch (err) {
+          console.log('GC_BOOT_RAW_QUEUE_LEN', {
+            err: err instanceof Error ? err.message : String(err),
+          });
+        }
+
+        // GC_BOOT_DOCDIR_FILES — list any `guardian_recording_*` /
+        // `guardian_recovered_*` / `guardian_export_*` files currently
+        // sitting in `documentDirectory`. A file present here with NO
+        // corresponding queue entry is an "orphan" — evidence the user
+        // captured that the upload pipeline never finished and recovery
+        // can no longer see. Today recovery only reads the queue, so
+        // these files are invisible to the system. The orphan-recovery
+        // pre-task (Capa 1) is the follow-up that uses this data; for
+        // now we just surface it for diagnosis.
+        //
+        // We `getInfoAsync` each candidate so the log carries the byte
+        // size — a 0-byte file is a different signal (encoder crashed
+        // before any write) than a 3 MB file (real evidence).
+        try {
+          const docDir = FileSystem.documentDirectory;
+          if (docDir) {
+            const all = await FileSystem.readDirectoryAsync(docDir);
+            const candidates = all.filter(
+              f =>
+                f.startsWith('guardian_recording_') ||
+                f.startsWith('guardian_recovered_') ||
+                f.startsWith('guardian_export_'),
+            );
+            const recording_files: {
+              name: string;
+              size: number | null;
+            }[] = [];
+            for (const f of candidates) {
+              try {
+                const info = await FileSystem.getInfoAsync(docDir + f);
+                recording_files.push({
+                  name: f,
+                  size: info.exists
+                    ? (info as { size?: number }).size ?? null
+                    : null,
+                });
+              } catch {
+                recording_files.push({ name: f, size: null });
+              }
+            }
+            console.log('GC_BOOT_DOCDIR_FILES', {
+              total: all.length,
+              recording_files,
+            });
+          } else {
+            console.log('GC_BOOT_DOCDIR_FILES', {
+              skipped: 'no documentDirectory',
+            });
+          }
+        } catch (err) {
+          console.log('GC_BOOT_DOCDIR_FILES', {
+            err: err instanceof Error ? err.message : String(err),
+          });
+        }
+
         // Pre-normalisation snapshot of the persisted queue. Captures
         // the state Android left behind after the kill — the
         // `uploading` count here is the number of chunks that were
@@ -4208,6 +4486,50 @@ export default function Index() {
           }
         } catch (err) {
           console.log('GC_QUEUE recovery reconcile failed', err);
+        }
+
+        // Orphan recovery scan. Detects recording files in
+        // `documentDirectory` that no longer have a matching queue
+        // entry — the failure mode the 2026-05-15 incident verified
+        // (AsyncStorage wiped while documentDirectory survived). The
+        // scan itself is read-only; any actual recovery happens later
+        // when the user taps the banner CTA. Filters applied inside
+        // `scanOrphans`:
+        //   - prefix `guardian_recording_`
+        //   - extension .aac / .m4a / .mp4 (others logged
+        //     `unknown_extension`)
+        //   - size > 0
+        //   - age <= 7 days
+        //   - not already referenced by a queue entry
+        //   - audio > AUDIO_ORPHAN_MAX_BYTES surfaces as oversized
+        //     (banner mentions but never recovers — protects against
+        //     re-tripping CursorWindow which is the corruption that
+        //     produced the orphan in the first place).
+        //
+        // The scan runs AFTER queue normalisation + reap + reconcile
+        // so the URI comparison sees the post-recovery queue state, not
+        // a transient mid-recovery view. Best-effort: scan failures are
+        // logged and recovery boot continues normally.
+        try {
+          const orphanResult = await scanOrphans();
+          if (orphanResult.orphans.length > 0) {
+            setOrphanRecoverable(orphanResult.orphans);
+          }
+          if (orphanResult.oversized.length > 0) {
+            setOrphanOversizedCount(orphanResult.oversized.length);
+            for (const big of orphanResult.oversized) {
+              console.log('GC_ORPHAN_RECOVERY_SKIPPED', {
+                uri: big.uri,
+                reason: 'too_large',
+                size: big.size,
+                limit: AUDIO_ORPHAN_MAX_BYTES,
+              });
+            }
+          }
+        } catch (err) {
+          console.log('GC_ORPHAN_SCAN_DONE', {
+            err: err instanceof Error ? err.message : String(err),
+          });
         }
 
         // Local-first recovery: re-fire the pending-registration loop in
@@ -5115,6 +5437,244 @@ export default function Index() {
     });
   }
 
+  /**
+   * Orphan recovery — one file at a time.
+   *
+   * Reconstructs the minimal queue entry the worker needs to drain a
+   * recording file that lost its row when AsyncStorage was wiped
+   * externally. The flow is byte-equivalent to the post-stop tail of
+   * `stopRecording`:
+   *
+   *   1. queueAppendNewSession  — inject the entry with a fresh
+   *                                synthetic session_id, the
+   *                                orphan's URI, and the currently
+   *                                pinned destination
+   *   2. appendHistoryEntry     — surface the recovered session in
+   *                                the History screen
+   *   3. createSessionRequest   — register the session backend-side.
+   *                                On retryable failure (offline,
+   *                                5xx, abort) defer via
+   *                                `schedulePendingSessionRegistration`
+   *                                — the same offline-first path
+   *                                normal recordings already use
+   *   4. runChunkerTick (final) — dispatch on mode:
+   *                                  audio → runAudioChunkerTick
+   *                                  video → runVideoChunkerTick
+   *                                Both read the finalized file and
+   *                                emit chunks via queueAppendChunk
+   *   5. queueMarkRecordingClosed — flip recording_closed=true with
+   *                                the chunker's authoritative count
+   *   6. uploadDrainLoop        — kick the worker (single-flight,
+   *                                no-op if already running)
+   *
+   * Zero new pipeline: every step reuses an existing entry-point. The
+   * worker, recovery cross-device, export, manifests, AudioEngine and
+   * backgroundService are untouched.
+   *
+   * The original session_id from when the file was first written is
+   * UNRECOVERABLE — it lived in the queue row that was wiped. We
+   * generate a fresh UUID. Backend sees a brand-new session, not a
+   * continuation. Server-side chunks from the lost session (if any
+   * reached the backend before the wipe) are orphaned under the old
+   * session_id but that is an accepted tradeoff per the
+   * "evidencia fuera del dispositivo ASAP" invariant — better a
+   * second copy than no copy.
+   */
+  async function recoverOneOrphan(orphan: OrphanFile): Promise<void> {
+    // Defensive: re-check duplicate at handler time. The scan already
+    // filtered against the queue at boot, but a parallel session could
+    // have created an entry pointing at the same URI in the
+    // milliseconds between scan and tap (unlikely but free to guard).
+    const existing = await queueRead();
+    if (existing.some(e => e.uri === orphan.uri)) {
+      console.log('GC_ORPHAN_RECOVERY_SKIPPED', {
+        uri: orphan.uri,
+        reason: 'already_in_queue_race',
+      });
+      return;
+    }
+
+    const sessionId = Crypto.randomUUID();
+    // Snapshot the destination AT TAP TIME. Same single-source-capture
+    // rule `startRecording` follows (see `pinnedDestinationType` at
+    // GRABAR-time): once the entry is created, every chunk for this
+    // session uploads to this destination, even if the user flips the
+    // Settings preference mid-recovery.
+    const pinnedDestinationType: DestinationType = activeDestinationType;
+
+    // Step 1: inject queue entry with `recording_closed=false` so the
+    // chunker (called below) treats it as a live session and emits
+    // chunks. We flip the flag to true in step 5 once chunking finished.
+    await queueAppendNewSession({
+      session_id: sessionId,
+      uri: orphan.uri,
+      recording_closed: false,
+      session_completed: false,
+      complete_attempts: 0,
+      emitted_base64_length: 0,
+      next_chunk_index: 0,
+      chunks: [],
+      destination_type: pinnedDestinationType,
+    });
+
+    // Step 2: local history index. The History screen enumerates
+    // sessions from this index, so an orphan that successfully recovers
+    // should appear there alongside normal recordings. Created-at is
+    // "now" — we deliberately do NOT use the file's mtime because
+    // History sorts by created_at and an old orphan would push to the
+    // bottom; the user just tapped Recover, they expect the session
+    // near the top.
+    appendHistoryEntry({
+      session_id: sessionId,
+      created_at: new Date().toISOString(),
+      mode: orphan.mode,
+    });
+
+    // Step 3: backend registration. Reuses the existing
+    // createSessionRequest helper; on retryable failure (offline /
+    // 5xx / abort) we defer via schedulePendingSessionRegistration,
+    // identical to startRecording's deferred-registration branch.
+    // Non-retryable 4xx errors propagate to the catch below — recovery
+    // for that orphan is abandoned and the file stays on disk for a
+    // future attempt.
+    const token = tokenRef.current;
+    try {
+      if (!token) throw new Error('no_token');
+      await createSessionRequest(
+        token,
+        orphan.mode,
+        sessionId,
+        pinnedDestinationType,
+      );
+    } catch (err) {
+      if (isRetryableSessionCreateError(err)) {
+        await schedulePendingSessionRegistration(
+          sessionId,
+          orphan.mode,
+          pinnedDestinationType,
+        );
+        // Recovery still proceeds — the worker will retry registration
+        // via the pending-registration loop once the network is back.
+      } else {
+        // Non-retryable: abandon this orphan. Leave the queue entry in
+        // place — the worker may eventually time it out — but more
+        // importantly leave the file on disk so the next boot can
+        // try again.
+        console.log('GC_ORPHAN_RECOVERY_SKIPPED', {
+          uri: orphan.uri,
+          reason: 'session_create_failed',
+          err: err instanceof Error ? err.message : String(err),
+        });
+        return;
+      }
+    }
+
+    // Step 4: chunk the file. runChunkerTick dispatches on mode and
+    // both branches (audio + video) emit chunks for the entire file
+    // when `finalPass=true` against a fresh entry (chunks=[],
+    // next_chunk_index=0). This is identical to what stopRecording
+    // runs at the end of every normal recording.
+    try {
+      await runChunkerTick(sessionId, orphan.uri, /*finalPass*/ true, orphan.mode);
+    } catch (err) {
+      console.log('GC_ORPHAN_RECOVERY_SKIPPED', {
+        uri: orphan.uri,
+        reason: 'chunk_error',
+        err: err instanceof Error ? err.message : String(err),
+      });
+      // The queue entry exists but is empty/partial. The worker will
+      // still try to upload whatever chunks landed (could be zero) and
+      // either complete the session as zero-chunk or fail-permanent.
+      // Either way the file stays on disk and the next boot may
+      // re-surface it as an orphan — best-effort survival.
+      return;
+    }
+
+    // Step 5: flip recording_closed=true with the authoritative
+    // emission tally read straight from the queue (the chunker
+    // mutated `next_chunk_index` and `emitted_base64_length` during
+    // step 4).
+    const finalQueue = await queueRead();
+    const entry = finalQueue.find(e => e.session_id === sessionId);
+    const emitted = entry?.emitted_base64_length ?? 0;
+    const next = entry?.next_chunk_index ?? 0;
+    await queueMarkRecordingClosed(sessionId, orphan.uri, emitted, next);
+
+    console.log('GC_ORPHAN_RECOVERY_ENQUEUED', {
+      uri: orphan.uri,
+      new_session_id: sessionId,
+      mode: orphan.mode,
+      chunks_emitted: next,
+    });
+
+    // Step 6: kick the worker. Fire-and-forget; uploadDrainLoop is
+    // single-flight so a redundant call while already draining is a
+    // harmless no-op. The catch keeps unhandled rejections from being
+    // silently swallowed.
+    uploadDrainLoop().catch(err => {
+      if (DEBUG_QUEUE) {
+        console.log('GC_DEBUG drain rejected (from orphan recovery)', {
+          err: err instanceof Error ? err.message : String(err),
+        });
+      }
+    });
+  }
+
+  /**
+   * Orphan recovery — serial driver.
+   *
+   * Iterates `orphanRecoverable` one entry at a time. The serial mode
+   * is intentional: the audio chunker stores `base64Slice` inline in
+   * the queue JSON, so two orphans recovering in parallel could push
+   * the persisted value past SQLite CursorWindow (~2 MB per row) and
+   * trip the very corruption this whole feature was built to mitigate.
+   * Single-flight also avoids race conditions on `queueMutate`'s
+   * write-chain and respects the project's single-flight architecture
+   * (`uploadDrainLoop`, `writeChain`, etc.).
+   *
+   * `orphanBusy` blocks re-entrancy from double-taps on the banner
+   * CTA. `orphanProgress` drives the banner copy
+   * ("Recuperando evidencia 2/3…") so the user has feedback that
+   * something is happening on a multi-orphan recovery.
+   *
+   * Banner state is cleared at the end whether or not every orphan
+   * succeeded — the per-orphan logs in `recoverOneOrphan` carry the
+   * detail, and the user has no actionable choice for a failed
+   * orphan (the file stays on disk; next boot's scan re-surfaces it).
+   */
+  async function handleRecoverOrphans(): Promise<void> {
+    if (orphanBusy) return;
+    if (orphanRecoverable.length === 0) return;
+
+    setOrphanBusy(true);
+    const list = orphanRecoverable;
+    setOrphanProgress({ current: 0, total: list.length });
+
+    try {
+      for (let i = 0; i < list.length; i++) {
+        // `noUncheckedIndexedAccess` treats `list[i]` as possibly
+        // undefined. The loop bound guarantees a value; the explicit
+        // guard preserves that invariant without a non-null assertion
+        // and bails defensively if the array was mutated underneath
+        // (which it should not be — `list` is a local snapshot).
+        const orphan = list[i];
+        if (!orphan) continue;
+        setOrphanProgress({ current: i + 1, total: list.length });
+        await recoverOneOrphan(orphan);
+      }
+    } finally {
+      setOrphanProgress(null);
+      setOrphanBusy(false);
+      // Clear the banner. Oversized count is cleared too because the
+      // user already saw the notice; surfacing it again on every
+      // subsequent screen entry would be noisy. The next cold boot
+      // re-scans and re-surfaces any orphans still present (including
+      // oversized) so nothing is lost.
+      setOrphanRecoverable([]);
+      setOrphanOversizedCount(0);
+    }
+  }
+
   // UI-only mirror of the upload queue progress. Polls every 500ms while
   // the user-perceived flow is active (recording, recovering, or stopping
   // — the worker may still be draining after STOP). The worker itself is
@@ -5807,6 +6367,143 @@ export default function Index() {
           >
             La aplicación dejó de estar visible.
           </Text>
+        </View>
+      ) : null}
+
+      {/* Orphan recovery banner — surfaces when boot's `scanOrphans()`
+          found recording files in `documentDirectory` with no matching
+          queue entry. Closes the 2026-05-15 evidence-loss window:
+          AsyncStorage wiped, `documentDirectory` survives, scanner
+          notices the gap, banner offers the user a single-tap recovery
+          via the existing chunking + upload pipeline.
+
+          UX rules (locked):
+            - non-blocking — never hides GRABAR or any other control
+            - single CTA "Recuperar" (no Ignore, no Delete, no Details)
+            - copy carries ONLY count + human age (no IDs, no
+              filenames, no URIs, no hashes, no sizes)
+            - sticky until the user taps OR `handleRecoverOrphans`
+              clears state on completion
+            - serial progress feedback during recovery
+              ("Recuperando evidencia 2/3…")
+            - amber palette (same as the video-background-stop banner)
+              to read as a non-fatal notice rather than success/error
+
+          Strictly UI — never gates logic, never read by
+          `deriveGuardianStatus`, never touches the queue / worker /
+          recovery cross-device / export / manifests / AudioEngine /
+          backgroundService directly. */}
+      {orphanRecoverable.length > 0 || orphanOversizedCount > 0 ? (
+        <View
+          style={{
+            alignItems: 'center',
+            justifyContent: 'center',
+            paddingVertical: 14,
+            paddingHorizontal: 18,
+            borderRadius: 10,
+            backgroundColor: '#2d2204',
+            borderWidth: 1,
+            borderColor: '#d29922',
+            marginBottom: 12,
+            alignSelf: 'stretch',
+          }}
+        >
+          <Text
+            style={{
+              color: '#d29922',
+              fontSize: 15,
+              fontWeight: '700',
+              letterSpacing: 0.3,
+              textAlign: 'center',
+            }}
+          >
+            Evidencia local sin terminar de proteger
+          </Text>
+          {orphanRecoverable.length > 0 ? (
+            <Text
+              style={{
+                color: '#e8c97a',
+                fontSize: 13,
+                fontWeight: '400',
+                marginTop: 4,
+                textAlign: 'center',
+                lineHeight: 18,
+              }}
+            >
+              {(() => {
+                // Pre-compute the most-recent mtime once. The `[0]` is
+                // guaranteed by `length > 0` (the outer branch) but
+                // `noUncheckedIndexedAccess` still requires a guard.
+                // The `.reduce` form on length-1 arrays just returns
+                // that single mtime; on N-element arrays it returns
+                // the latest. Either way the banner copy reads
+                // "se encontró 1 evidencia hace X" /
+                // "se encontraron N evidencias. La más reciente, hace X".
+                const latestMtime = orphanRecoverable
+                  .map(o => o.mtime_ms)
+                  .reduce((a, b) => Math.max(a, b), 0);
+                return orphanRecoverable.length === 1
+                  ? `Se encontró 1 evidencia ${formatAgeHuman(latestMtime)}.`
+                  : `Se encontraron ${orphanRecoverable.length} evidencias. La más reciente, ${formatAgeHuman(latestMtime)}.`;
+              })()}
+            </Text>
+          ) : null}
+          {orphanOversizedCount > 0 ? (
+            <Text
+              style={{
+                color: '#c2956a',
+                fontSize: 12,
+                fontWeight: '400',
+                marginTop: 6,
+                textAlign: 'center',
+                lineHeight: 17,
+                fontStyle: 'italic',
+              }}
+            >
+              {orphanOversizedCount === 1
+                ? 'Hay 1 archivo demasiado grande para esta versión.'
+                : `Hay ${orphanOversizedCount} archivos demasiado grandes para esta versión.`}
+            </Text>
+          ) : null}
+          {orphanProgress !== null ? (
+            <Text
+              style={{
+                color: '#e8c97a',
+                fontSize: 13,
+                fontWeight: '600',
+                marginTop: 10,
+                textAlign: 'center',
+              }}
+            >
+              Recuperando evidencia {orphanProgress.current}/
+              {orphanProgress.total}…
+            </Text>
+          ) : orphanRecoverable.length > 0 ? (
+            <Pressable
+              onPress={handleRecoverOrphans}
+              disabled={orphanBusy}
+              hitSlop={8}
+              style={{
+                marginTop: 12,
+                paddingVertical: 10,
+                paddingHorizontal: 24,
+                borderRadius: 6,
+                backgroundColor: '#1f6feb',
+                opacity: orphanBusy ? 0.5 : 1,
+              }}
+            >
+              <Text
+                style={{
+                  color: '#fff',
+                  fontSize: 14,
+                  fontWeight: '700',
+                  letterSpacing: 0.3,
+                }}
+              >
+                Recuperar
+              </Text>
+            </Pressable>
+          ) : null}
         </View>
       ) : null}
 

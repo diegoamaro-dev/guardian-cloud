@@ -63,8 +63,18 @@ ios/build/
 # =========================
 captures/
 recordings/
+*.aac
 *.m4a
 *.mp4
+
+# =========================
+# FORENSIC EVIDENCE (recovered orphan files)
+# =========================
+# Folder used to stage recovery of orphaned recording files pulled from
+# device storage via `adb`. Contents are private user evidence — never
+# commit. The path is also a stable target for the forthcoming orphan
+# scanner's manual fixtures.
+recovered_evidence/
 
 # =========================
 # NGROK / URLS TEMPORALES
