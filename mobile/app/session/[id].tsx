@@ -24,7 +24,7 @@ import {
   TextInput,
   View,
 } from 'react-native';
-import { router, useLocalSearchParams } from 'expo-router';
+import { router, Stack, useLocalSearchParams } from 'expo-router';
 import * as Sharing from 'expo-sharing';
 import * as FileSystem from 'expo-file-system/legacy';
 
@@ -1016,6 +1016,14 @@ export default function SessionDetailScreen() {
       style={{ flex: 1, backgroundColor: '#0d1117' }}
       contentContainerStyle={{ padding: 20, paddingTop: 48 }}
     >
+      {/* Hide Expo Router's default header so the screen renders only
+          the Guardian Cloud custom dark header below. Without this the
+          user sees the native `session/[id]` segment as a literal
+          technical title AND the manual "← Volver" button — duplicate
+          navigation. Same technique as every other screen in the app
+          (home / history / settings / recover[/id]). Pure UI: no
+          export / queue / worker / recovery side effects. */}
+      <Stack.Screen options={{ headerShown: false }} />
       <Pressable
         onPress={() => {
           // Deep links (guardiancloud://session/<id>) land here with no
@@ -1033,21 +1041,20 @@ export default function SessionDetailScreen() {
         <Text style={{ color: '#8b949e', fontSize: 14 }}>← Volver</Text>
       </Pressable>
 
+      {/* Body title. The previous version rendered a second `<Text>`
+          right below this one with the raw `sessionId` UUID as a
+          selectable technical id — that field was internal-only noise
+          for the user. Removed; the visual focus now jumps straight
+          from the title to the StatusHeader below. */}
       <Text
         style={{
           color: '#c9d1d9',
           fontSize: 22,
           fontWeight: '700',
-          marginBottom: 6,
+          marginBottom: 20,
         }}
       >
         Sesión
-      </Text>
-      <Text
-        selectable
-        style={{ color: '#6e7681', fontSize: 12, marginBottom: 20 }}
-      >
-        {sessionId || '(sin id)'}
       </Text>
 
       {/* Live status header. All fields derived strictly from the
