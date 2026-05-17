@@ -36,6 +36,7 @@ import * as Crypto from 'expo-crypto';
 
 import { env } from '@/config/env';
 import { getFreshAccessToken } from '@/auth/store';
+import { supabase } from '@/auth/supabase';
 import { apiFetch, ApiError } from './client';
 import { type DestinationType } from './destinations';
 import { type SessionMode } from './history';
@@ -139,14 +140,30 @@ export interface ExportResult {
    *   'hash_mismatch'   — bytes downloaded but sha256 disagreed with
    *                        the chunks row;
    *   'download_failed' — network / 4xx / 5xx prevented retrieval;
+   *   'auth_failed'     — authentication unavailable mid-export
+   *                        (getFreshAccessToken returned null twice, or
+   *                        the server returned 401 twice in a row).
+   *                        Crucially distinct from `download_failed`:
+   *                        the chunk's BYTES were never even attempted
+   *                        against the server, so there is nothing to
+   *                        call "corrupt". The UI surfaces this as a
+   *                        retry prompt instead of an integrity damaged
+   *                        verdict;
    *   null              — loop completed without bailing OR an
    *                        early-return path didn't run the loop.
    *
    * `missingIndexes` / `corruptIndexes` are still authoritative for
    * UI rendering and totals; `stopReason` only names the FIRST gap so
-   * downstream code can categorise the export cleanly.
+   * downstream code can categorise the export cleanly. Note that an
+   * `auth_failed` stop NEVER adds to `corruptIndexes` — that array is
+   * reserved for byte-level integrity problems only.
    */
-  stopReason?: 'missing' | 'hash_mismatch' | 'download_failed' | null;
+  stopReason?:
+    | 'missing'
+    | 'hash_mismatch'
+    | 'download_failed'
+    | 'auth_failed'
+    | null;
 }
 
 function bytesDigestToHex(buf: ArrayBuffer): string {
@@ -190,16 +207,67 @@ function concatBytes(parts: Uint8Array[]): Uint8Array {
   return out;
 }
 
-/** GET /sessions/:id/chunks — metadata only. */
+/**
+ * GET /sessions/:id/chunks — metadata only.
+ *
+ * Auth-retry contract (mirrors `downloadChunk`):
+ *   - If `apiFetch` throws `ApiError(401, 'NO_TOKEN', ...)` (the gate
+ *     `apiFetch` raises when `getFreshAccessToken` returned null), we
+ *     pause 500 ms and retry ONCE. Same pattern for an actual server
+ *     401 (e.g. the access token expired between resolution and
+ *     receipt). The pause covers the typical transient: supabase-js's
+ *     inline refresh hit a momentary network blip mid-export.
+ *   - If the second attempt is also auth-failing, we throw
+ *     `ApiError(401, 'AUTH_FAILED', ...)`. The export wrapper above
+ *     detects that distinct code and surfaces `stopReason: 'auth_failed'`
+ *     so the UI renders the "Sesión caducada / Vuelve a intentarlo"
+ *     block instead of the generic `list_failed` verdict.
+ *   - Any other failure (5xx, 404 SESSION_NOT_FOUND, network throw,
+ *     etc.) propagates unchanged — behaviour-identical to the
+ *     pre-retry version.
+ *
+ * The retry is single-shot by design; beyond two attempts a session
+ * is genuinely lost and the user needs to re-authenticate.
+ */
 export async function listSessionChunks(
   sessionId: string,
   signal?: AbortSignal,
 ): Promise<ChunkMeta[]> {
-  const { chunks } = await apiFetch<ListChunksResponse>(
-    `/sessions/${encodeURIComponent(sessionId)}/chunks`,
-    { method: 'GET', ...(signal ? { signal } : {}) },
+  const path = `/sessions/${encodeURIComponent(sessionId)}/chunks`;
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const { chunks } = await apiFetch<ListChunksResponse>(path, {
+        method: 'GET',
+        ...(signal ? { signal } : {}),
+      });
+      return chunks;
+    } catch (err) {
+      const isAuth =
+        err instanceof ApiError &&
+        (err.status === 401 || err.code === 'NO_TOKEN');
+      if (!isAuth) throw err;
+      if (attempt === 2) {
+        throw new ApiError(
+          401,
+          'AUTH_FAILED',
+          'Authentication unavailable; please retry',
+          null,
+        );
+      }
+      log('AUTH RETRY', { path, attempt });
+      await sleep(500);
+    }
+  }
+
+  // Unreachable — the loop returns or throws on every path. Defensive
+  // throw kept so TypeScript can prove the function always exits.
+  throw new ApiError(
+    401,
+    'AUTH_FAILED',
+    'Authentication unavailable; please retry',
+    null,
   );
-  return chunks;
 }
 
 /**
@@ -247,12 +315,61 @@ export async function getSessionDetail(
 }
 
 /**
+ * Wait helper used by `downloadChunk`'s single auth retry. Kept inline to
+ * avoid pulling a timer utility into this file.
+ */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Resolve a fresh Supabase access token, retrying ONCE after a short
+ * pause if the first attempt comes back null.
+ *
+ * Why this exists: `getFreshAccessToken` calls `supabase.auth.getSession()`
+ * which performs an inline refresh against Supabase using the persisted
+ * refresh_token when the access token has expired. During a long export
+ * (~200 chunks, ~1-2 min) it is realistic for that refresh's HTTP call
+ * to land on a transient network blip — `getSession()` then returns
+ * `{ session: null }` and we get null here. Retrying once after 500 ms
+ * usually picks the network back up and unblocks the chunk download.
+ *
+ * Pre-refactor, a null here threw `ApiError(401, 'NO_TOKEN', ...)` on
+ * the first miss, which the export loop catch then misclassified as a
+ * chunk integrity failure. The retry + the distinct `AUTH_FAILED` code
+ * below break that misclassification.
+ */
+async function getFreshAccessTokenWithRetry(): Promise<string | null> {
+  const first = await getFreshAccessToken();
+  if (first) return first;
+  await sleep(500);
+  return await getFreshAccessToken();
+}
+
+/**
  * GET /sessions/:id/chunks/:index/download — raw bytes.
  *
  * Returns the decoded bytes and the hash the backend advertised in the
  * X-Chunk-Hash header (useful for debug logging; the caller still
  * verifies against the per-chunk metadata hash from the chunks listing,
  * which is the source of truth).
+ *
+ * Auth retry contract:
+ *   - If `getFreshAccessToken()` returns null we retry ONCE after 500 ms
+ *     (via `getFreshAccessTokenWithRetry`). If still null, we throw a
+ *     distinct `ApiError(401, 'AUTH_FAILED', ...)` so the caller can
+ *     recognise the failure as "no auth available", NOT "the bytes
+ *     went bad". The export loop relies on this code to skip the
+ *     corruptIndexes path.
+ *   - If the server responds 401, we invalidate, fetch a fresh token,
+ *     and retry the request ONCE. If the second attempt is still 401,
+ *     we throw the same `AUTH_FAILED` code.
+ *   - Any other failure (network, 404, 5xx, content-type) keeps its
+ *     historical behaviour: `ApiError(status, code, message, parsed)`.
+ *
+ * The retry is single-shot by design — `getFreshAccessToken` already
+ * does its own inline refresh on every call; this wrapper only covers
+ * a transient blip during that refresh's outbound HTTP request.
  */
 export async function downloadChunk(
   sessionId: string,
@@ -260,36 +377,89 @@ export async function downloadChunk(
   timeoutMs = 30_000,
 ): Promise<{ bytes: Uint8Array; headerHash: string }> {
   const path = `/sessions/${encodeURIComponent(sessionId)}/chunks/${chunkIndex}/download`;
-  const token = await getFreshAccessToken();
-  if (!token) {
-    log('AUTH MISSING', { path });
-    throw new ApiError(401, 'NO_TOKEN', 'No access token in store', null);
-  }
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-
   const url = `${env.apiUrl}${path}`;
-  log('API CALL', { method: 'GET', url, authed: true });
-  let response: Response;
-  try {
-    response = await fetch(url, {
-      method: 'GET',
-      headers: { Authorization: `Bearer ${token}` },
-      signal: controller.signal,
-    });
-  } catch (e) {
-    throw new ApiError(
-      0,
-      'NETWORK_ERROR',
-      e instanceof Error ? e.message : 'Network request failed',
-      null,
-    );
-  } finally {
-    clearTimeout(timer);
-  }
 
-  if (!response.ok) {
+  // Two attempts max. First attempt uses whatever token is currently
+  // valid; if the server responds 401, the second attempt forces a
+  // fresh refresh + retries the request body exactly once. We never
+  // attempt 3+ — beyond two an auth failure is permanent enough to
+  // surface, not loop on.
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const token = await getFreshAccessTokenWithRetry();
+    if (!token) {
+      log('AUTH MISSING', { path, attempt });
+      if (attempt === 2) {
+        throw new ApiError(
+          401,
+          'AUTH_FAILED',
+          'Authentication unavailable; please retry',
+          null,
+        );
+      }
+      // First attempt: pause briefly and re-loop so the
+      // getFreshAccessTokenWithRetry on attempt 2 sees a different
+      // network window.
+      await sleep(500);
+      continue;
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+    log('API CALL', { method: 'GET', url, authed: true, attempt });
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${token}` },
+        signal: controller.signal,
+      });
+    } catch (e) {
+      clearTimeout(timer);
+      throw new ApiError(
+        0,
+        'NETWORK_ERROR',
+        e instanceof Error ? e.message : 'Network request failed',
+        null,
+      );
+    }
+    clearTimeout(timer);
+
+    if (response.ok) {
+      const headerHash =
+        response.headers.get('x-chunk-hash') ??
+        response.headers.get('X-Chunk-Hash') ??
+        '';
+      const ab = await response.arrayBuffer();
+      return { bytes: new Uint8Array(ab), headerHash };
+    }
+
+    // Non-2xx. If it's a 401 on attempt 1, loop once with a fresh
+    // token — supabase-js may have rotated it by now. On attempt 2 a
+    // 401 means auth is genuinely unavailable; surface as AUTH_FAILED.
+    if (response.status === 401) {
+      if (attempt === 1) {
+        log('AUTH 401 RETRY', { path, attempt });
+        await sleep(500);
+        continue;
+      }
+      // Drain body for log fidelity (best-effort).
+      const ct = response.headers.get('content-type') ?? '';
+      let parsed: unknown = null;
+      if (ct.includes('application/json')) {
+        parsed = await response.json().catch(() => null);
+      }
+      throw new ApiError(
+        401,
+        'AUTH_FAILED',
+        'Authentication unavailable; please retry',
+        parsed,
+      );
+    }
+
+    // Any other non-2xx is propagated unchanged — same shape as
+    // before this refactor so downstream classification of network /
+    // 4xx / 5xx failures is byte-identical.
     let parsed: unknown = null;
     const ct = response.headers.get('content-type') ?? '';
     if (ct.includes('application/json')) {
@@ -304,12 +474,15 @@ export async function downloadChunk(
     );
   }
 
-  const headerHash =
-    response.headers.get('x-chunk-hash') ??
-    response.headers.get('X-Chunk-Hash') ??
-    '';
-  const ab = await response.arrayBuffer();
-  return { bytes: new Uint8Array(ab), headerHash };
+  // Unreachable: the loop either returns or throws on every path. The
+  // explicit throw here keeps TypeScript happy without disabling the
+  // exhaustive check on the loop body.
+  throw new ApiError(
+    401,
+    'AUTH_FAILED',
+    'Authentication unavailable; please retry',
+    null,
+  );
 }
 
 /** sha256(bytes) === expected, as lowercase hex. */
@@ -451,7 +624,12 @@ export async function exportFromChunkRefs(
   // classify why the export ended up partial. Populated in the same
   // three break branches that populate `stoppedAt`. Stays `null` if
   // the loop completes without bailing.
-  let stopReason: 'missing' | 'hash_mismatch' | 'download_failed' | null =
+  let stopReason:
+    | 'missing'
+    | 'hash_mismatch'
+    | 'download_failed'
+    | 'auth_failed'
+    | null =
     null;
   // Mirror of the container extension picked by the post-concat
   // sniff. Lives at function scope (instead of only inside the write
@@ -550,6 +728,25 @@ export async function exportFromChunkRefs(
       });
     } catch (err) {
       // (c) Download failure — record and stop.
+      //
+      // Auth-failed branch: `downloadChunk` raises ApiError with code
+      // `AUTH_FAILED` after its single retry exhausts (null token twice
+      // OR server 401 twice). That is structurally different from
+      // download_failed: the chunk's BYTES were never even pitted
+      // against the wire, so calling it "corrupt" would lie to the
+      // user. Bail with stopReason='auth_failed' and DO NOT push to
+      // corruptIndexes. The caller's UI maps this to a retry prompt
+      // rather than an integrity-damaged verdict.
+      if (err instanceof ApiError && err.code === 'AUTH_FAILED') {
+        stoppedAt = idx;
+        stopReason = 'auth_failed';
+        error('EXPORT STOPPED AT AUTH', {
+          sessionId,
+          atIndex: idx,
+          err: err.message,
+        });
+        break;
+      }
       const msg = err instanceof Error ? err.message : String(err);
       error('EXPORT CHUNK CORRUPT', {
         sessionId,
@@ -578,6 +775,45 @@ export async function exportFromChunkRefs(
     stoppedAt,
     contiguous: validChunks === totalChunks,
   });
+
+  // Auth-failed short-circuit. Per the survival rule "no false claims
+  // about evidence integrity", an export that bailed because the
+  // device lost its session token must NOT be presented as partial
+  // (even if validChunks > 0). The user's mental model is "I lost my
+  // login; I should re-try", not "my evidence is damaged". We return
+  // `status: 'failed'` with no file written; the UI maps this to a
+  // retry CTA. `validChunks` is preserved in the result so logs and
+  // any future diagnostic surface honest numbers without lying.
+  if (stopReason === 'auth_failed') {
+    error('EXPORT ERROR', {
+      sessionId,
+      phase: 'auth_failed',
+      validChunks,
+    });
+    log('GC_EXPORT_DIAG_RAW', {
+      sessionId,
+      phase: 'auth_failed',
+      status: 'failed',
+      totalChunks,
+      validChunks,
+      missingCount: missingIndexes.length,
+      corruptCount: corruptIndexes.length,
+      stoppedAt,
+      stopReason,
+      extension: null,
+    });
+    return {
+      status: 'failed',
+      filePath: null,
+      totalChunks,
+      validChunks,
+      missingIndexes,
+      corruptIndexes,
+      extension: null,
+      stoppedAt,
+      stopReason,
+    };
+  }
 
   if (validChunks === 0) {
     error('EXPORT ERROR', {
@@ -762,6 +998,230 @@ export async function exportFromChunkRefs(
   };
 }
 
+// ===========================================================================
+// Shared-token download path for long-running exports
+// ===========================================================================
+//
+// Why this exists: pre-this-patch, the export loop called
+// `downloadChunk` for every chunk, and `downloadChunk` re-resolved the
+// access token via `getFreshAccessToken()` (which calls
+// `supabase.auth.getSession()`) on every call. For a 200-chunk export
+// that meant ~400-800 token resolutions, each one capable of doing an
+// opportunistic inline refresh against Supabase. A single transient
+// network blip during any of those refreshes returned null → the loop
+// bailed with AUTH_FAILED even though the user's session was perfectly
+// healthy.
+//
+// The fix shifts the model:
+//   1. `exportSession` resolves the access token ONCE after
+//      `listSessionChunks` succeeds, stores it in a `tokenRef`.
+//   2. The chunk loop uses `downloadChunkSharedToken` which reads
+//      `tokenRef.current` and NEVER calls `getFreshAccessToken`.
+//   3. ONLY when the backend returns 401 do we explicitly refresh via
+//      `supabase.auth.refreshSession()` with exponential backoff
+//      (500/1000/2000/4000/8000 ms, max 5 attempts), update
+//      `tokenRef.current`, and retry the same chunk. Following chunks
+//      inherit the refreshed token automatically because they read
+//      the same ref.
+//
+// What this DOES NOT touch:
+//   - `downloadChunk` (the standalone export helper) stays intact for
+//     the few solo callers like the session detail screen's fragment
+//     downloader. The legacy retry-twice pattern there is unchanged.
+//   - `listSessionChunks` keeps its own auth retry — it is one call
+//     at the start of export, not per-chunk, so it is not the
+//     bottleneck this patch addresses.
+//   - `exportFromChunkRefs` is auth-agnostic by design; it consumes
+//     the `downloadFn` callback the caller hands it, and that is
+//     where the shared token gets injected.
+//   - Recovery cross-device (`recoveryExport.ts`) — out of scope per
+//     project policy.
+
+const AUTH_BACKOFF_MS = [500, 1000, 2000, 4000, 8000] as const;
+const MAX_AUTH_REFRESH_ATTEMPTS = AUTH_BACKOFF_MS.length;
+
+/**
+ * Mutable holder for the access token shared across all chunk
+ * downloads in one export run. Mutated by the 401-recovery path inside
+ * `downloadChunkSharedToken` so the next chunk sees the refreshed
+ * token without re-resolving via supabase-js.
+ */
+interface TokenRef {
+  current: string;
+}
+
+/**
+ * Explicitly refresh the Supabase session and return the new access
+ * token, or null if the refresh failed for any reason (revoked
+ * refresh_token, network down, no persisted session, etc.).
+ *
+ * Distinct from `getFreshAccessToken`: that helper calls
+ * `supabase.auth.getSession()` which only refreshes opportunistically
+ * (i.e. when supabase-js considers the token expired). When the
+ * backend rejects a token with 401 mid-export, supabase-js may not
+ * agree it is expired yet (clock skew, server-side revocation we
+ * don't know about). `refreshSession()` is the unambiguous "give me a
+ * new token now" call.
+ *
+ * Never throws.
+ */
+async function refreshAccessTokenViaSupabase(): Promise<string | null> {
+  try {
+    const { data, error: err } = await supabase.auth.refreshSession();
+    if (err) return null;
+    return data.session?.access_token ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Download one chunk using the export-scoped `tokenRef`. Mirrors the
+ * external contract of `downloadChunk` (returns `{bytes, headerHash}`,
+ * throws `ApiError` for failures) but uses the shared token model
+ * instead of resolving auth per call.
+ *
+ * Failure semantics:
+ *   - 2xx                            → bytes + headerHash
+ *   - non-2xx and non-401            → throw ApiError(status, code, ...)
+ *     (same shape as `downloadChunk` — propagated through the export
+ *     loop into the standard `download_failed` stopReason path)
+ *   - 401                            → enter the refresh backoff. Up to
+ *     `MAX_AUTH_REFRESH_ATTEMPTS` cycles of "sleep, refreshSession,
+ *     retry chunk". Each successful refresh mutates `tokenRef.current`
+ *     so later chunks pick up the new token without re-entering this
+ *     path. If all attempts exhaust → throw ApiError(401, 'AUTH_FAILED').
+ *   - network throw                  → throw ApiError(0, 'NETWORK_ERROR', ...)
+ *     (same as `downloadChunk`).
+ *
+ * This function does NOT mutate `tokenRef.current` outside the 401
+ * branch — happy-path downloads leave the token untouched.
+ */
+async function downloadChunkSharedToken(
+  sessionId: string,
+  chunkIndex: number,
+  tokenRef: TokenRef,
+  timeoutMs = 30_000,
+): Promise<{ bytes: Uint8Array; headerHash: string }> {
+  const path = `/sessions/${encodeURIComponent(sessionId)}/chunks/${chunkIndex}/download`;
+  const url = `${env.apiUrl}${path}`;
+
+  async function fetchOnce(token: string): Promise<Response> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      return await fetch(url, {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${token}` },
+        signal: controller.signal,
+      });
+    } catch (e) {
+      throw new ApiError(
+        0,
+        'NETWORK_ERROR',
+        e instanceof Error ? e.message : 'Network request failed',
+        null,
+      );
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  function readHeaderHash(response: Response): string {
+    return (
+      response.headers.get('x-chunk-hash') ??
+      response.headers.get('X-Chunk-Hash') ??
+      ''
+    );
+  }
+
+  async function throwHttpError(response: Response): Promise<never> {
+    let parsed: unknown = null;
+    const ct = response.headers.get('content-type') ?? '';
+    if (ct.includes('application/json')) {
+      parsed = await response.json().catch(() => null);
+    }
+    const errBody = (parsed as { error?: { code?: string; message?: string } }) ?? {};
+    throw new ApiError(
+      response.status,
+      errBody.error?.code,
+      errBody.error?.message ?? `HTTP ${response.status}`,
+      parsed,
+    );
+  }
+
+  log('API CALL', { method: 'GET', url, authed: true, shared_token: true });
+  let response = await fetchOnce(tokenRef.current);
+
+  if (response.ok) {
+    const ab = await response.arrayBuffer();
+    return { bytes: new Uint8Array(ab), headerHash: readHeaderHash(response) };
+  }
+  if (response.status !== 401) {
+    await throwHttpError(response);
+  }
+
+  // 401 path: try to recover by refreshing the session and retrying.
+  // We do NOT propagate the original 401 immediately because the
+  // primary symptom we're fixing is a transient that resolves with a
+  // single refresh — but bound the work strictly with the documented
+  // backoff schedule so a genuinely revoked session fails in a
+  // predictable window (sum of backoffs ≈ 15.5s).
+  log('AUTH_REFRESH_START', {
+    sessionId,
+    chunkIndex,
+    reason: 'http_401_from_backend',
+  });
+  for (let attempt = 0; attempt < MAX_AUTH_REFRESH_ATTEMPTS; attempt++) {
+    await sleep(AUTH_BACKOFF_MS[attempt]!);
+    const newToken = await refreshAccessTokenViaSupabase();
+    if (!newToken) {
+      log('AUTH_REFRESH_FAILED', {
+        sessionId,
+        chunkIndex,
+        attempt: attempt + 1,
+        backoff_ms: AUTH_BACKOFF_MS[attempt],
+      });
+      continue;
+    }
+    // Shared mutation. Subsequent chunks see this new token without
+    // re-entering this 401 path themselves, so a single 401 incident
+    // benefits the rest of the export in one shot.
+    tokenRef.current = newToken;
+    log('AUTH_REFRESH_OK', {
+      sessionId,
+      chunkIndex,
+      attempt: attempt + 1,
+    });
+    response = await fetchOnce(newToken);
+    if (response.ok) {
+      const ab = await response.arrayBuffer();
+      return { bytes: new Uint8Array(ab), headerHash: readHeaderHash(response) };
+    }
+    if (response.status !== 401) {
+      // The refresh worked but the chunk request itself errored for
+      // an unrelated reason (404, 5xx, etc.). Propagate that normally
+      // — the export loop classifies it as `download_failed`, NOT
+      // `auth_failed`.
+      await throwHttpError(response);
+    }
+    // Still 401 — Supabase rotated tokens but the backend still
+    // rejects. Keep retrying within the budget.
+  }
+
+  error('AUTH_REFRESH_EXHAUSTED', {
+    sessionId,
+    chunkIndex,
+    attempts: MAX_AUTH_REFRESH_ATTEMPTS,
+  });
+  throw new ApiError(
+    401,
+    'AUTH_FAILED',
+    'Authentication unavailable; please retry',
+    null,
+  );
+}
+
 /**
  * Orchestrator. Never throws — any failure is folded into the result.
  *
@@ -781,6 +1241,13 @@ export async function exportFromChunkRefs(
  * branch ("no_uploaded_chunks") that depends on the raw DB count rather
  * than the filtered set. Behaviour-preserving — no external observable
  * difference vs. the pre-refactor implementation.
+ *
+ * Shared-token patch: after listSessionChunks succeeds we resolve the
+ * access token ONCE and bind it into a closure-scoped `tokenRef`. The
+ * downloadFn handed to `exportFromChunkRefs` uses this ref instead of
+ * re-resolving auth per chunk — see `downloadChunkSharedToken` for the
+ * detailed rationale. The 401-only refresh path is the only place the
+ * ref is mutated; the happy path does not touch auth at all.
  */
 export async function exportSession(
   sessionId: string,
@@ -805,6 +1272,48 @@ export async function exportSession(
   try {
     chunks = await listSessionChunks(sessionId);
   } catch (err) {
+    // Discriminate the auth-loss case from a generic list failure.
+    // `listSessionChunks` raises `ApiError(401, 'AUTH_FAILED', ...)`
+    // after its single auth-retry exhausts; anything else (5xx, 404,
+    // network) propagates with its original shape and we keep the
+    // legacy `list_failed` diagnostic surface.
+    //
+    // The UI's `ResultBlock` auth_failed branch keys off
+    // `result.stopReason === 'auth_failed'`, so propagating that here
+    // is the one wire that makes "Sesión caducada / Vuelve a
+    // intentarlo" appear instead of the generic empty-list verdict.
+    const isAuthFailed =
+      err instanceof ApiError && err.code === 'AUTH_FAILED';
+    if (isAuthFailed) {
+      error('EXPORT ERROR', {
+        sessionId,
+        phase: 'auth_failed_list',
+        err: err.message,
+      });
+      log('GC_EXPORT_DIAG_RAW', {
+        sessionId,
+        phase: 'auth_failed',
+        status: 'failed',
+        totalChunks: 0,
+        validChunks: 0,
+        missingCount: 0,
+        corruptCount: 0,
+        stoppedAt: null,
+        stopReason: 'auth_failed',
+        extension: null,
+      });
+      return {
+        status: 'failed',
+        filePath: null,
+        totalChunks: 0,
+        validChunks: 0,
+        missingIndexes: [],
+        corruptIndexes: [],
+        extension: null,
+        stoppedAt: null,
+        stopReason: 'auth_failed',
+      };
+    }
     error('EXPORT ERROR', {
       sessionId,
       phase: 'list',
@@ -886,11 +1395,55 @@ export async function exportSession(
     size: c.size,
   }));
 
+  // Resolve the access token ONCE for the whole chunk loop.
+  // `listSessionChunks` just succeeded so supabase-js definitely has a
+  // valid token in hand; we read it and pin it. The chunk loop below
+  // never calls `getFreshAccessToken` again — only the 401-recovery
+  // branch inside `downloadChunkSharedToken` mutates this ref through
+  // an explicit `supabase.auth.refreshSession()`. This eliminates the
+  // ~400-800 token resolutions a 200-chunk export used to make and
+  // the matching probability of a single transient failure aborting
+  // the whole run.
+  const initialToken = await getFreshAccessToken();
+  if (!initialToken) {
+    // Extremely rare: list just succeeded but the next token read came
+    // back null. Treat as auth_failed and surface the same UI block
+    // the rest of the auth path uses. NOT a corruption verdict.
+    error('EXPORT ERROR', {
+      sessionId,
+      phase: 'auth_failed_initial_token',
+    });
+    log('GC_EXPORT_DIAG_RAW', {
+      sessionId,
+      phase: 'auth_failed',
+      status: 'failed',
+      totalChunks: 0,
+      validChunks: 0,
+      missingCount: 0,
+      corruptCount: 0,
+      stoppedAt: null,
+      stopReason: 'auth_failed',
+      extension: null,
+    });
+    return {
+      status: 'failed',
+      filePath: null,
+      totalChunks: 0,
+      validChunks: 0,
+      missingIndexes: [],
+      corruptIndexes: [],
+      extension: null,
+      stoppedAt: null,
+      stopReason: 'auth_failed',
+    };
+  }
+  const tokenRef: TokenRef = { current: initialToken };
+
   return exportFromChunkRefs(
     sessionId,
     'guardian_export',
     refs,
-    (idx) => downloadChunk(sessionId, idx),
+    (idx) => downloadChunkSharedToken(sessionId, idx, tokenRef),
     onProgress,
     mode,
   );
