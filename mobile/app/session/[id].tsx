@@ -385,12 +385,19 @@ type ExportDiagCause =
   | 'unsupported_format'
   | 'pending_upload'
   | 'all_present'
+  | 'auth_failed'
   | 'unknown';
 
 function deriveExportCause(
   result: ExportResult,
   expectedLocalChunks: number | null,
 ): ExportDiagCause {
+  // Auth-failed is evaluated FIRST so it wins over the
+  // `validChunks === 0` discriminator below. A run that lost auth on
+  // chunk 0 has validChunks=0 but the user should see the retry copy,
+  // not the "no uploaded chunks" copy. The export pipeline guarantees
+  // an auth_failed result NEVER carries corruptIndexes.
+  if (result.stopReason === 'auth_failed') return 'auth_failed';
   if (result.validChunks === 0) return 'no_uploaded_chunks';
   if (result.stopReason === 'hash_mismatch') return 'hash_mismatch';
   if (result.stopReason === 'download_failed') return 'download_failed';
@@ -1136,6 +1143,7 @@ export default function SessionDetailScreen() {
           availableFragmentCount={availableFragmentCount}
           fragmentsPhase={fragmentsPhase}
           onDownloadFragments={handleDownloadFragments}
+          onRetry={handleExport}
         />
       )}
       {phase.kind === 'error' && <ErrorBlock message={phase.message} />}
@@ -1305,13 +1313,70 @@ function ResultBlock({
   availableFragmentCount,
   fragmentsPhase,
   onDownloadFragments,
+  onRetry,
 }: {
   result: ExportResult;
   expectedLocalChunks: number | null;
   availableFragmentCount: number | null;
   fragmentsPhase: FragmentsPhase;
   onDownloadFragments: () => void;
+  /**
+   * Re-run the same `handleExport` that produced this result. Wired
+   * exclusively into the `auth_failed` branch below; other verdict
+   * branches don't need it (the user can navigate back and tap
+   * "Exportar evidencia" again anyway).
+   */
+  onRetry: () => void;
 }) {
+  // Auth-failed short-circuit. Bytes-level integrity is irrelevant
+  // here — the chunk never reached the wire. We must NOT render the
+  // green/yellow integrity verdict or the Save/Share buttons (there
+  // is no file). The copy is intentionally simple: tell the user the
+  // single action that will likely fix it.
+  //
+  // The pipeline guarantees `corruptIndexes` is empty on this branch
+  // (see the catch in `exportFromChunkRefs`), so the
+  // "Evidencia dañada" frame downstream cannot be triggered by an
+  // auth failure.
+  if (result.stopReason === 'auth_failed') {
+    return (
+      <View
+        style={{
+          marginTop: 4,
+          padding: 12,
+          borderWidth: 1,
+          borderColor: '#f85149',
+          borderRadius: 6,
+          backgroundColor: '#2d0d12',
+        }}
+      >
+        <Text style={{ color: '#f85149', fontSize: 13, fontWeight: '700' }}>
+          Sesión caducada
+        </Text>
+        <Text style={{ color: '#c9d1d9', fontSize: 12, marginTop: 6 }}>
+          No se pudo acceder a Google Drive. Vuelve a intentarlo.
+        </Text>
+        <Pressable
+          onPress={onRetry}
+          style={{
+            marginTop: 12,
+            paddingVertical: 10,
+            paddingHorizontal: 14,
+            borderWidth: 1,
+            borderColor: '#1f6feb',
+            borderRadius: 6,
+            backgroundColor: '#0c1e3a',
+            alignItems: 'center',
+          }}
+        >
+          <Text style={{ color: '#c9d1d9', fontSize: 13, fontWeight: '600' }}>
+            Reintentar
+          </Text>
+        </Pressable>
+      </View>
+    );
+  }
+
   // Real expected total. Backend-derived `result.totalChunks` is only
   // truthful when EVERY emitted chunk made it server-side. When uploads
   // are still pending, backend sees a prefix (e.g. 7) while the local
