@@ -52,14 +52,42 @@ vi.mock('@/auth/store', () => ({
   useAuthStore: { setState: vi.fn() },
 }));
 
+// Override the global `@/api/client` mock from `tests/setup.ts` (which
+// only re-exports `ApiError`) so this file can drive `apiFetch` with
+// controlled failures to exercise `listSessionChunks` auth retry. The
+// `ApiError` class is mirrored locally with identical shape so the
+// `instanceof` checks inside the helper under test still work.
+vi.mock('@/api/client', () => {
+  class ApiError extends Error {
+    readonly status: number;
+    readonly code: string | undefined;
+    readonly body: unknown;
+    constructor(
+      status: number,
+      code: string | undefined,
+      message: string,
+      body: unknown,
+    ) {
+      super(message);
+      this.name = 'ApiError';
+      this.status = status;
+      this.code = code;
+      this.body = body;
+    }
+  }
+  return { ApiError, apiFetch: vi.fn() };
+});
+
 import * as FileSystem from 'expo-file-system/legacy';
 import * as Crypto from 'expo-crypto';
 
 import {
   exportFromChunkRefs,
+  listSessionChunks,
   type ChunkRef,
   type ExportResult,
 } from '../src/api/export';
+import { ApiError, apiFetch } from '../src/api/client';
 
 // --- Helpers ------------------------------------------------------------
 
@@ -310,5 +338,129 @@ describe('exportFromChunkRefs — zero valid chunks', () => {
     expect(result.validChunks).toBe(0);
     expect(result.filePath).toBeNull();
     expect(FileSystem.writeAsStringAsync).not.toHaveBeenCalled();
+  });
+});
+
+// --- Auth failed --------------------------------------------------------
+
+describe('exportFromChunkRefs — auth_failed', () => {
+  it('bails with stopReason=auth_failed without marking the chunk corrupt', async () => {
+    mockDigestConstant(0xab);
+    const refs = refsFor(3);
+
+    // Chunk 0 and 2 succeed; chunk 1 throws AUTH_FAILED (mirrors what
+    // the real `downloadChunk` raises after its single auth retry
+    // exhausts on a transient session loss mid-export). The helper
+    // must:
+    //   - NOT push idx=1 into corruptIndexes
+    //   - NOT emit "EXPORT CHUNK CORRUPT"
+    //   - return status='failed' with stopReason='auth_failed'
+    //   - NOT write a file (corrupt evidence claim is the exact failure
+    //     the user reported; partial-with-auth-loss is misleading)
+    //   - preserve `validChunks=1` honestly so logs/diagnostics keep
+    //     the truth without lying about what got through
+    const downloadFn = vi.fn(async (idx: number) => {
+      if (idx === 1) {
+        throw new ApiError(
+          401,
+          'AUTH_FAILED',
+          'Authentication unavailable; please retry',
+          null,
+        );
+      }
+      return { bytes: new Uint8Array([0x01, 0x02, 0x03, 0x04]), headerHash: '' };
+    });
+
+    const result = await exportFromChunkRefs(
+      'sess-auth-loss',
+      'guardian_export',
+      refs,
+      downloadFn,
+    );
+
+    expect(result.status).toBe('failed');
+    expect(result.stopReason).toBe('auth_failed');
+    expect(result.stoppedAt).toBe(1);
+    expect(result.corruptIndexes).toEqual([]); // critical: no corrupt mark
+    expect(result.validChunks).toBe(1); // chunk 0 made it through honestly
+    expect(result.filePath).toBeNull(); // no file written for auth_failed
+    expect(FileSystem.writeAsStringAsync).not.toHaveBeenCalled();
+    // Verify the loop did NOT keep attempting chunk 2 after the auth bail
+    expect(downloadFn).toHaveBeenCalledTimes(2); // 0 (ok) and 1 (auth)
+  });
+
+  it('returns auth_failed cleanly even when chunk 0 is the one that fails', async () => {
+    mockDigestConstant(0xab);
+    const refs = refsFor(1);
+
+    const downloadFn = vi.fn(async () => {
+      throw new ApiError(
+        401,
+        'AUTH_FAILED',
+        'Authentication unavailable; please retry',
+        null,
+      );
+    });
+
+    const result = await exportFromChunkRefs(
+      'sess-auth-on-first',
+      'guardian_export',
+      refs,
+      downloadFn,
+    );
+
+    expect(result.status).toBe('failed');
+    expect(result.stopReason).toBe('auth_failed');
+    expect(result.corruptIndexes).toEqual([]);
+    expect(result.validChunks).toBe(0);
+    expect(result.filePath).toBeNull();
+    expect(FileSystem.writeAsStringAsync).not.toHaveBeenCalled();
+  });
+});
+
+// --- listSessionChunks auth retry --------------------------------------
+
+describe('listSessionChunks — auth retry', () => {
+  beforeEach(() => {
+    vi.mocked(apiFetch).mockReset();
+  });
+
+  it('retries once when apiFetch raises NO_TOKEN, then throws AUTH_FAILED', async () => {
+    // Simulate the production failure: `apiFetch` raises
+    // ApiError(401, 'NO_TOKEN') on every call because supabase-js's
+    // inline refresh is failing. `listSessionChunks` must catch it,
+    // pause briefly, retry ONE more time, and on the second failure
+    // re-throw with the distinct AUTH_FAILED code so the export
+    // wrapper can route to stopReason='auth_failed' rather than the
+    // generic list_failed verdict.
+    vi.mocked(apiFetch).mockRejectedValue(
+      new ApiError(401, 'NO_TOKEN', 'No access token in store', null),
+    );
+
+    await expect(listSessionChunks('sess-auth')).rejects.toMatchObject({
+      status: 401,
+      code: 'AUTH_FAILED',
+    });
+
+    // Two attempts inside listSessionChunks's loop. Bump deliberately
+    // if the retry budget changes — this is the pinned contract.
+    expect(apiFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('does NOT retry non-auth failures (network / 5xx / 404)', async () => {
+    // A 5xx from the backend is propagated immediately on the first
+    // attempt: there is no benefit to retrying inside listSessionChunks
+    // and doing so would hide real backend incidents behind extra
+    // latency. The retry budget is strictly for transient auth blips.
+    vi.mocked(apiFetch).mockRejectedValue(
+      new ApiError(500, 'INTERNAL', 'Server error', null),
+    );
+
+    await expect(listSessionChunks('sess-5xx')).rejects.toMatchObject({
+      status: 500,
+      code: 'INTERNAL',
+    });
+
+    expect(apiFetch).toHaveBeenCalledTimes(1);
   });
 });
