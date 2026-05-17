@@ -288,7 +288,18 @@ const DRIVE_CHUNK_UPLOAD_ENABLED = true;
 // the whole growing file). At 256 KB a 3–5 MB clip is ~12–20 chunks.
 // Mode-pick happens in the chunker only; queue/worker/retry/recovery
 // shapes are untouched.
-const CHUNK_SIZE_AUDIO = 16 * 1024;
+// Audio chunk size bump 16 KB → 32 KB (2026-05-18). Iguala el stride
+// validado del path video y reduce ~2× la cuenta total de requests
+// durante sesiones largas (a 64 kbps son ~30 chunks/min con 16 KB vs
+// ~15 chunks/min con 32 KB). Time-to-first-chunk pasa de ~3 s a ~4.5 s
+// (1.5 s extra de evidencia que vive sólo en el device antes del primer
+// upload) — regresión aceptada bajo la invariante "subir > grabar
+// perfecto". El path queue/worker/retry/recovery NO cambia: el cursor
+// `emitted_base64_length` es char-count y resume con el stride nuevo
+// sin migración. Entries legacy sin `local_uri` ni `base64Slice` rehy-
+// dratan correctamente porque `base64SliceAt` deriva el stride desde
+// `chunk.size`, no desde esta constante.
+const CHUNK_SIZE_AUDIO = 32 * 1024;
 const CHUNK_SIZE_VIDEO = 256 * 1024;
 const CHUNK_SIZE_BASE64_AUDIO =
   Math.ceil(Math.ceil((CHUNK_SIZE_AUDIO * 4) / 3) / 4) * 4;
@@ -1863,7 +1874,7 @@ async function rehydrateChunkSlice(
       return null;
     }
   }
-  return base64SliceAt(base64, chunk.chunk_index);
+  return base64SliceAt(base64, chunk, entry);
 }
 
 interface NextPick {
@@ -3158,15 +3169,35 @@ async function readRecordingBase64(uri: string): Promise<string> {
  * Pure (no I/O) — the caller reads base64 once via
  * `readRecordingBase64` and slices per chunk from memory.
  */
-function base64SliceAt(base64: string, chunkIndex: number): string {
+function base64SliceAt(
+  base64: string,
+  chunk: QueueChunk,
+  entry: PendingQueueEntry,
+): string {
   // Rehydration only triggers for legacy entries that lack a persisted
-  // base64Slice. Pre-Phase-2 entries were all audio (video did not exist
-  // at the time), and any post-Phase-2 entry — audio or video — keeps
-  // its base64Slice in the queue until upload succeeds. Using the audio
-  // base64 size here therefore matches every rehydration we can actually
-  // hit; video chunks never need this path.
-  const offset = chunkIndex * CHUNK_SIZE_BASE64_AUDIO;
-  return base64.substring(offset, offset + CHUNK_SIZE_BASE64_AUDIO);
+  // base64Slice and a local_uri. Pre-Phase-2 entries were all audio
+  // (video did not exist at the time), and any post-Phase-2 entry —
+  // audio or video — keeps its bytes off-queue (local_uri or
+  // byteOffset/byteLength) until upload succeeds. So this path only
+  // fires for pre-hotfix audio entries persisted under an older value
+  // of CHUNK_SIZE_AUDIO.
+  //
+  // Stride is derived from `chunk.size` of a non-tail chunk inside the
+  // same entry, NOT from the current global constant. Reason: bumping
+  // CHUNK_SIZE_AUDIO would otherwise re-slice legacy entries with the
+  // new stride against bytes hashed under the old stride →
+  // HASH_MISMATCH. Reading the original stride back from a sibling
+  // chunk's `size` preserves byte-for-byte correctness across constant
+  // bumps. The current chunk is itself a valid reference when it isn't
+  // the tail; the find() falls back to scanning when it is.
+  const lastIndex = Math.max(...entry.chunks.map(c => c.chunk_index));
+  const reference = chunk.chunk_index < lastIndex
+    ? chunk
+    : entry.chunks.find(c => c.chunk_index < lastIndex);
+  const referenceSize = reference?.size ?? chunk.size;
+  const strideBase64 = Math.ceil(Math.ceil((referenceSize * 4) / 3) / 4) * 4;
+  const offset = chunk.chunk_index * strideBase64;
+  return base64.substring(offset, offset + strideBase64);
 }
 
 /**
