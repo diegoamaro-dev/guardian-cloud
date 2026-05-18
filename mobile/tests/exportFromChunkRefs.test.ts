@@ -418,6 +418,127 @@ describe('exportFromChunkRefs — auth_failed', () => {
   });
 });
 
+// --- Cancellation (AbortSignal plumbing) -------------------------------
+
+describe('exportFromChunkRefs — cancellation', () => {
+  it('returns cancelled when signal is already aborted before the loop', async () => {
+    mockDigestConstant(0xab);
+    const refs = refsFor(5);
+    const downloadFn = vi.fn(async () => ({
+      bytes: new Uint8Array([0x01]),
+      headerHash: '',
+    }));
+    const controller = new AbortController();
+    controller.abort();
+
+    const result = await exportFromChunkRefs(
+      'sess-cancel-pre',
+      'guardian_export',
+      refs,
+      downloadFn,
+      undefined,
+      undefined,
+      controller.signal,
+    );
+
+    expect(result.status).toBe('failed');
+    expect(result.stopReason).toBe('cancelled');
+    expect(result.validChunks).toBe(0);
+    expect(result.filePath).toBeNull();
+    expect(result.corruptIndexes).toEqual([]);
+    // No download was attempted because the abort gate fires at the
+    // very top of the for-loop on the first iteration.
+    expect(downloadFn).not.toHaveBeenCalled();
+    expect(FileSystem.writeAsStringAsync).not.toHaveBeenCalled();
+  });
+
+  it('returns cancelled mid-loop after N successful chunks', async () => {
+    mockDigestConstant(0xab);
+    const refs = refsFor(5);
+    const controller = new AbortController();
+    // Abort once the loop has processed 2 chunks (so chunk 2's
+    // boundary check fires the cancel).
+    let calls = 0;
+    const downloadFn = vi.fn(async () => {
+      calls += 1;
+      if (calls === 2) controller.abort();
+      return {
+        bytes: new Uint8Array([0x01, 0x02, 0x03, 0x04]),
+        headerHash: '',
+      };
+    });
+
+    const result = await exportFromChunkRefs(
+      'sess-cancel-mid',
+      'guardian_export',
+      refs,
+      downloadFn,
+      undefined,
+      undefined,
+      controller.signal,
+    );
+
+    expect(result.status).toBe('failed');
+    expect(result.stopReason).toBe('cancelled');
+    expect(result.stoppedAt).toBe(2);
+    // Two successful downloads + verifies before the cancel landed.
+    expect(result.validChunks).toBe(2);
+    expect(result.corruptIndexes).toEqual([]);
+    expect(result.filePath).toBeNull();
+    expect(FileSystem.writeAsStringAsync).not.toHaveBeenCalled();
+  });
+
+  it('classifies a download throwing EXPORT_CANCELLED as cancelled, not download_failed', async () => {
+    mockDigestConstant(0xab);
+    const refs = refsFor(3);
+    const downloadFn = vi.fn(async (idx: number) => {
+      if (idx === 1) {
+        throw new ApiError(0, 'EXPORT_CANCELLED', 'aborted', null);
+      }
+      return {
+        bytes: new Uint8Array([0x01, 0x02, 0x03, 0x04]),
+        headerHash: '',
+      };
+    });
+
+    const result = await exportFromChunkRefs(
+      'sess-cancel-fetch',
+      'guardian_export',
+      refs,
+      downloadFn,
+    );
+
+    expect(result.status).toBe('failed');
+    expect(result.stopReason).toBe('cancelled');
+    expect(result.stoppedAt).toBe(1);
+    expect(result.validChunks).toBe(1);
+    // Crucial: the chunk that raised EXPORT_CANCELLED is NOT marked
+    // corrupt — cancellation is not an integrity event.
+    expect(result.corruptIndexes).toEqual([]);
+    expect(result.filePath).toBeNull();
+    expect(FileSystem.writeAsStringAsync).not.toHaveBeenCalled();
+  });
+
+  it('omitting signal preserves byte-identical behaviour (regression guard)', async () => {
+    mockDigestConstant(0xab);
+    const refs = refsFor(3);
+
+    const result = await exportFromChunkRefs(
+      'sess-no-signal',
+      'guardian_export',
+      refs,
+      mockDownloadOk(),
+      // no onProgress, no mode, no signal
+    );
+
+    expect(result.status).toBe('complete');
+    expect(result.stopReason).toBeNull();
+    expect(result.validChunks).toBe(3);
+    expect(result.filePath).toContain('guardian_export_sess-no-signal');
+    expect(FileSystem.writeAsStringAsync).toHaveBeenCalledTimes(1);
+  });
+});
+
 // --- listSessionChunks auth retry --------------------------------------
 
 describe('listSessionChunks — auth retry', () => {

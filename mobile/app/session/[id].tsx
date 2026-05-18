@@ -30,13 +30,23 @@ import * as FileSystem from 'expo-file-system/legacy';
 
 import {
   downloadChunk,
-  exportSession,
   getSessionDetail,
   listSessionChunks,
   type ChunkMeta,
   type ExportProgress,
   type ExportResult,
 } from '@/api/export';
+// Export runner — module-scoped singleton that owns the in-flight
+// export and survives screen unmount. The screen subscribes to its
+// status and mirrors transitions into the local `phase` so the visible
+// UI stays byte-identical to the pre-runner flow while gaining
+// rehydration on remount and anti-double-export at the API layer.
+// `exportSession` is no longer called directly from this screen — the
+// runner is the single integration point.
+import {
+  startExport,
+  subscribeExport,
+} from '@/api/exportRunner';
 import {
   type SessionMode,
   type SessionStatusSummary,
@@ -441,6 +451,17 @@ export default function SessionDetailScreen() {
   const [localRecordingUri, setLocalRecordingUri] = useState<string | null>(
     null,
   );
+  // Latest-ref mirror of `localRecordingUri` for the export-runner
+  // subscriber's `done` handler. The subscriber callback is created
+  // inside a `useEffect` keyed on `sessionId` only — it does NOT
+  // re-bind when `localRecordingUri` changes, so a direct closure
+  // reference would capture a stale value. Reading from
+  // `localRecordingUriRef.current` resolves the latest value at the
+  // moment the local-fallback decision runs.
+  const localRecordingUriRef = useRef(localRecordingUri);
+  useEffect(() => {
+    localRecordingUriRef.current = localRecordingUri;
+  }, [localRecordingUri]);
   // Authoritative emitted-chunk count for this session, read from the
   // persisted queue. Used to detect the "backend says 7/7 but the local
   // chunker emitted 32" false-positive integrity verdict. Null when the
@@ -748,6 +769,94 @@ export default function SessionDetailScreen() {
     sessionId.length === 0 ||
     (!canExportCloud && !canExportLocal);
 
+  // Subscribe to the export-runner singleton and mirror its status into
+  // the local `phase`. The runner owns the in-flight export's lifecycle
+  // (start, progress, completion, cancellation, error) — this effect is
+  // a pure projection that renders byte-identical UI to the pre-runner
+  // flow.
+  //
+  // Lifecycle contract:
+  //   - The listener fires once synchronously inside `subscribeExport`
+  //     with the current snapshot, which is the rehydration primitive:
+  //     mounting the screen mid-export immediately reflects the in-flight
+  //     state without missing the running phase.
+  //   - Status updates for ANOTHER sessionId are ignored. Two screens
+  //     for two different sessions can coexist (in practice only one is
+  //     on top, but the runner is global, so the guard is required).
+  //   - `idle` is ignored on purpose: the screen's initial `useState`
+  //     value is already `idle` and the local-only direct path at the
+  //     top of `handleExport` may set `localFallback` / `localExport`
+  //     without going through the runner — we must not clobber those.
+  //   - `done` runs the same local-fallback decision that lived inline
+  //     in the pre-runner `handleExport`: if cloud collapsed to `failed`
+  //     + `validChunks === 0`, try the local recording file and surface
+  //     it as `localFallback`. Behaviour-preserving — same condition,
+  //     same `LOCAL EXPORT fallback used` log key, same `setPhase`
+  //     transitions.
+  //   - `cancelled` resets to `idle`. Cancellation has no UI surface
+  //     today (per scope: no UX changes) but the API is plumbed so a
+  //     future cancel button can simply call `cancelExport(sessionId)`.
+  //   - `error` mirrors `setPhase({ kind: 'error', message })` — same
+  //     shape `handleExport`'s catch block used pre-runner.
+  //
+  // Cleanup: the effect's `cancelled` flag guards the async fallback
+  // path so a navigation away mid-fallback does not setPhase on an
+  // unmounted component. The unsub removes the listener so the runner
+  // does not retain a reference to a dead screen instance.
+  useEffect(() => {
+    if (!sessionId) return;
+    let cancelled = false;
+
+    async function handleDone(result: ExportResult): Promise<void> {
+      if (result.status === 'failed' && result.validChunks === 0) {
+        setPhase({ kind: 'localExport' });
+        const localUri =
+          localRecordingUriRef.current ??
+          (await findLocalRecordingUri(sessionId));
+        if (cancelled) return;
+        if (localUri) {
+          console.log('LOCAL EXPORT fallback used', {
+            sessionId,
+            localUri,
+          });
+          setPhase({ kind: 'localFallback', filePath: localUri });
+          return;
+        }
+        // No local file available either — fall through to the
+        // existing failed UI which renders the cloud result.
+      }
+      if (cancelled) return;
+      setPhase({ kind: 'done', result });
+    }
+
+    const unsub = subscribeExport((status) => {
+      if (cancelled) return;
+      if (status.kind === 'idle') return;
+      // Per-session filter. The runner is global; another session
+      // exporting in the background must not bleed UI into this screen.
+      if (status.sessionId !== sessionId) return;
+      switch (status.kind) {
+        case 'running':
+          setPhase({ kind: 'running', progress: status.progress });
+          return;
+        case 'done':
+          void handleDone(status.result);
+          return;
+        case 'cancelled':
+          setPhase({ kind: 'idle' });
+          return;
+        case 'error':
+          setPhase({ kind: 'error', message: status.message });
+          return;
+      }
+    });
+
+    return () => {
+      cancelled = true;
+      unsub();
+    };
+  }, [sessionId]);
+
   async function handleExport() {
     if (!sessionId) return;
 
@@ -784,57 +893,28 @@ export default function SessionDetailScreen() {
       return;
     }
 
-    // Cloud-first path with the original local fallback when cloud
-    // export collapses to failed/0 (offline mid-flight, no uploaded
-    // chunks server-side, etc.).
-    setPhase({ kind: 'running', progress: null });
-    try {
-      // Mode is loaded by a dedicated useEffect into `sessionMode`
-      // (cached so the partial-fragments downloader can reuse it
-      // without a second history read). Only 'video' has a behavioural
-      // effect inside `exportSession` (forces '.mp4'); 'audio' and
-      // undefined both keep the sniff path.
-      const mode: SessionMode | undefined = sessionMode ?? undefined;
-      const result = await exportSession(
-        sessionId,
-        (progress) => {
-          setPhase({ kind: 'running', progress });
-        },
-        mode,
-      );
-
-      // Local-export fallback. `exportSession` collapses every failure
-      // path into `status='failed'` + `validChunks === 0`: that covers
-      // the offline case (`listSessionChunks` threw NETWORK_ERROR) AND
-      // the "no chunks uploaded yet" case. In both situations the
-      // recording's local file is likely still on disk (the queue
-      // entry has not been reaped because uploads never finished). If
-      // we can find that local URI, surface it as the result instead
-      // of the empty failure block. The cloud export logic is NOT
-      // modified — we only react to its output.
-      if (result.status === 'failed' && result.validChunks === 0) {
-        setPhase({ kind: 'localExport' });
-        const localUri =
-          localRecordingUri ?? (await findLocalRecordingUri(sessionId));
-        if (localUri) {
-          console.log('LOCAL EXPORT fallback used', {
-            sessionId,
-            localUri,
-          });
-          setPhase({ kind: 'localFallback', filePath: localUri });
-          return;
-        }
-        // No local file available either — fall through to the
-        // existing failed UI which renders the cloud result.
-      }
-
-      setPhase({ kind: 'done', result });
-    } catch (err) {
-      // `exportSession` is supposed to never throw, but we defend in
-      // depth — any escape gets surfaced as a controlled error state.
-      const message = err instanceof Error ? err.message : String(err);
-      setPhase({ kind: 'error', message });
-    }
+    // Cloud-first path. Routed through the export-runner singleton
+    // since 2026-05-18 (Fase 2 of the export refactor). The runner:
+    //   - guarantees at most ONE in-flight export across the app
+    //     (anti double-export — startExport returns false if busy);
+    //   - survives screen unmount so a navigate-away/back during
+    //     export re-hydrates progress on remount;
+    //   - owns the AbortController so a future cancel surface can
+    //     call `cancelExport(sessionId)` without UI plumbing changes.
+    //
+    // The `phase` state (running / done / localFallback / error) is
+    // driven by the runner subscriber installed in the useEffect
+    // above. This function only TRIGGERS the run; it does not await
+    // its completion. The local-fallback decision lives in the
+    // subscriber's `handleDone` helper — same condition, same
+    // transitions, same log key as the pre-runner inline version.
+    //
+    // If the runner refuses (returns false), an export for this
+    // session is already in flight: the subscriber is already pushing
+    // its progress into `phase`, so we simply return — no need to
+    // setPhase from this call site.
+    const mode: SessionMode | undefined = sessionMode ?? undefined;
+    startExport(sessionId, mode);
   }
 
   /**

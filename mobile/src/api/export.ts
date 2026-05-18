@@ -163,6 +163,7 @@ export interface ExportResult {
     | 'hash_mismatch'
     | 'download_failed'
     | 'auth_failed'
+    | 'cancelled'
     | null;
 }
 
@@ -320,6 +321,40 @@ export async function getSessionDetail(
  */
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Abortable sleep used by the shared-token 401 refresh backoff. Resolves
+ * after `ms` OR rejects with ApiError(0, 'EXPORT_CANCELLED', ...) if
+ * `signal` fires first. When `signal` is undefined the behaviour is
+ * identical to the plain `sleep(ms)` above (path equivalence preserved
+ * for callers that do not pass a signal).
+ *
+ * The abort listener is removed inside both the timer callback and the
+ * abort handler so no listener leaks across consecutive backoff cycles
+ * when the same signal services multiple chunks.
+ */
+function sleepAbortable(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (!signal) {
+      setTimeout(resolve, ms);
+      return;
+    }
+    if (signal.aborted) {
+      reject(new ApiError(0, 'EXPORT_CANCELLED', 'aborted', null));
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', onAbort);
+      reject(new ApiError(0, 'EXPORT_CANCELLED', 'aborted', null));
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener('abort', onAbort);
+  });
 }
 
 /**
@@ -557,6 +592,13 @@ export async function exportFromChunkRefs(
   }>,
   onProgress?: (p: ExportProgress) => void,
   mode?: SessionMode,
+  // Optional cancellation signal. When omitted, behaviour is byte-
+  // identical to the pre-signal implementation (no aborted checks fire,
+  // no cancelled short-circuit runs). Callers that pass a signal can
+  // abort the export at iteration boundaries OR mid-fetch (the latter
+  // requires the `downloadFn` closure to honour the same signal — see
+  // `downloadChunkSharedToken` for the active wiring).
+  signal?: AbortSignal,
 ): Promise<ExportResult> {
   // Caller guarantees `chunks` is already filtered + sorted asc by
   // chunk_index. We re-derive lastIndex / totalChunks / missingIndexes
@@ -629,6 +671,7 @@ export async function exportFromChunkRefs(
     | 'hash_mismatch'
     | 'download_failed'
     | 'auth_failed'
+    | 'cancelled'
     | null =
     null;
   // Mirror of the container extension picked by the post-concat
@@ -653,6 +696,27 @@ export async function exportFromChunkRefs(
   // `corruptIndexes` so the integrity report stays honest).
   const byIndex = new Map(chunks.map((c) => [c.chunk_index, c]));
   for (let idx = 0; idx < totalChunks; idx++) {
+    // Cancellation gate at iteration boundary. Fires when the caller's
+    // AbortController has been aborted between (or before) downloads.
+    // Mirrors the same "stopped at gap" structure used for missing /
+    // hash_mismatch / download_failed: record the index, set the
+    // stopReason, log, break. The bottom-of-function short-circuit
+    // then collapses to `status='failed'` with no file written.
+    //
+    // When `signal` is undefined this branch is dead code — `signal?.aborted`
+    // evaluates to `undefined` (falsy). Path equivalence with the
+    // pre-signal implementation is preserved by construction.
+    if (signal?.aborted) {
+      stoppedAt = idx;
+      stopReason = 'cancelled';
+      log('EXPORT STOPPED AT GAP', {
+        sessionId,
+        atIndex: idx,
+        reason: 'cancelled',
+      });
+      break;
+    }
+
     const meta = byIndex.get(idx);
 
     // (a) Missing from the input set — stop. The exact set of missing
@@ -729,6 +793,25 @@ export async function exportFromChunkRefs(
     } catch (err) {
       // (c) Download failure — record and stop.
       //
+      // Cancelled branch: `downloadChunkSharedToken` raises ApiError
+      // with code `EXPORT_CANCELLED` when the caller's AbortSignal
+      // fires mid-fetch (linked into the internal AbortController) or
+      // during the 401 refresh backoff. Same survival rule as
+      // `AUTH_FAILED`: bytes never reached the verifier, so calling it
+      // "corrupt" would lie. Tag stopReason='cancelled' and do NOT
+      // push to corruptIndexes. The bottom short-circuit below folds
+      // this into `status='failed'` with no file written.
+      if (err instanceof ApiError && err.code === 'EXPORT_CANCELLED') {
+        stoppedAt = idx;
+        stopReason = 'cancelled';
+        log('EXPORT STOPPED AT GAP', {
+          sessionId,
+          atIndex: idx,
+          reason: 'cancelled',
+        });
+        break;
+      }
+
       // Auth-failed branch: `downloadChunk` raises ApiError with code
       // `AUTH_FAILED` after its single retry exhausts (null token twice
       // OR server 401 twice). That is structurally different from
@@ -775,6 +858,41 @@ export async function exportFromChunkRefs(
     stoppedAt,
     contiguous: validChunks === totalChunks,
   });
+
+  // Cancelled short-circuit. The user explicitly aborted via the
+  // AbortSignal (either before any download, between chunks, or
+  // mid-fetch). No file is written and no chunks are flagged corrupt
+  // — cancellation is not an integrity event. The result preserves
+  // `validChunks` (the number that downloaded + verified before the
+  // abort landed) so callers can show "you got N/M before stopping"
+  // if they want, but the authoritative shape is status='failed' with
+  // stopReason='cancelled' and filePath=null. Mirrors the auth_failed
+  // structure below — same "user-initiated, not corruption" semantics.
+  if (stopReason === 'cancelled') {
+    log('GC_EXPORT_DIAG_RAW', {
+      sessionId,
+      phase: 'cancelled',
+      status: 'failed',
+      totalChunks,
+      validChunks,
+      missingCount: missingIndexes.length,
+      corruptCount: corruptIndexes.length,
+      stoppedAt,
+      stopReason,
+      extension: null,
+    });
+    return {
+      status: 'failed',
+      filePath: null,
+      totalChunks,
+      validChunks,
+      missingIndexes,
+      corruptIndexes,
+      extension: null,
+      stoppedAt,
+      stopReason,
+    };
+  }
 
   // Auth-failed short-circuit. Per the survival rule "no false claims
   // about evidence integrity", an export that bailed because the
@@ -1051,6 +1169,31 @@ interface TokenRef {
 }
 
 /**
+ * Build a uniform "cancelled" ExportResult. Used by `exportSession`
+ * for the pre-flight cancellation checks (signal already aborted
+ * before list / between list and token / between token and loop). The
+ * loop's own cancellation lives inside `exportFromChunkRefs`'s short-
+ * circuit and produces an equivalent shape.
+ *
+ * `totalChunks` is 0 here because the loop never ran; the result is
+ * "we never even got to count". The UI's cancellation copy is keyed
+ * off `stopReason === 'cancelled'`, not the chunk totals.
+ */
+function buildCancelledResult(): ExportResult {
+  return {
+    status: 'failed',
+    filePath: null,
+    totalChunks: 0,
+    validChunks: 0,
+    missingIndexes: [],
+    corruptIndexes: [],
+    extension: null,
+    stoppedAt: null,
+    stopReason: 'cancelled',
+  };
+}
+
+/**
  * Explicitly refresh the Supabase session and return the new access
  * token, or null if the refresh failed for any reason (revoked
  * refresh_token, network down, no persisted session, etc.).
@@ -1102,6 +1245,15 @@ async function downloadChunkSharedToken(
   chunkIndex: number,
   tokenRef: TokenRef,
   timeoutMs = 30_000,
+  // Optional cancellation signal. When provided, an abort fires the
+  // internal AbortController (cancelling any in-flight fetch) AND
+  // interrupts the 401 refresh backoff sleep. Aborts surface as
+  // ApiError(0, 'EXPORT_CANCELLED', ...) so the caller in
+  // `exportFromChunkRefs` can discriminate cancellation from
+  // NETWORK_ERROR / AUTH_FAILED / generic download failures. When
+  // omitted, every code path is byte-identical to the pre-signal
+  // implementation.
+  signal?: AbortSignal,
 ): Promise<{ bytes: Uint8Array; headerHash: string }> {
   const path = `/sessions/${encodeURIComponent(sessionId)}/chunks/${chunkIndex}/download`;
   const url = `${env.apiUrl}${path}`;
@@ -1109,6 +1261,18 @@ async function downloadChunkSharedToken(
   async function fetchOnce(token: string): Promise<Response> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
+    // External signal → internal controller relay. Allows mid-fetch
+    // cancellation while preserving the existing timeout semantics.
+    // Listener is removed in the finally so a long-lived signal does
+    // not accumulate handlers across consecutive chunk downloads.
+    const onExternalAbort = () => controller.abort();
+    if (signal) {
+      if (signal.aborted) {
+        controller.abort();
+      } else {
+        signal.addEventListener('abort', onExternalAbort);
+      }
+    }
     try {
       return await fetch(url, {
         method: 'GET',
@@ -1116,6 +1280,14 @@ async function downloadChunkSharedToken(
         signal: controller.signal,
       });
     } catch (e) {
+      // Distinguish a fetch abort originating from `signal` (caller
+      // cancelled) from a fetch abort originating from `timer`
+      // (timeout) or a genuine network throw. The caller's loop maps
+      // EXPORT_CANCELLED to `stopReason='cancelled'` and keeps the
+      // chunk OFF corruptIndexes — see exportFromChunkRefs's catch.
+      if (signal?.aborted) {
+        throw new ApiError(0, 'EXPORT_CANCELLED', 'aborted', null);
+      }
       throw new ApiError(
         0,
         'NETWORK_ERROR',
@@ -1124,6 +1296,9 @@ async function downloadChunkSharedToken(
       );
     } finally {
       clearTimeout(timer);
+      if (signal) {
+        signal.removeEventListener('abort', onExternalAbort);
+      }
     }
   }
 
@@ -1173,7 +1348,11 @@ async function downloadChunkSharedToken(
     reason: 'http_401_from_backend',
   });
   for (let attempt = 0; attempt < MAX_AUTH_REFRESH_ATTEMPTS; attempt++) {
-    await sleep(AUTH_BACKOFF_MS[attempt]!);
+    // Use the abortable sleep so a cancel during a long backoff
+    // (up to 8s on the last attempt) does not stall the export. The
+    // signal-less call is byte-identical to the plain sleep used
+    // before this change.
+    await sleepAbortable(AUTH_BACKOFF_MS[attempt]!, signal);
     const newToken = await refreshAccessTokenViaSupabase();
     if (!newToken) {
       log('AUTH_REFRESH_FAILED', {
@@ -1265,12 +1444,29 @@ export async function exportSession(
    * index, which records `mode` per session at creation time.
    */
   mode?: SessionMode,
+  /**
+   * Optional cancellation signal. Plumbed through `listSessionChunks`,
+   * `exportFromChunkRefs`, and `downloadChunkSharedToken`. When the
+   * signal fires, the run resolves with `status='failed'` and
+   * `stopReason='cancelled'` — no throw, no file written, no chunks
+   * marked corrupt. When omitted, behaviour is byte-identical to the
+   * pre-signal implementation (the cancelled short-circuit never
+   * fires, list and download paths see `signal: undefined` and skip
+   * the abort hooks entirely).
+   */
+  signal?: AbortSignal,
 ): Promise<ExportResult> {
   log('EXPORT START', { sessionId, mode });
 
+  // Pre-list cancellation check. Catches the "started then immediately
+  // cancelled" race before any network or token I/O fires.
+  if (signal?.aborted) {
+    return buildCancelledResult();
+  }
+
   let chunks: ChunkMeta[];
   try {
-    chunks = await listSessionChunks(sessionId);
+    chunks = await listSessionChunks(sessionId, signal);
   } catch (err) {
     // Discriminate the auth-loss case from a generic list failure.
     // `listSessionChunks` raises `ApiError(401, 'AUTH_FAILED', ...)`
@@ -1395,6 +1591,13 @@ export async function exportSession(
     size: c.size,
   }));
 
+  // Post-list cancellation check. Lets a cancel that arrived during
+  // `listSessionChunks` (or during the small window before the token
+  // resolution starts) bail out cleanly before we read auth state.
+  if (signal?.aborted) {
+    return buildCancelledResult();
+  }
+
   // Resolve the access token ONCE for the whole chunk loop.
   // `listSessionChunks` just succeeded so supabase-js definitely has a
   // valid token in hand; we read it and pin it. The chunk loop below
@@ -1437,15 +1640,30 @@ export async function exportSession(
       stopReason: 'auth_failed',
     };
   }
+  // Post-token cancellation check. Mirrors the pre-list and post-list
+  // checks; together they ensure every awaited transition in this
+  // function honours cancellation before the (potentially long) chunk
+  // loop starts.
+  if (signal?.aborted) {
+    return buildCancelledResult();
+  }
+
   const tokenRef: TokenRef = { current: initialToken };
 
   return exportFromChunkRefs(
     sessionId,
     'guardian_export',
     refs,
-    (idx) => downloadChunkSharedToken(sessionId, idx, tokenRef),
+    // Closure captures `signal` so each per-chunk fetch + 401 backoff
+    // sleep honours the same cancellation. The default-timeout argument
+    // is preserved at its value (30_000) — only the new signal slot is
+    // populated here. Path equivalence with the pre-signal call site
+    // holds: when signal is undefined, downloadChunkSharedToken sees
+    // signal=undefined and follows the legacy code path verbatim.
+    (idx) => downloadChunkSharedToken(sessionId, idx, tokenRef, 30_000, signal),
     onProgress,
     mode,
+    signal,
   );
 }
 
