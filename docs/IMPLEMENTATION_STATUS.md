@@ -115,6 +115,83 @@ Capacidades:
 - partial recovery
 - export from recovered evidence
 
+---
+
+## Incremental manifests and partial cross-device recovery (v0.3.4)
+
+Status: ✅ validated on real device
+
+Guardian Cloud now writes incremental Drive manifests during recording/upload, not only after session completion.
+
+### What changed
+
+Partial manifests are generated:
+- after the first uploaded chunk
+- every 10 uploaded chunks
+- once more as final manifest when the session completes
+
+The manifest keeps the same deterministic filename:
+
+`{sessionId}_manifest.json`
+
+and is overwritten as the session progresses.
+
+### Why
+
+Previously, chunks could survive in Google Drive while the session was still undiscoverable from another device.
+
+Failure case fixed:
+1. start recording
+2. upload some chunks
+3. lose connection / enable airplane mode
+4. uninstall the app
+5. reinstall on another device
+6. open recovery
+
+Before this change:
+- uploaded chunks existed in Drive
+- but no manifest existed yet
+- recovery only showed older completed sessions
+
+Now:
+- partial manifests make interrupted sessions discoverable
+- recovery can show them as partial
+- uploaded evidence can be exported even if the original app install is gone
+
+### Architecture
+
+- Backend writes partial manifests fire-and-forget after chunk upload registration.
+- Chunk upload response is not blocked by manifest generation.
+- `GC_QUEUE` is unchanged.
+- Mobile worker is unchanged.
+- Export pipeline is unchanged.
+- Drive OAuth is unchanged.
+- Final complete manifest still overwrites the partial manifest on `/complete`.
+
+### Partial recovery behavior
+
+Audio:
+- partial `.aac` recovery is usable because AAC ADTS frames are self-framing.
+
+Video:
+- partial `.mp4` recovery may not be directly playable if the MP4 metadata/moov atom was not written yet.
+- It is still preserved as forensic partial evidence.
+
+### Validated scenario
+
+Real-device test passed:
+
+- started recording
+- waited for chunks + partial manifest
+- enabled airplane mode
+- uninstalled app
+- reinstalled APK
+- opened recovery
+- partial session appeared
+- partial recovery/export worked
+
+This closes the gap where evidence chunks survived remotely but were not discoverable after local state loss.
+
 ### Video upload pipeline optimization (validated)
 
 Status: ✅ validated on real device
