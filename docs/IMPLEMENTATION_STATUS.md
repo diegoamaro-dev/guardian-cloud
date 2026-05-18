@@ -114,3 +114,41 @@ Capacidades:
 - reconstruction from manifest
 - partial recovery
 - export from recovered evidence
+
+### Video upload pipeline optimization (validated)
+
+Status: ✅ validated on real device
+
+Changes:
+- Increased `VIDEO_FILE_CHUNK_SIZE` from 32 KB → 128 KB.
+- Reduced POST/upload request count ~4× for typical MVP-sized videos.
+- Preserved:
+  - disk-backed queue
+  - recovery flow
+  - export compatibility
+  - completion gate
+  - cleanup/reap behaviour
+  - background draining
+
+Why:
+The previous 32 KB strategy generated excessive request overhead for
+video uploads (~150-160 chunks for ~5 MB recordings). Real-device
+testing showed the bottleneck was request count, not local disk IO.
+
+Result:
+- Faster drain throughput.
+- Smaller queue metadata pressure.
+- Less post-stop waiting time before protection completes.
+- Stable exports and playback after upload.
+
+Real-device validation completed:
+- short recording
+- near-MVP-cap recording
+- upload completion
+- export playback
+- recovery after restart
+
+Important:
+This optimization only affects the post-stop video chunking pipeline.
+Audio live-stream chunking remains independent and optimized separately
+(32 KB disk-backed audio chunks).
