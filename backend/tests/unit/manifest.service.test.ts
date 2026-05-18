@@ -20,6 +20,7 @@ import { describe, expect, it } from 'vitest';
 import {
   buildManifest,
   chunkFileName,
+  shouldEmitIncrementalManifest,
   type SessionManifest,
 } from '../../src/services/manifest.service.js';
 import type { ChunkRow } from '../../src/services/chunks.service.js';
@@ -198,5 +199,97 @@ describe('buildManifest', () => {
     ]);
     expect(JSON.stringify(manifest)).not.toContain('drive-file-id-secret');
     expect(JSON.stringify(manifest)).not.toContain('remote_reference');
+  });
+
+  // --- Incremental manifest fields (post 2026-05-18) -------------------
+
+  it('sets manifest_seq from uploaded count and last_updated_at from now()', () => {
+    const chunks: ChunkRow[] = [
+      mkChunk({ chunk_index: 0, remote_reference: 'd0' }),
+      mkChunk({ chunk_index: 1, remote_reference: 'd1' }),
+    ];
+    const manifest = buildManifest(
+      { id: SESSION_ID, mode: 'audio', created_at: CREATED_AT },
+      COMPLETED_AT,
+      chunks,
+    );
+
+    expect(manifest.manifest_seq).toBe(2);
+    expect(typeof manifest.last_updated_at).toBe('string');
+    expect(manifest.last_updated_at!.length).toBeGreaterThan(10);
+  });
+
+  it('omits is_partial by default (final manifest path)', () => {
+    const manifest = buildManifest(
+      { id: SESSION_ID, mode: 'audio', created_at: CREATED_AT },
+      COMPLETED_AT,
+      [mkChunk({ chunk_index: 0 })],
+    );
+    expect(manifest.is_partial).toBeUndefined();
+  });
+
+  it('sets is_partial=true and accepts completed_at=null for incremental writes', () => {
+    const manifest = buildManifest(
+      { id: SESSION_ID, mode: 'audio', created_at: CREATED_AT },
+      /*completedAt*/ null,
+      [
+        mkChunk({ chunk_index: 0, remote_reference: 'd0' }),
+        mkChunk({ chunk_index: 1, remote_reference: 'd1' }),
+        mkChunk({ chunk_index: 2, remote_reference: 'd2' }),
+      ],
+      { isPartial: true },
+    );
+
+    expect(manifest.is_partial).toBe(true);
+    expect(manifest.completed_at).toBeNull();
+    expect(manifest.manifest_seq).toBe(3);
+    expect(manifest.chunk_count).toBe(3);
+  });
+
+  it('honours an explicit lastUpdatedAt option (deterministic for tests)', () => {
+    const lastUpdated = '2026-05-18T12:34:56.000Z';
+    const manifest = buildManifest(
+      { id: SESSION_ID, mode: 'audio', created_at: CREATED_AT },
+      null,
+      [mkChunk({ chunk_index: 0 })],
+      { isPartial: true, lastUpdatedAt: lastUpdated },
+    );
+    expect(manifest.last_updated_at).toBe(lastUpdated);
+  });
+});
+
+describe('shouldEmitIncrementalManifest', () => {
+  // Trigger thresholds pinned: first chunk (count===1) plus every 10
+  // uploads thereafter. Together with the /complete final write, a
+  // typical 5 MB video session (~40 chunks) produces ~5 incremental
+  // manifests + 1 final = 6 total Drive writes per session.
+
+  it('fires on the first uploaded chunk', () => {
+    expect(shouldEmitIncrementalManifest(1)).toBe(true);
+  });
+
+  it('does NOT fire on counts in (1, 10)', () => {
+    for (let n = 2; n < 10; n++) {
+      expect(shouldEmitIncrementalManifest(n)).toBe(false);
+    }
+  });
+
+  it('fires on every multiple of 10', () => {
+    expect(shouldEmitIncrementalManifest(10)).toBe(true);
+    expect(shouldEmitIncrementalManifest(20)).toBe(true);
+    expect(shouldEmitIncrementalManifest(150)).toBe(true);
+    expect(shouldEmitIncrementalManifest(1000)).toBe(true);
+  });
+
+  it('does NOT fire on counts between multiples of 10', () => {
+    expect(shouldEmitIncrementalManifest(11)).toBe(false);
+    expect(shouldEmitIncrementalManifest(19)).toBe(false);
+    expect(shouldEmitIncrementalManifest(99)).toBe(false);
+  });
+
+  it('does NOT fire on 0 or negative counts (defensive)', () => {
+    expect(shouldEmitIncrementalManifest(0)).toBe(false);
+    expect(shouldEmitIncrementalManifest(-1)).toBe(false);
+    expect(shouldEmitIncrementalManifest(-10)).toBe(false);
   });
 });

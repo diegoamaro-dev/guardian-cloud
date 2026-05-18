@@ -106,16 +106,118 @@ describe('parseManifest', () => {
     const parsed = parseManifest(validManifest({ chunk_count: 0, chunks: [] }));
     expect(parsed?.chunk_count).toBe(0);
   });
+
+  // --- Incremental manifest fields (post 2026-05-18) -------------------
+
+  it('accepts completed_at: null (partial manifest)', () => {
+    const parsed = parseManifest(
+      validManifest({ completed_at: null, is_partial: true }),
+    );
+    expect(parsed).not.toBeNull();
+    expect(parsed?.completed_at).toBeNull();
+    expect(parsed?.is_partial).toBe(true);
+  });
+
+  it('rejects completed_at: 0 or other non-string non-null values', () => {
+    expect(parseManifest(validManifest({ completed_at: 0 }))).toBeNull();
+    expect(parseManifest(validManifest({ completed_at: false }))).toBeNull();
+    expect(parseManifest(validManifest({ completed_at: 'short' }))).toBeNull();
+  });
+
+  it('extracts is_partial, manifest_seq, last_updated_at when present', () => {
+    const lastUpdated = '2026-05-18T12:00:00.000Z';
+    const parsed = parseManifest(
+      validManifest({
+        is_partial: true,
+        manifest_seq: 30,
+        last_updated_at: lastUpdated,
+      }),
+    );
+    expect(parsed?.is_partial).toBe(true);
+    expect(parsed?.manifest_seq).toBe(30);
+    expect(parsed?.last_updated_at).toBe(lastUpdated);
+  });
+
+  it('rejects malformed is_partial / manifest_seq / last_updated_at', () => {
+    expect(parseManifest(validManifest({ is_partial: 'true' }))).toBeNull();
+    expect(parseManifest(validManifest({ manifest_seq: -1 }))).toBeNull();
+    expect(parseManifest(validManifest({ manifest_seq: 'ten' }))).toBeNull();
+    expect(parseManifest(validManifest({ last_updated_at: 0 }))).toBeNull();
+    expect(parseManifest(validManifest({ last_updated_at: 'short' }))).toBeNull();
+  });
+
+  it('preserves backward compatibility: legacy manifest without new fields parses unchanged', () => {
+    // Manifest written before the incremental path existed has no
+    // is_partial / manifest_seq / last_updated_at fields. Must parse to
+    // the same 5-field shape it always produced.
+    const parsed = parseManifest(validManifest());
+    expect(parsed?.is_partial).toBeUndefined();
+    expect(parsed?.manifest_seq).toBeUndefined();
+    expect(parsed?.last_updated_at).toBeUndefined();
+    expect(parsed?.completed_at).toBe('2026-05-14T10:05:00.000Z');
+  });
 });
 
 describe('classifyProtection', () => {
-  it("returns 'complete' when chunk_count > 0", () => {
-    expect(classifyProtection(1)).toBe('complete');
-    expect(classifyProtection(42)).toBe('complete');
+  // Signature evolved from `classifyProtection(chunkCount)` to
+  // `classifyProtection({chunk_count, is_partial?, completed_at})` when
+  // incremental (partial) manifests were introduced. The same legacy
+  // outcomes are preserved: pre-incremental manifests (no is_partial,
+  // ISO completed_at) classify identically.
+
+  it("returns 'complete' when chunk_count > 0 and not partial (legacy shape)", () => {
+    expect(
+      classifyProtection({
+        chunk_count: 1,
+        completed_at: '2026-01-01T00:00:00.000Z',
+      }),
+    ).toBe('complete');
+    expect(
+      classifyProtection({
+        chunk_count: 42,
+        completed_at: '2026-01-01T00:00:00.000Z',
+      }),
+    ).toBe('complete');
   });
 
-  it("returns 'partial' when chunk_count === 0", () => {
-    expect(classifyProtection(0)).toBe('partial');
+  it("returns 'partial' when chunk_count === 0 (defensive)", () => {
+    expect(
+      classifyProtection({
+        chunk_count: 0,
+        completed_at: '2026-01-01T00:00:00.000Z',
+      }),
+    ).toBe('partial');
+  });
+
+  it("returns 'partial' when is_partial === true (incremental manifest)", () => {
+    expect(
+      classifyProtection({
+        chunk_count: 10,
+        is_partial: true,
+        completed_at: null,
+      }),
+    ).toBe('partial');
+  });
+
+  it("returns 'partial' when completed_at === null (incremental, defensive without is_partial flag)", () => {
+    expect(
+      classifyProtection({
+        chunk_count: 10,
+        completed_at: null,
+      }),
+    ).toBe('partial');
+  });
+
+  it("returns 'complete' when is_partial is absent and completed_at is ISO (pre-incremental manifest)", () => {
+    // Backward compatibility with manifests written before the
+    // is_partial field existed: classification must remain 'complete'
+    // exactly as the old single-arg signature returned.
+    expect(
+      classifyProtection({
+        chunk_count: 5,
+        completed_at: '2025-12-01T12:00:00.000Z',
+      }),
+    ).toBe('complete');
   });
 });
 

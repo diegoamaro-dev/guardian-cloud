@@ -197,7 +197,12 @@ type Phase =
     }
   | { kind: 'error'; message: string };
 
-function formatDate(iso: string): string {
+function formatDate(iso: string | null): string {
+  // Partial manifests (incremental writes during recording) carry a
+  // null `completed_at`. Render an em-dash so the row stays structured;
+  // the partial verdict comes from `result.status`/`stopReason`, not
+  // from this label.
+  if (iso === null) return '—';
   try {
     const d = new Date(iso);
     if (Number.isNaN(d.getTime())) return iso;

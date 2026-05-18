@@ -869,6 +869,136 @@ export async function listFilesInFolder(
 }
 
 /**
+ * Replace the content bytes of an existing Drive file by `fileId`. Uses
+ * Drive's "simple media upload" PATCH path (no metadata change, just
+ * content). Atomic per file — interrupting this call leaves either the
+ * old content intact OR the new content fully written; partial mid-write
+ * states are not observable through Drive's API.
+ *
+ * Returns the same `DriveUploadResult` shape as `uploadFile` so the two
+ * functions are interchangeable through `uploadOrReplaceFile` (which
+ * picks one based on whether a file with the same name already exists).
+ *
+ * Used by the manifest pipeline so a session ends up with exactly ONE
+ * manifest file in Drive across all incremental writes + the final
+ * write at /complete. Without this, repeated `uploadFile` calls under
+ * the same `fileName` would create duplicate Drive files (Drive permits
+ * dup names per folder); discovery's most-recent-modifiedTime dedup
+ * would still pick the latest, but Drive clutter would grow linearly.
+ *
+ * Failure modes mirror `uploadFile`:
+ *   - 401 → DRIVE_AUTH_EXPIRED (caller's withDriveRetry will refresh)
+ *   - 404 → DRIVE_FILE_NOT_FOUND (the file_id is no longer valid)
+ *   - any other non-2xx → DRIVE_UPLOAD_FAILED (502)
+ */
+export async function updateFileContent(
+  accessToken: string,
+  fileId: string,
+  content: Uint8Array | Buffer,
+  mimeType = 'application/octet-stream',
+): Promise<DriveUploadResult> {
+  const safeId = encodeURIComponent(fileId);
+  // `Buffer.concat([x])` returns `Buffer<ArrayBuffer>` (concrete) where
+  // a direct `Buffer.from(Uint8Array)` returns `Buffer<ArrayBufferLike>`
+  // — the former is assignable to DOM `BodyInit`, the latter is not.
+  // Mirrors the pattern the existing `uploadFile` uses for its body.
+  const contentBuffer = Buffer.concat([
+    Buffer.isBuffer(content) ? content : Buffer.from(content),
+  ]);
+  const res = await fetchWithTimeout(
+    `${DRIVE_UPLOAD_BASE}/files/${safeId}?uploadType=media&fields=id,name,size,webViewLink`,
+    {
+      method: 'PATCH',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': mimeType,
+        'Content-Length': contentBuffer.length.toString(),
+      },
+      body: contentBuffer,
+    },
+  );
+
+  if (!res.ok) {
+    const detail = await res.text().catch(() => '<no body>');
+    logger.warn(
+      {
+        op: 'drive.updateFileContent',
+        status: res.status,
+        size: contentBuffer.length,
+        detail: detail.substring(0, 200),
+      },
+      'Drive update content failed',
+    );
+    if (res.status === 401) {
+      throw new AppError(
+        401,
+        'DRIVE_AUTH_EXPIRED',
+        'Drive update 401 (access token rejected)',
+      );
+    }
+    if (res.status === 404) {
+      throw new AppError(
+        404,
+        'DRIVE_FILE_NOT_FOUND',
+        'Drive update target file no longer exists',
+      );
+    }
+    throw new AppError(
+      502,
+      'DRIVE_UPLOAD_FAILED',
+      `Drive update failed (${res.status})`,
+    );
+  }
+
+  const json = (await res.json()) as {
+    id?: string;
+    name?: string;
+    size?: string;
+    webViewLink?: string;
+  };
+  if (!json.id) {
+    throw new AppError(502, 'DRIVE_UPLOAD_FAILED', 'Drive update returned no file id');
+  }
+
+  return {
+    file_id: json.id,
+    name: json.name ?? '',
+    size: Number(json.size ?? contentBuffer.length),
+    web_view_link: json.webViewLink,
+  };
+}
+
+/**
+ * Find-or-create write semantics. If a file with `fileName` already
+ * exists under `folderId`, replace its content via `updateFileContent`;
+ * otherwise create a new file via `uploadFile`. Returns the same
+ * `DriveUploadResult` either way.
+ *
+ * This keeps the manifest path deterministic: exactly ONE manifest
+ * file per session in Drive across incremental writes + the final
+ * write at /complete. Adheres to the "no multi-manifest" project rule.
+ *
+ * Race: if two concurrent calls race past the `findFileByName` check
+ * before either uploads, BOTH create new files (Drive permits dup
+ * names). Discovery dedups by session_id + most recent modifiedTime,
+ * so end-user behaviour is correct. This is an acceptable race because
+ * the only caller is fire-and-forget from the chunk upload handler.
+ */
+export async function uploadOrReplaceFile(
+  accessToken: string,
+  folderId: string,
+  fileName: string,
+  content: Uint8Array | Buffer,
+  mimeType = 'application/octet-stream',
+): Promise<DriveUploadResult> {
+  const existingId = await findFileByName(accessToken, folderId, fileName);
+  if (existingId) {
+    return await updateFileContent(accessToken, existingId, content, mimeType);
+  }
+  return await uploadFile(accessToken, folderId, fileName, content, mimeType);
+}
+
+/**
  * Upload `content` to Drive under `folderId` as `fileName` using the
  * simple multipart upload path (Drive's "one shot" upload, suitable for
  * small files — which is exactly what our chunks are at 16 KB).

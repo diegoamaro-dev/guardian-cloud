@@ -33,7 +33,15 @@ export interface RecoverableSession {
   session_id: string;
   mode: RecoverableMode;
   created_at: string;
-  completed_at: string;
+  /**
+   * Completion timestamp. ISO string for sessions that reached
+   * /complete server-side. `null` for partial manifests written
+   * incrementally during recording (the session was interrupted before
+   * /complete fired — e.g. app killed mid-recording, uninstalled, then
+   * reinstalled). The "Parcial" badge derives from `protection_status`,
+   * not from this field directly.
+   */
+  completed_at: string | null;
   chunk_count: number;
   protection_status: ProtectionStatus;
   /**

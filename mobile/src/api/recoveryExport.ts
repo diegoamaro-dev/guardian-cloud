@@ -50,13 +50,18 @@ export interface ManifestChunkRef {
 /**
  * Full manifest payload from `GET /recovery/manifests/:manifest_file_id`.
  * Mirrors `FullManifest` in the backend `recovery.service.ts`.
+ *
+ * `completed_at: string | null` — null when the manifest was written
+ * incrementally during recording (the session never reached /complete).
+ * The recovery exporter consumes the same `chunks` array either way
+ * and produces a longest-prefix file via `exportFromChunkRefs`.
  */
 export interface RecoveryFullManifest {
   manifest_file_id: string;
   session_id: string;
   mode: 'audio' | 'video';
   created_at: string;
-  completed_at: string;
+  completed_at: string | null;
   chunk_count: number;
   chunks: ManifestChunkRef[];
 }

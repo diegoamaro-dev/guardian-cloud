@@ -29,6 +29,12 @@ import { AppError } from '../errors/AppError.js';
 import { authMiddleware } from '../middleware/auth.js';
 import { userRateLimiter } from '../middleware/rateLimit.js';
 import { registerChunk } from '../services/chunks.service.js';
+import { listChunksForSession } from '../services/chunks.service.js';
+import {
+  shouldEmitIncrementalManifest,
+  tryGenerateIncrementalManifest,
+} from '../services/manifest.service.js';
+import { logger } from '../utils/logger.js';
 
 const router = Router();
 
@@ -73,6 +79,74 @@ router.post(
         updated_at: result.updated_at,
         idempotent_replay: result.idempotent_replay ?? false,
       });
+
+      // Fire-and-forget incremental manifest write. Triggered ONLY when:
+      //   - this was a fresh state transition (not an idempotent replay)
+      //   - the chunk's new status is 'uploaded'
+      //   - the resulting uploaded-chunks count matches the threshold
+      //     (first chunk, then every 10 — see shouldEmitIncrementalManifest)
+      //
+      // The work is scheduled AFTER `res.status(...).json(...)` so the
+      // response is sent before any Drive I/O begins. Errors inside the
+      // async block are logged but never surfaced to the client and
+      // never affect the chunk-upload's response shape. The chunk hot
+      // path is therefore byte-identical to the pre-incremental-manifest
+      // behaviour from the caller's point of view.
+      //
+      // Throughput impact: cost happens out-of-band on the server. No
+      // Express middleware is blocked; no client-visible latency. The
+      // Drive API quota used is documented in `manifest.service.ts`
+      // (~5-6 calls per typical 5 MB video session, 1 findFileByName
+      // + 1 PATCH/POST per call).
+      if (!result.idempotent_replay && result.status === 'uploaded') {
+        const userId = req.user.id;
+        const sessionId = result.session_id;
+        // setImmediate so the work runs on the next event-loop tick,
+        // AFTER any in-progress response flush. `void` keeps the linter
+        // happy about the unhandled-promise nature of fire-and-forget.
+        setImmediate(() => {
+          void (async () => {
+            try {
+              // Count uploaded chunks for this session. We use the
+              // existing `listChunksForSession` rather than a SQL
+              // COUNT(*) to keep the change additive — no new repository
+              // method, no schema mutation. The N+1 cost is bounded by
+              // the trigger frequency (this only runs after a real
+              // state transition, ~6 times per session) and the chunk
+              // list is small (40 for a 5 MB video, 450 for an audio).
+              const chunks = await listChunksForSession(userId, sessionId);
+              const uploadedCount = chunks.filter(
+                (c) => c.status === 'uploaded' && !!c.remote_reference,
+              ).length;
+
+              if (!shouldEmitIncrementalManifest(uploadedCount)) {
+                return;
+              }
+
+              logger.info(
+                {
+                  op: 'manifest.generate_incremental',
+                  sessionId,
+                  uploaded_count: uploadedCount,
+                  triggered_by_chunk_index: result.chunk_index,
+                },
+                'GC_INCREMENTAL_MANIFEST_TRIGGERED',
+              );
+
+              await tryGenerateIncrementalManifest(userId, sessionId);
+            } catch (err) {
+              logger.warn(
+                {
+                  op: 'manifest.generate_incremental',
+                  sessionId,
+                  err: err instanceof Error ? err.message : String(err),
+                },
+                'GC_INCREMENTAL_MANIFEST_HOOK_FAILED',
+              );
+            }
+          })();
+        });
+      }
     } catch (err) {
       next(err);
     }

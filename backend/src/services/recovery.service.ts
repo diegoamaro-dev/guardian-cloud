@@ -58,8 +58,21 @@ export interface RecoverableSession {
   session_id: string;
   mode: 'audio' | 'video';
   created_at: string;
-  completed_at: string;
+  /**
+   * Completion timestamp. ISO string for fully-completed sessions
+   * (manifest written at /complete). `null` for partial manifests
+   * (written during recording). Mobile UIs may render the "Parcial —
+   * sesión interrumpida" copy when this is null.
+   */
+  completed_at: string | null;
   chunk_count: number;
+  /**
+   * Status of the recoverable session. 'partial' when the manifest was
+   * written during recording (is_partial === true OR completed_at ===
+   * null). 'complete' when /complete fired the final manifest.
+   * Pre-incremental manifests are treated as 'complete' (chunk_count >
+   * 0), preserving backward compatibility.
+   */
   protection_status: 'complete' | 'partial';
   /**
    * Drive file_id of the manifest this entry was derived from. Opaque to
@@ -102,13 +115,27 @@ const HEX_SHA256_REGEX = /^[a-f0-9]{64}$/i;
  * declared independently here so a future schema bump cannot drag the
  * reader silently. Only the fields discovery actually consumes are
  * required; everything else is permissive.
+ *
+ * `completed_at` is `string | null`: null indicates a partial manifest
+ * written during recording, before /complete fires. The classifier
+ * below uses (`is_partial === true` OR `completed_at === null`) to
+ * surface the recovery list's "parcial" badge. Old manifests written
+ * before the incremental path existed always carry an ISO string in
+ * `completed_at`, so backward compatibility is total.
+ *
+ * `is_partial`, `manifest_seq`, `last_updated_at` are NEW optional
+ * fields. Missing values are valid and indicate a pre-incremental
+ * manifest (treated as complete by `classifyProtection`).
  */
 interface ParsedManifest {
   session_id: string;
   mode: 'audio' | 'video';
   created_at: string;
-  completed_at: string;
+  completed_at: string | null;
   chunk_count: number;
+  is_partial?: boolean;
+  manifest_seq?: number;
+  last_updated_at?: string;
 }
 
 function isIsoLike(value: unknown): value is string {
@@ -131,36 +158,75 @@ export function parseManifest(raw: unknown): ParsedManifest | null {
   }
   if (m.mode !== 'audio' && m.mode !== 'video') return null;
   if (!isIsoLike(m.created_at)) return null;
-  if (!isIsoLike(m.completed_at)) return null;
+  // completed_at: either an ISO-like string (complete manifest) or null
+  // (partial manifest written during recording). Anything else rejects.
+  if (m.completed_at !== null && !isIsoLike(m.completed_at)) return null;
   if (typeof m.chunk_count !== 'number' || !Number.isFinite(m.chunk_count) || m.chunk_count < 0) {
     return null;
   }
 
-  return {
+  // Optional new fields. Permissive: only validate shape if present.
+  // Missing fields are treated as undefined and classify as complete.
+  let isPartial: boolean | undefined;
+  if (m.is_partial !== undefined) {
+    if (typeof m.is_partial !== 'boolean') return null;
+    isPartial = m.is_partial;
+  }
+  let manifestSeq: number | undefined;
+  if (m.manifest_seq !== undefined) {
+    if (
+      typeof m.manifest_seq !== 'number' ||
+      !Number.isFinite(m.manifest_seq) ||
+      m.manifest_seq < 0
+    ) {
+      return null;
+    }
+    manifestSeq = m.manifest_seq;
+  }
+  let lastUpdatedAt: string | undefined;
+  if (m.last_updated_at !== undefined) {
+    if (!isIsoLike(m.last_updated_at)) return null;
+    lastUpdatedAt = m.last_updated_at;
+  }
+
+  const parsed: ParsedManifest = {
     session_id: m.session_id,
     mode: m.mode,
     created_at: m.created_at,
-    completed_at: m.completed_at,
+    completed_at: m.completed_at as string | null,
     chunk_count: m.chunk_count,
   };
+  if (isPartial !== undefined) parsed.is_partial = isPartial;
+  if (manifestSeq !== undefined) parsed.manifest_seq = manifestSeq;
+  if (lastUpdatedAt !== undefined) parsed.last_updated_at = lastUpdatedAt;
+  return parsed;
 }
 
 /**
  * Derive `protection_status` from manifest data alone (no DB lookup —
  * deferred to a future commit).
  *
- *   chunk_count > 0  → 'complete'   ("Protegido" in UI)
- *   chunk_count === 0 → 'partial'    (manifest exists but no chunks)
+ *   is_partial === true OR completed_at === null → 'partial'
+ *     ("Parcial" badge in UI; session was interrupted mid-recording)
+ *   chunk_count === 0                            → 'partial'
+ *     (defensive: a manifest with no chunks would be useless to recover)
+ *   otherwise                                    → 'complete'
+ *     ("Protegido" badge in UI; session reached /complete server-side)
  *
- * Note: COMMIT 1's `manifest.service.ts` SKIPS generation when
- * `chunk_count === 0`, so the partial branch is mostly defensive — but a
- * future flow (e.g. a forced regeneration of empty manifests for audit)
- * could produce one, and this keeps the classifier honest.
+ * Backward compatibility: pre-incremental manifests carry an ISO
+ * `completed_at` and no `is_partial` field. They land in the `otherwise`
+ * branch and classify as 'complete' — identical to the previous
+ * `chunkCount > 0 ? 'complete' : 'partial'` behaviour.
  *
  * Exposed for unit testing.
  */
-export function classifyProtection(chunkCount: number): 'complete' | 'partial' {
-  return chunkCount > 0 ? 'complete' : 'partial';
+export function classifyProtection(
+  parsed: Pick<ParsedManifest, 'chunk_count' | 'is_partial' | 'completed_at'>,
+): 'complete' | 'partial' {
+  if (parsed.is_partial === true) return 'partial';
+  if (parsed.completed_at === null) return 'partial';
+  if (parsed.chunk_count === 0) return 'partial';
+  return 'complete';
 }
 
 interface DiscoveryCandidate {
@@ -203,13 +269,30 @@ export function dedupAndSort(
       created_at: cand.parsed.created_at,
       completed_at: cand.parsed.completed_at,
       chunk_count: cand.parsed.chunk_count,
-      protection_status: classifyProtection(cand.parsed.chunk_count),
+      protection_status: classifyProtection(cand.parsed),
       manifest_file_id: cand.manifest_file_id,
     });
   }
 
-  // Newest completed_at first. Falls back to lexicographic on ISO strings.
-  out.sort((a, b) => (a.completed_at < b.completed_at ? 1 : a.completed_at > b.completed_at ? -1 : 0));
+  // Newest first. For complete manifests the natural key is
+  // `completed_at`; for partial manifests it is null, so fall back to
+  // `last_updated_at` if present (incremental writes set it on every
+  // update) and finally to `created_at`. ISO strings sort lexically.
+  function sortKey(s: RecoverableSession): string {
+    if (s.completed_at) return s.completed_at;
+    // last_updated_at is not on RecoverableSession to keep the surface
+    // small; reach back into the candidate map for it.
+    const lastUpdated = bySession.get(s.session_id)?.parsed.last_updated_at;
+    if (lastUpdated) return lastUpdated;
+    return s.created_at;
+  }
+  out.sort((a, b) => {
+    const ka = sortKey(a);
+    const kb = sortKey(b);
+    if (ka < kb) return 1;
+    if (ka > kb) return -1;
+    return 0;
+  });
   return out;
 }
 
@@ -402,9 +485,20 @@ export interface FullManifest {
   session_id: string;
   mode: 'audio' | 'video';
   created_at: string;
-  completed_at: string;
+  /**
+   * Completion timestamp. Same semantics as `ParsedManifest.completed_at`:
+   * ISO string for complete manifests, `null` for partial manifests
+   * written during recording. Recovery export consumers should treat
+   * a partial manifest as a best-effort longest-prefix export — the
+   * mobile `exportFromChunkRefs` already handles this case identically
+   * to a "stopped at gap" complete export.
+   */
+  completed_at: string | null;
   chunk_count: number;
   chunks: ManifestChunkRef[];
+  is_partial?: boolean;
+  manifest_seq?: number;
+  last_updated_at?: string;
 }
 
 /**
@@ -437,7 +531,12 @@ export function parseManifestFull(
   }
   if (m.mode !== 'audio' && m.mode !== 'video') return null;
   if (typeof m.created_at !== 'string' || m.created_at.length < 10) return null;
-  if (typeof m.completed_at !== 'string' || m.completed_at.length < 10) {
+  // completed_at: ISO-like string for complete manifests, `null` for
+  // partial manifests written during recording. Any other shape rejects.
+  if (
+    m.completed_at !== null &&
+    (typeof m.completed_at !== 'string' || m.completed_at.length < 10)
+  ) {
     return null;
   }
   if (
@@ -448,6 +547,31 @@ export function parseManifestFull(
     return null;
   }
   if (!Array.isArray(m.chunks)) return null;
+
+  // Optional new fields. Validate shape only if present.
+  let isPartial: boolean | undefined;
+  if (m.is_partial !== undefined) {
+    if (typeof m.is_partial !== 'boolean') return null;
+    isPartial = m.is_partial;
+  }
+  let manifestSeq: number | undefined;
+  if (m.manifest_seq !== undefined) {
+    if (
+      typeof m.manifest_seq !== 'number' ||
+      !Number.isFinite(m.manifest_seq) ||
+      m.manifest_seq < 0
+    ) {
+      return null;
+    }
+    manifestSeq = m.manifest_seq;
+  }
+  let lastUpdatedAt: string | undefined;
+  if (m.last_updated_at !== undefined) {
+    if (typeof m.last_updated_at !== 'string' || m.last_updated_at.length < 10) {
+      return null;
+    }
+    lastUpdatedAt = m.last_updated_at;
+  }
 
   // Strict chunks validation. We do NOT accept any chunk that fails the
   // shape check — a partial parse would hide tampering. The session_id
@@ -497,15 +621,19 @@ export function parseManifestFull(
   // deterministic order regardless of how Drive stored them.
   chunks.sort((a, b) => a.chunk_index - b.chunk_index);
 
-  return {
+  const out: FullManifest = {
     manifest_file_id: manifestFileId,
     session_id: sessionId,
     mode: m.mode,
     created_at: m.created_at,
-    completed_at: m.completed_at,
+    completed_at: m.completed_at as string | null,
     chunk_count: m.chunk_count,
     chunks,
   };
+  if (isPartial !== undefined) out.is_partial = isPartial;
+  if (manifestSeq !== undefined) out.manifest_seq = manifestSeq;
+  if (lastUpdatedAt !== undefined) out.last_updated_at = lastUpdatedAt;
+  return out;
 }
 
 /**

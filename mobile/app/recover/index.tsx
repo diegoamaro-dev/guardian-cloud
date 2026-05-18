@@ -55,7 +55,12 @@ type ScreenState =
   | { kind: 'empty' }
   | { kind: 'list'; sessions: RecoverableSession[] };
 
-function formatDate(iso: string): string {
+function formatDate(iso: string | null): string {
+  // Partial manifests (written during recording before /complete) carry
+  // a null `completed_at`. Render an explicit em-dash so the row still
+  // looks structured — the "Parcial" badge on the same card carries the
+  // semantic load.
+  if (iso === null) return '—';
   // Locale-aware human format; fallback to the raw ISO if Date parsing
   // fails for any reason (corrupt manifest snuck past the validator,
   // exotic device locale config). Either way the screen does not throw.
