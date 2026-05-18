@@ -8,23 +8,36 @@ import type { ChunkPayload, ChunkProducer } from './chunkProducer';
  * History:
  *   - 16 KB matched the audio chunker but produced ~1300 chunks for a
  *     21 MB MP4 (HTTP fan-out hell, UI stuck around 5/100).
- *   - 256 KB cut chunk count ~16x but each base64Slice was ~352 KB and
- *     the GC_QUEUE row blew past Android SQLite's CursorWindow ~2 MB
- *     per-row limit after only a handful of un-pruned chunks. Symptoms
- *     were `OutOfMemoryError` reading the file as base64 (separate
- *     issue, addressed by the size guard below) AND `Row too big to fit
- *     into CursorWindow` on every queueRead afterwards.
+ *   - 256 KB (pre disk-backed era) cut chunk count ~16x but each
+ *     base64Slice was ~352 KB and the GC_QUEUE row blew past Android
+ *     SQLite's CursorWindow ~2 MB per-row limit after only a handful
+ *     of un-pruned chunks. Symptoms were `OutOfMemoryError` reading
+ *     the file as base64 (separate issue, addressed by the size guard
+ *     below) AND `Row too big to fit into CursorWindow` on every
+ *     queueRead afterwards.
  *   - 64 KB held briefly but the matching 2 MB max-video cap was too
  *     strict: ordinary tiny recordings (~3 MB) were rejected outright.
- *   - 32 KB is the current setting — each base64Slice is ~44 KB, so the
- *     per-row base64 pressure scales more slowly with chunk count and
- *     the worker has more time to prune before CursorWindow trips.
+ *   - 32 KB was the disk-backed-era setting that traded request fan-out
+ *     for a queue-row-size safety margin.
+ *   - 128 KB is the CURRENT setting (2026-05-18 bump). Rationale:
+ *       The CursorWindow constraint above no longer applies. The video
+ *       post-stop pipeline persists base64 as a per-chunk file under
+ *       `documentDirectory/chunks/{sid}/{idx}.b64` and the GC_QUEUE row
+ *       carries ONLY metadata (`{chunk_index, hash, size, status,
+ *       attempts, local_uri}`) — never `base64Slice` inline. Queue row
+ *       size is therefore invariant to chunk size; only the per-chunk
+ *       file size on disk scales (~172 KB at 128 KB chunks). Memory
+ *       peak is dominated by the whole-file base64 read in `chunkFile`
+ *       (~6.7 MB for a 5 MB MP4), which is independent of chunk size.
+ *       Reducing chunk count 4x (5 MB / 32 KB = ~160 chunks → 5 MB /
+ *       128 KB = ~40 chunks) cuts HTTP request fan-out by the same
+ *       factor and shortens total upload wall-clock proportionally.
  *
- * Pair this with VIDEO_MAX_SIZE_BYTES below — together they bound the
- * worst-case in-queue base64 footprint to something the persistence
- * layer can actually hold.
+ * `VIDEO_MAX_SIZE_BYTES` below is unchanged — the binding constraint
+ * for that cap is the OOM ceiling on the whole-file base64 read, NOT
+ * CursorWindow. Both apply independently.
  */
-const VIDEO_FILE_CHUNK_SIZE_BYTES = 32 * 1024;
+const VIDEO_FILE_CHUNK_SIZE_BYTES = 128 * 1024;
 
 /** Base64-char count derived from the byte size — same formula audio uses. */
 const VIDEO_FILE_CHUNK_SIZE_BASE64 =
@@ -35,19 +48,26 @@ const VIDEO_FILE_CHUNK_SIZE_BASE64 =
  *
  * History:
  *   - 50 MB → OOM on readAsStringAsync(base64) for files past ~30 MB.
- *   - 10 MB → CursorWindow blow-up: a 7.6 MB video produced 117 chunks
- *     (~16 MB peak base64 in queue, far over the ~2 MB SQLite per-row
- *     limit). Also corrupted the queue mid-emission.
+ *   - 10 MB → (pre disk-backed era) CursorWindow blow-up: a 7.6 MB
+ *     video produced 117 chunks (~16 MB peak base64 in queue, far over
+ *     the ~2 MB SQLite per-row limit). Also corrupted the queue
+ *     mid-emission. NOTE: this rationale no longer applies — chunks
+ *     persist as per-file base64 on disk, not inline in the queue row.
  *   - 2 MB → over-correction: a normal short recording is ~3 MB and
  *     was rejected outright before any chunk could be emitted.
- *   - 5 MB is the current balance, paired with 32 KB chunks. A 3 MB
- *     video at 32 KB chunks → ~96 chunks, ~4 MB peak base64 if nothing
- *     pruned; in practice the upload worker prunes faster than emission
- *     produces, so steady-state queue size stays under CursorWindow.
+ *   - 5 MB is the current balance. The binding constraint TODAY is the
+ *     OOM ceiling on the single `readAsStringAsync(uri, base64)` call
+ *     inside `chunkFile`: a 5 MB MP4 becomes a ~6.7 MB JS string, well
+ *     under the OOM threshold seen at ~30 MB. Chunk count for a 5 MB
+ *     file at 128 KB chunks → ~40 chunks (~172 KB per-chunk file on
+ *     disk under `chunks/{sid}/{idx}.b64`). Queue row size is now
+ *     invariant to chunk size because base64 lives on disk, not inline.
  *
- * Above this we fail FAST (before any base64 read or queue mutation).
- * Long video is explicitly out of MVP scope until payloads move out of
- * AsyncStorage (e.g. per-chunk files keyed by hash).
+ * Above this cap we fail FAST (before any base64 read or queue
+ * mutation). Long video is explicitly out of MVP scope until the
+ * whole-file base64 read is replaced with a streaming or partial-read
+ * implementation (the OOM ceiling — NOT CursorWindow — is what blocks
+ * raising this cap further).
  */
 const VIDEO_MAX_SIZE_BYTES = 5 * 1024 * 1024;
 
@@ -60,10 +80,13 @@ const VIDEO_MAX_SIZE_BYTES = 5 * 1024 * 1024;
  * `documentDirectory`, the host then calls `chunkFile(uri)` (a
  * non-interface method, since `ChunkProducer` has no slot for the
  * source URI). This producer reads the whole file as base64, slices
- * into chunks of the same size as the audio chunker (16 KB →
- * VIDEO_FILE_CHUNK_SIZE_BASE64 base64 chars), and emits each via the
+ * into `VIDEO_FILE_CHUNK_SIZE_BYTES`-equivalent base64 chars (128 KB
+ * → `VIDEO_FILE_CHUNK_SIZE_BASE64` chars), and emits each via the
  * registered `onChunk` callback in chunk_index order. The last chunk
- * carries `isFinal: true`.
+ * carries `isFinal: true`. Chunk size is sized for HTTP-request
+ * fan-out — not for queue-row pressure, since the post-stop sink
+ * persists base64 to disk via `local_uri` and the queue row carries
+ * only metadata.
  *
  * The producer never talks to the queue, the upload worker, or the
  * backend. The host's `onChunk` callback is the single integration
@@ -88,9 +111,10 @@ export class VideoFileChunkProducer implements ChunkProducer {
   }
 
   /**
-   * Read the finalized video file, slice it into 16 KB-equivalent
-   * chunks, and emit each via `onChunk` in order. The last emission
-   * carries `isFinal: true`.
+   * Read the finalized video file, slice it into
+   * `VIDEO_FILE_CHUNK_SIZE_BYTES`-equivalent chunks (128 KB at the
+   * current setting), and emit each via `onChunk` in order. The last
+   * emission carries `isFinal: true`.
    *
    * Designed to be called AFTER the recorder has stopped and the file
    * has been moved into `documentDirectory`. Callers handle the
