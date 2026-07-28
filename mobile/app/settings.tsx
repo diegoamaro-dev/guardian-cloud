@@ -29,6 +29,11 @@ import {
 } from '@/destinations/preference';
 import { claimDriveOAuthCode } from '@/oauth/exchangeGuard';
 import { openBatteryOptimizationSettings } from '@/permissions/batteryOptimization';
+// ReliabilityCard — same component the home screen mounts in 'home' mode.
+// Here we mount it in 'settings' mode so it stays visible as a permanent
+// "Fiabilidad" section. The card uses isolated helpers in
+// `src/permissions/*` and never touches recording / upload / queue.
+import { ReliabilityCard } from '@/components/ReliabilityCard';
 // DEV-only queue wipe — surfaced as a button at the bottom of this screen.
 // Does NOT touch auth/Drive/anything else; only Guardian Cloud queue keys.
 import { clearGuardianQueueDev } from '.';
@@ -774,6 +779,25 @@ export default function SettingsScreen() {
         </View>
       </Pressable>
 
+      {/* Fiabilidad — contextual reliability card, settings variant.
+          Permanent (no "Ahora no" button here, no driveConnected gate)
+          so the user can re-open the system permission/settings pages
+          at any time without having to discover them through the home
+          card. Mirrors the same component the home screen renders;
+          isolated helpers, zero touch on recording / upload / queue. */}
+      <Text
+        style={{
+          color: '#8b949e',
+          fontSize: 12,
+          letterSpacing: 1,
+          marginTop: 28,
+          marginBottom: 8,
+        }}
+      >
+        FIABILIDAD
+      </Text>
+      <ReliabilityCard mode="settings" />
+
       {/* Battery-optimisation exemption. Android Doze pauses background
           network reads for unwhitelisted apps; that throttles our upload
           worker when the screen is locked for long periods. We do not
@@ -781,7 +805,11 @@ export default function SettingsScreen() {
           do not request the dialog programmatically (Play Store policy
           friction). Tapping the button opens the system "Battery
           optimisation" settings page so the user can grant the
-          exemption manually. Recording is unaffected if they skip. */}
+          exemption manually. Recording is unaffected if they skip.
+          NOTE: this legacy button is kept intentionally for this
+          iteration alongside the new ReliabilityCard above. We will
+          retire it in a follow-up once the card is validated on real
+          devices. */}
       <Text
         style={{
           color: '#8b949e',
