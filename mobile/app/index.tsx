@@ -73,6 +73,14 @@ import {
   isBackgroundProtectionRunning,
 } from '@/recording/backgroundService';
 import { usePermissionsStore } from '@/permissions/permissionsStore';
+// ReliabilityCard — contextual ask for POST_NOTIFICATIONS + battery
+// optimisation. Strictly additive: never reads or mutates GC_QUEUE,
+// the upload worker, recovery, chunking, export, the FG service, the
+// AudioEngine, or any module beyond the two new helpers in
+// `src/permissions/*`. The yellow notification-denied pill below
+// remains as a persistent low-key fallback after the card is
+// dismissed.
+import { ReliabilityCard } from '@/components/ReliabilityCard';
 import { humanizeFailure } from '@/errors/humanError';
 
 /**
@@ -6826,6 +6834,19 @@ export default function Index() {
         mode={mode}
         onChange={setMode}
         disabled={isRecording || isStarting || isStopping}
+      />
+
+      {/* Reliability card — proactive contextual ask shown after Drive
+          connect, hidden during recording, and dismissed permanently
+          after the user taps "Ahora no". Strictly additive UI; the
+          card's helpers do not touch the FG service, the queue, the
+          worker, or recovery. The yellow pill below stays in place as
+          the persistent low-key fallback once the card is dismissed —
+          the two surfaces are deliberately complementary. */}
+      <ReliabilityCard
+        mode="home"
+        driveConnected={Boolean(drive)}
+        isRecording={showStop}
       />
 
       {/* POST_NOTIFICATIONS denial pill. Read-only info: the recording
