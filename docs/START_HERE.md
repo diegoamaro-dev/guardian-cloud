@@ -1,5 +1,16 @@
 # Guardian Cloud — START HERE
 
+⛔ NO APTO — auditoría 2026-07-28; validación anterior retirada; vídeo no protege durante la grabación
+
+Este documento conserva afirmaciones históricas que ya no constituyen evidencia de validación.
+Hasta completar la reconciliación documental de la fase H, prevalecen estos informes:
+
+* [Auditoría integral](./audits/GUARDIAN_CLOUD_FULL_AUDIT_2026-07-28.md)
+* [Matriz de trazabilidad](./audits/GUARDIAN_CLOUD_TRACEABILITY_2026-07-28.md)
+* [Plan de remediación](./audits/GUARDIAN_CLOUD_REMEDIATION_PLAN_2026-07-28.md)
+
+Veredicto vigente: NO APTO. Las afirmaciones de validación contenidas más abajo no deben utilizarse como prueba de funcionamiento real.
+
 ## 1. Qué es este proyecto
 
 Guardian Cloud es una aplicación móvil cuyo objetivo es permitir capturar evidencia (audio/vídeo) en situaciones críticas y garantizar que una parte de esa evidencia sobreviva fuera del dispositivo en segundos.
