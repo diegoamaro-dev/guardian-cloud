@@ -27,17 +27,29 @@ Guardian Cloud permite:
 
 ## ⚙️ Estado actual
 
+⛔ **Veredicto vigente: `NO APTO`** — auditoría 2026-07-28. Empezar por
+[`START_HERE.md`](./START_HERE.md).
+
+**Baseline técnica congelada:** [`v0.3.0-rc.1`](./releases/v0.3.0-rc.1.md)
+(2026-07-30) — punto de retorno reproducible, **no** una release pública.
+
 El sistema actualmente:
 
 * ✔ grabación funcional
-* ✔ chunking en tiempo real
+* ✔ chunking en tiempo real **sólo en audio**
 * ✔ subida a Google Drive
 * ✔ cola persistente (AsyncStorage)
-* ✔ recovery tras kill/reinicio
+* ✔ recovery tras kill / arranque de la app
 * ✔ subida en background
 * ✔ export de evidencia (`.m4a`)
+* ❌ **el vídeo NO saca evidencia del dispositivo durante la grabación**
+  (GC-AUD-001) — encola después de parar
+* ❌ sin `capture_end_reason`: no se puede probar finalización limpia
+* ❌ recovery automático tras reinicio del dispositivo (I5c) no implementado
+* ❌ cifrado local no implementado
 
-👉 MVP CORE: VALIDADO
+Las afirmaciones históricas de validación de este repositorio quedaron retiradas
+por la auditoría. Ver [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md).
 
 ---
 
@@ -68,26 +80,39 @@ Export:
 Leer en este orden:
 
 1. docs/START_HERE.md
-2. docs/MVP_SCOPE.md
-3. docs/ARCHITECTURE.md
-4. docs/API_SPEC.md
-5. docs/DESIGN.md
-6. docs/UI_SCREENS.md
-7. docs/SECURITY.md
+2. **docs/releases/v0.3.0-rc.1.md** — baseline técnica vigente
+3. **docs/DEVELOPMENT_WORKFLOW.md** — cómo se avanza sobre la baseline
+4. docs/MVP_SCOPE.md
+5. docs/ARCHITECTURE.md
+6. docs/API_SPEC.md
+7. docs/DESIGN.md
+8. docs/UI_SCREENS.md
+9. docs/SECURITY.md
+
+Auditoría y estado real:
+
+* docs/audits/ — los tres informes ratificados
+* docs/IMPLEMENTATION_STATUS.md
+* docs/KNOWN_DEBT.md
+* docs/RELEASE_CHECKLIST_v0.3.md
+* docs/PLAYSTORE_RELEASE_PLAN.md
 
 ---
 
 ## 🧪 Validación
 
-El sistema ha sido probado en:
+**198/198 tests automáticos verdes** · **12 errores TypeScript heredados**
+(typecheck NO verde) · sin CI.
 
-* cierre forzado
-* pérdida de red
-* background
-* recovery tras reinicio
+La baseline `v0.3.0-rc.1` distingue tres niveles de evidencia —verificado por
+instrumentación, atestiguado manualmente, y no ejecutado— y **no marca como
+superado nada sin evidencia de su nivel**. Ver su matriz de pruebas.
+
+Sin cobertura: rama Android 13+, Closed Testing, usuarios externos.
 
 Ver:
 
+* `releases/v0.3.0-rc.1.md` — matriz de pruebas vigente
 * `TEST_SCENARIOS.md`
 * `TEST_RESULTS.md`
 

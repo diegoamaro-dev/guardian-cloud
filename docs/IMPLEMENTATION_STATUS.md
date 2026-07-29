@@ -11,6 +11,64 @@ Hasta completar la reconciliación documental de la fase H, prevalecen estos inf
 
 Veredicto vigente: NO APTO. Las afirmaciones de validación contenidas más abajo no deben utilizarse como prueba de funcionamiento real.
 
+---
+
+## Baseline técnica congelada — `v0.3.0-rc.1` (2026-07-30)
+
+Registro completo: [`releases/v0.3.0-rc.1.md`](./releases/v0.3.0-rc.1.md).
+
+| | |
+|---|---|
+| Commit construido | `5ac4a0314a9bfb62dcd97685ecb3295ae8257392` |
+| Build EAS | `e98dd3a2-1448-43b5-a675-9116b5fa5ca3` (perfil `preview`, APK) |
+| SHA-256 del APK | `A3A51604AE207D9DFA0C25241EF438C321065C758722C3794DE8860C208E0F2A` |
+| Dispositivo de validación | OnePlus 6, Android 11 (SDK 30), `arm64-v8a` |
+| Tests automáticos | **198/198 verdes** |
+| TypeScript | **12 errores heredados**, cero nuevos → typecheck NO verde |
+
+### Qué contiene
+
+- **A-0 · A-1 · A-2** fusionadas (base `origin/main` @ `e656ea44`).
+- **ReliabilityCard** (+538 líneas): petición contextual de `POST_NOTIFICATIONS`
+  y exención de optimización de batería. Aislada — no importa nada de
+  `recording`, `queue`, `worker`, `recovery` ni `export`, y usa clave propia de
+  AsyncStorage (`gc.reliability.dismissed_at`).
+- Configuración EAS repuntada a `@amarus/guardian-cloud`.
+
+### Qué es y qué no es
+
+**Es** un punto de retorno reproducible. **No es** una release pública: no hay
+AAB de producción, ni Closed Testing, ni usuarios externos. Ver
+[`RELEASE_CHECKLIST_v0.3.md`](./RELEASE_CHECKLIST_v0.3.md).
+
+### El veredicto `NO APTO` sigue vigente
+
+La baseline **no levanta** el veredicto de la auditoría. Siguen abiertas:
+
+- el **vídeo no saca evidencia del dispositivo durante la grabación**
+  (GC-AUD-001);
+- no existe `capture_end_reason`: no se puede probar finalización limpia;
+- recovery **I5c** (tras reinicio del dispositivo, sin abrir la app) no
+  implementado;
+- cifrado local no implementado.
+
+A-1 y A-2 fueron **contención semántica**: cambiaron lo que el sistema afirma,
+no lo que hace.
+
+### Validación por nivel de evidencia
+
+| Nivel | Alcance |
+|---|---|
+| **Verificado por instrumentación** | instalación, arranque estable, ausencia de excepciones fatales, `ENV READY`, `GC_BOOT_*`, worker en bucle, firma del APK, contenido del bundle, casos T2/T5/T9/T11/T12 |
+| **Atestiguado manualmente** | grabación audio y vídeo, subida durante grabación, segundo plano y bloqueo, mala red, cierre forzado, reinicio con cola pendiente, recovery y exportación |
+| **No ejecutado** | rama Android 13+ de `POST_NOTIFICATIONS`, T1/T3/T4/T6/T7/T8/T10, Closed Testing, usuarios externos |
+
+**Discrepancia de versión conocida:** la etiqueta se llama `v0.3.0-rc.1` pero la
+aplicación declara `0.1.0` / `versionCode 1`. La etiqueta marca un punto de git,
+no una versión de aplicación. Ver §7.1 del registro de baseline.
+
+---
+
 ## Current MVP status
 
 The MVP currently supports:

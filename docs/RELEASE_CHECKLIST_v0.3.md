@@ -6,15 +6,49 @@ Primera release MVP funcional. Validar que el flujo completo aguanta
 producción real: grabar, chunkear, subir en background, recuperar tras
 kill, exportar.
 
+> **Este checklist gobierna la RELEASE PÚBLICA, no la baseline técnica.**
+> Existe una baseline congelada — [`v0.3.0-rc.1`](./releases/v0.3.0-rc.1.md) —
+> que es un punto de retorno reproducible, **no** una release. Ninguna casilla
+> de este documento se marca por el hecho de que esa baseline exista.
+
+### Tres artefactos distintos, no confundir
+
+| Artefacto | Para qué | Estado |
+|---|---|---|
+| **Build local** (`expo run:android`) | iteración rápida durante el desarrollo | no sirve como evidencia de release |
+| **EAS `preview`** (`buildType: apk`, `distribution: internal`) | candidatas y validación en dispositivo propio | la baseline `v0.3.0-rc.1` es de este tipo |
+| **Release de Play Store** (AAB, perfil `production`) | publicación | **no construida nunca todavía** |
+
 ---
 
 ## 1. Pre-flight (código)
 
 ### Mobile
-- [ ] `cd mobile && npx tsc --noEmit` limpio.
-- [ ] `cd mobile && npm test` → 99/99 verdes.
+- [ ] `cd mobile && npx tsc --noEmit`.
+      **Requisito de release: cero errores.**
+      **Estado actual: 12 errores heredados → typecheck NO verde → bloquea la
+      release pública.** Distribución exacta en
+      [`releases/v0.3.0-rc.1.md`](./releases/v0.3.0-rc.1.md) §6.
+      Comparar contra esa lista: **cero errores nuevos** es condición mínima
+      para seguir; cero absolutos es el requisito de release.
+- [ ] `cd mobile && npm test` → **suite completa verde, sin tests saltados**,
+      y registrar el total observado (`___ / ___`).
+      Referencia vigente: **198/198** en la baseline `v0.3.0-rc.1`.
+      No fijar la cifra en este documento: las cifras `99` y `138` que
+      aparecían antes quedaron obsoletas (99 era anterior a la auditoría, 138
+      el baseline previo a A-1/A-2) y empujaban a «arreglar» el checklist en
+      vez del código.
+      Los tests se ejecutan **en local, sin CI**: ningún resultado es
+      reproducible de forma independiente todavía.
 - [ ] `mobile/package.json` versión actualizada a `0.3.x`.
-- [ ] `mobile/app.config.ts` `version` actualizada.
+      **SIN CUMPLIR.** Declara `0.1.0`. Ver §7.1 del registro de baseline: la
+      etiqueta `v0.3.0-rc.1` marca un punto de git, **no** la versión de la
+      aplicación.
+- [ ] `mobile/app.config.ts` `version` actualizada. **SIN CUMPLIR** (`0.1.0`).
+- [ ] `mobile/android/app/build.gradle` `versionName` / `versionCode`
+      coherentes con lo anterior. **SIN CUMPLIR** (`0.1.0` / `1`).
+      Requiere decidir el esquema: `eas.json` declara
+      `appVersionSource: "remote"` pero no hay versiones remotas configuradas.
 - [ ] No hay `console.log` con secretos (los logs `TOKEN`, `SUB`,
       `ACCESS_TOKEN` solo loguean longitud + prefijo, nunca el valor).
 - [ ] `DEBUG_QUEUE`, `DEBUG_INJECT_CHUNK1_FAILURE`, `DEBUG_DUPLICATE_SUBMISSION`,
@@ -50,13 +84,31 @@ kill, exportar.
 
 ## 3. Build release
 
+### 3.1 ⛔ `expo prebuild --clean` NO es un paso rutinario
+
+El directorio `mobile/android/` está **versionado** y contiene
+personalizaciones nativas que el prebuild **destruye**: permisos custom del
+manifest, el `<service>` de `RNBackgroundActionsTask` con su
+`foregroundServiceType`, el `meta-data` de shortcuts y la configuración de
+seguridad de red.
+
+Además, EAS ignora `android.package` de `app.config.ts` precisamente porque
+detecta ese directorio: **el paquete real sale del nativo versionado**.
+
+> **No ejecutar `prebuild --clean` como parte de un flujo normal de build.**
+> Sólo de forma consciente, cuando sea imprescindible (p. ej. al subir de SDK
+> mayor), y en ese caso:
+>
+> 1. partir de árbol limpio y con el diff de `mobile/android/` a mano;
+> 2. ejecutarlo en una rama dedicada, nunca junto a otros cambios;
+> 3. **reaplicar y verificar una a una** las personalizaciones de §2;
+> 4. comparar `AndroidManifest.xml` y `build.gradle` contra la versión anterior
+>    antes de commitear.
+
+### 3.2 Build
+
 ```bash
 cd mobile
-# Si cambió manifest / dep nativa:
-npx expo prebuild --clean   # ojo: REGENERA AndroidManifest — reaplica
-                            # los permisos custom + el <service> + el
-                            # meta-data de shortcuts si los borra.
-
 npx expo run:android --variant release
 # o:
 cd android && ./gradlew assembleRelease
@@ -65,6 +117,27 @@ cd android && ./gradlew assembleRelease
 - [ ] AAB / APK firmado con keystore de release (NO con el debug.keystore).
 - [ ] `applicationId` = `com.guardiancloud.app`.
 - [ ] `versionCode` incrementado respecto a la release anterior.
+
+### 3.3 Comprobaciones obligatorias en toda build de EAS
+
+Antes de aceptar cualquier artefacto de EAS, verificar **las cinco** en su log.
+Si falta una, el artefacto no vale:
+
+- [ ] Las tres variables cargadas del entorno correspondiente:
+      `Environment variables … loaded from the "<env>" environment on EAS:
+      EXPO_PUBLIC_API_URL, EXPO_PUBLIC_SUPABASE_ANON_KEY, EXPO_PUBLIC_SUPABASE_URL`.
+      **Si aparece `No environment variables found`, detener**: el bundle
+      llevará `undefined` y la app abortará al arrancar con
+      `[env] Invalid EXPO_PUBLIC_* configuration`.
+- [ ] Proyecto y Project ID esperados (`eas project:info`).
+- [ ] `Using Keystore from configuration: Build Credentials <id>` —
+      **reutilizado, no regenerado**. Un keystore nuevo rompe `install -r`
+      sobre instalaciones previas.
+- [ ] Paquete Android procedente del nativo, no de `app.config.ts`.
+- [ ] **Arranque del APK real con Metro APAGADO**, sin `FATAL EXCEPTION` ni
+      `JavascriptException`, con `ENV READY` mostrando valores reales y la
+      secuencia `GC_BOOT_RECOVERY_START` → `GC_BOOT_QUEUE_PENDING` →
+      `GC_PERF_DRAIN_PICK` en Logcat.
 
 ---
 
@@ -142,6 +215,13 @@ adb install mobile/android/app/build/outputs/apk/release/app-release.apk
 - [ ] Verificar notificación visible.
 - [ ] Reinstalar y denegar. Verificar que la app graba pero sin
       notificación. Documentado.
+- [ ] **ReliabilityCard en Android 13+**: el botón «Activar notificaciones»
+      aparece cuando el estado es `denied`/`unknown`, y desaparece al conceder.
+      **NO VALIDADO.** La baseline `v0.3.0-rc.1` se probó en un OnePlus 6 con
+      Android 11 (SDK 30 < 33), donde `POST_NOTIFICATIONS` resuelve a
+      `not_applicable` y el botón queda oculto por diseño. **La rama Android
+      13+ del código nuevo no ha sido ejercitada nunca.** Requiere un
+      dispositivo con SDK ≥ 33.
 
 ### 4.9 Launcher shortcut
 - [ ] Long-press del icono → menú con "Grabar evidencia".
@@ -152,10 +232,15 @@ adb install mobile/android/app/build/outputs/apk/release/app-release.apk
 
 ## 5. Closed Testing en Play Console
 
-- [ ] Subir AAB a Closed Testing.
-- [ ] 12 testers mínimo invitados.
-- [ ] 14 días de prueba interna sin regresiones.
-- [ ] Feedback recogido en `TEST_RESULTS.md`.
+> **NADA DE ESTA SECCIÓN ESTÁ INICIADO.** No existe AAB de producción, no hay
+> ficha en Play Console y no ha habido testers externos. La baseline
+> `v0.3.0-rc.1` es un APK `preview` instalado en un único dispositivo propio.
+
+- [ ] Subir AAB a Closed Testing. **NO INICIADO** — nunca se ha construido un
+      AAB con el perfil `production`.
+- [ ] 12 testers mínimo invitados. **NO INICIADO.**
+- [ ] 14 días de prueba interna sin regresiones. **NO INICIADO.**
+- [ ] Feedback recogido en `TEST_RESULTS.md`. **NO INICIADO.**
 
 ---
 
@@ -208,9 +293,17 @@ Si una métrica clave se rompe en producción:
 - Re-promote.
 
 NUNCA force-push a main.
+
+**Punto de retorno técnico disponible hoy:** la baseline
+[`v0.3.0-rc.1`](./releases/v0.3.0-rc.1.md), con criterios de rollback y
+comandos de reversión por commit en su §8.
+
 ## 4.10 Test con usuarios reales (obligatorio)
 
-* [ ] 3 personas sin contexto técnico usan la app
+> **NO REALIZADO.** Ningún usuario externo ha usado la aplicación. La baseline
+> `v0.3.0-rc.1` sólo se ha ejecutado en un dispositivo del desarrollador.
+
+* [ ] 3 personas sin contexto técnico usan la app. **NO REALIZADO.**
 * [ ] No se les explica cómo funciona
 * [ ] Se les pide: "usa esto si te pasa algo raro"
 
@@ -218,7 +311,8 @@ Verificar:
 
 * [ ] Tiempo hasta empezar a grabar < 2 segundos
 * [ ] No hay dudas durante grabación
-* [ ] El usuario entiende que está protegido
+* [ ] El usuario **distingue** grabación, subida y protección confirmada — y no
+      asume que grabar equivale a estar protegido
 * [ ] El usuario puede recuperar la evidencia sin ayuda
 
 Si falla:

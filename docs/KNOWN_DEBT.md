@@ -1,5 +1,64 @@
 # KNOWN_DEBT.md
 
+## Deuda registrada en la baseline `v0.3.0-rc.1` (2026-07-30)
+
+Detalle completo en [`releases/v0.3.0-rc.1.md`](./releases/v0.3.0-rc.1.md) §7.
+
+### Versionado — bloquea cualquier release pública
+
+- La etiqueta `v0.3.0-rc.1` marca un punto de git, **no** una versión de app: la
+  aplicación declara `0.1.0` con `versionCode 1` en `package.json`,
+  `app.config.ts` y `build.gradle`. La casilla del checklist «versión
+  actualizada a `0.3.x`» sigue sin cumplir.
+- `eas.json` declara `appVersionSource: "remote"` pero **no hay versiones
+  remotas configuradas**. Hay que decidir el esquema antes de publicar.
+
+### TypeScript y CI
+
+- **12 errores heredados**; el typecheck **no** está verde. 6 en `app.config.ts`
+  (tipos de `ExpoConfig`/`ManifestService`), 4 en `app/index.tsx` y 2 en
+  `src/api/*` (`Uint8Array<ArrayBufferLike>` vs `BufferSource`/`BodyInit`).
+- **No hay CI.** Los 198 tests corren sólo en la máquina del desarrollador.
+- `npm ci` **falla** sin `--legacy-peer-deps`: el lockfile no materializa los
+  peers `react-dom` y `scheduler`.
+- 29 vulnerabilidades de `npm audit` (1 baja, 17 moderadas, 8 altas, 3
+  críticas). Sin resolver.
+
+### Cobertura de pruebas
+
+- La rama **Android 13+** de `POST_NOTIFICATIONS` —la mitad del propósito de la
+  ReliabilityCard— **nunca se ha ejercitado**. Requiere un dispositivo con
+  SDK ≥ 33; la validación se hizo en Android 11.
+- Sin Closed Testing y sin usuarios externos.
+
+### Ambigüedades UX residuales de A-2
+
+- **Banner verde genérico**: dos vías de activación producen el mismo resultado
+  visual, y el texto no identifica la sesión. Puede aparecer mientras se graba
+  otra captura.
+- **Carrera polling ↔ `reap`**: Home lee `GC_QUEUE` cada 500 ms; el worker puede
+  reapar una entrada antes de que un tick la observe. Protección lógica y
+  observación por polling no son equivalentes.
+- **Sesión cerrada, asentada e incompleta** (fragmentos `uploaded` sin
+  `remote_reference`) cae en `Listo` sin informar de que queda evidencia sin
+  confirmar.
+- La ReliabilityCard **desplaza el botón principal** hacia abajo en Home.
+- El botón legacy de exención de batería en Ajustes coexiste a propósito con la
+  tarjeta; su retirada está diferida.
+
+### Repositorio
+
+- Tres ficheros basura versionados en la raíz: `table-nas-routing`,
+  `tash push -u -m wip remaining mobile assets docs`, `tash show --stat`.
+  Restos de comandos `git stash` mal tecleados.
+- El proyecto EAS anterior (`65029e8e-1af4-4070-80ce-4d6a1b4baa01`) quedó
+  inaccesible y fue abandonado.
+- `expo prebuild --clean` **destruye** las personalizaciones de
+  `mobile/android/` versionadas. No es un paso rutinario; ver
+  `RELEASE_CHECKLIST_v0.3.md` §3.1.
+
+---
+
 ## Known technical debt
 
 - ngrok is temporary and not valid for production.

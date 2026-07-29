@@ -11,6 +11,29 @@ Hasta completar la reconciliación documental de la fase H, prevalecen estos inf
 
 Veredicto vigente: NO APTO. Las afirmaciones de validación contenidas más abajo no deben utilizarse como prueba de funcionamiento real.
 
+### Punto de partida actual (2026-07-30)
+
+**Baseline técnica congelada: [`v0.3.0-rc.1`](./releases/v0.3.0-rc.1.md).**
+Es el punto de retorno reproducible del proyecto y lo primero que hay que leer
+antes de tocar nada.
+
+* commit construido `5ac4a03` · build EAS `e98dd3a2-…` · **198/198 tests verdes**
+* **12 errores TypeScript heredados** — el typecheck **no** está verde
+* validada en un OnePlus 6 con Android 11; la rama Android 13+ del código nuevo
+  **no ha sido probada**
+* **no es una release pública**: sin AAB de producción, sin Closed Testing, sin
+  usuarios externos
+
+El veredicto `NO APTO` **sigue vigente**: la baseline no resuelve que el vídeo no
+saque evidencia del dispositivo durante la grabación, ni la ausencia de
+`capture_end_reason`.
+
+Cómo se trabaja a partir de aquí:
+[`DEVELOPMENT_WORKFLOW.md`](./DEVELOPMENT_WORKFLOW.md).
+
+Las afirmaciones históricas de más abajo **se conservan sin retirar**. La
+reconciliación documental integral pertenece a la fase H.
+
 ## 1. Qué es este proyecto
 
 Guardian Cloud es una aplicación móvil cuyo objetivo es permitir capturar evidencia (audio/vídeo) en situaciones críticas y garantizar que una parte de esa evidencia sobreviva fuera del dispositivo en segundos.
