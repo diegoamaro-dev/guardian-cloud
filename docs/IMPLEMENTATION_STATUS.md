@@ -1,5 +1,16 @@
 # IMPLEMENTATION_STATUS.md
 
+⛔ NO APTO — auditoría 2026-07-28; validación anterior retirada; vídeo no protege durante la grabación
+
+Este documento conserva afirmaciones históricas que ya no constituyen evidencia de validación.
+Hasta completar la reconciliación documental de la fase H, prevalecen estos informes:
+
+* [Auditoría integral](./audits/GUARDIAN_CLOUD_FULL_AUDIT_2026-07-28.md)
+* [Matriz de trazabilidad](./audits/GUARDIAN_CLOUD_TRACEABILITY_2026-07-28.md)
+* [Plan de remediación](./audits/GUARDIAN_CLOUD_REMEDIATION_PLAN_2026-07-28.md)
+
+Veredicto vigente: NO APTO. Las afirmaciones de validación contenidas más abajo no deben utilizarse como prueba de funcionamiento real.
+
 ## Current MVP status
 
 The MVP currently supports:
