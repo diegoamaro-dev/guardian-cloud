@@ -1,13 +1,13 @@
 /**
  * Recovery detail screen — drives `exportRecoveredSession` for the
- * manifest selected in `app/recover.tsx`. The route param is the
+ * manifest selected in `app/recover/index.tsx`. The route param is the
  * manifest's Drive `file_id` (URL-encoded by the caller).
  *
- * COMMIT 3 — minimal UI for cross-device evidence reconstruction:
+ * Minimal UI for cross-device evidence reconstruction:
  *   - shows session date + mode while idle
  *   - one button "Reconstruir y exportar" → drives the manifest export
  *   - progress text while running
- *   - result block on done (Protegido / Protección parcial / Error)
+ *   - result block with an honest recovery verdict
  *   - "Guardar en el dispositivo" (Android SAF) + "Compartir archivo"
  *
  * No technical fields surfaced (no hashes, chunk lists, manifest_file_id,
@@ -43,6 +43,10 @@ import {
 } from '@/api/recoveryExport';
 import { ApiError } from '@/api/client';
 import { type ExportProgress, type ExportResult } from '@/api/export';
+// Verdict copy lives in a pure module so it can be unit-tested without a
+// React Native runtime — and so this screen and the recovery list cannot
+// drift into contradicting each other about the same session.
+import { recoveryDetailVerdict } from '@/recovery/recoveryVerdict';
 
 // ---------------------------------------------------------------------------
 // Save / Share helpers — intentionally duplicated from
@@ -198,10 +202,11 @@ type Phase =
   | { kind: 'error'; message: string };
 
 function formatDate(iso: string | null): string {
-  // Partial manifests (incremental writes during recording) carry a
-  // null `completed_at`. Render an em-dash so the row stays structured;
-  // the partial verdict comes from `result.status`/`stopReason`, not
-  // from this label.
+  // Presentation only. Manifests written incrementally during recording
+  // carry a null `completed_at`; render an em-dash so the row stays
+  // structured. The recovery verdict is derived separately from
+  // `result.status` — `completed_at` is never used as proof that the
+  // capture ended cleanly.
   if (iso === null) return '—';
   try {
     const d = new Date(iso);
@@ -214,40 +219,6 @@ function formatDate(iso: string | null): string {
 
 function modeIcon(mode: 'audio' | 'video'): string {
   return mode === 'video' ? '🎥' : '🎤';
-}
-
-/**
- * Map an `ExportResult` from the shared exporter to the human-friendly
- * verdict the user sees. Two-axis: `status` (complete / partial /
- * failed) crossed with content presence. Strings are intentionally
- * simple — no technical jargon, no chunk counts, no hashes.
- */
-function verdictFor(result: ExportResult): {
-  label: string;
-  color: string;
-  hint: string | null;
-} {
-  if (result.status === 'complete') {
-    return {
-      label: 'Protegido',
-      color: '#3ddc84',
-      hint: 'Evidencia recuperada correctamente.',
-    };
-  }
-  if (result.status === 'partial') {
-    return {
-      label: 'Protección parcial',
-      color: '#d29922',
-      hint:
-        'Falta parte de la evidencia. El archivo recuperado contiene lo disponible hasta el corte.',
-    };
-  }
-  return {
-    label: 'No se pudo recuperar',
-    color: '#f85149',
-    hint:
-      'No se pudo reconstruir esta evidencia desde Google Drive. Inténtalo de nuevo.',
-  };
 }
 
 export default function RecoverDetailScreen() {
@@ -503,7 +474,11 @@ export default function RecoverDetailScreen() {
 }
 
 function ResultBlock({ result }: { result: ExportResult }) {
-  const verdict = verdictFor(result);
+  // Derived from `result.status` alone. Deliberately NOT from
+  // `validChunks`, `totalChunks`, `completed_at` or `protection_status`:
+  // none of them establishes that the recording itself ran to the end
+  // (GC-AUD-033). See `@/recovery/recoveryVerdict`.
+  const verdict = recoveryDetailVerdict(result.status);
   const frameBorder =
     result.status === 'complete'
       ? '#238636'

@@ -1,10 +1,10 @@
 /**
  * "Recuperar evidencia" screen.
  *
- * COMMIT 2 — discovery only. Lists session manifests stored on the user's
- * connected Google Drive. Reconstruction / export from a manifest is
- * deferred to COMMIT 3 — the "Recuperar" button on each row currently
- * surfaces an explanatory Alert.
+ * Lists the session manifests stored on the user's connected Google
+ * Drive. Each row opens the detail screen (`app/recover/[id].tsx`),
+ * which reconstructs the evidence from that manifest and lets the user
+ * export it.
  *
  * Strict UI isolation:
  *   - no Drive imports, no googleapis, no OAuth handling on this screen
@@ -47,6 +47,10 @@ import {
   type RecoverableSession,
 } from '@/api/recovery';
 import { ApiError } from '@/api/client';
+// Shared with `app/recover/[id].tsx` through a pure, unit-tested module
+// so the list and the detail screen cannot claim different things about
+// the same session.
+import { recoveryListLabel } from '@/recovery/recoveryVerdict';
 
 type ScreenState =
   | { kind: 'loading' }
@@ -56,10 +60,9 @@ type ScreenState =
   | { kind: 'list'; sessions: RecoverableSession[] };
 
 function formatDate(iso: string | null): string {
-  // Partial manifests (written during recording before /complete) carry
-  // a null `completed_at`. Render an explicit em-dash so the row still
-  // looks structured — the "Parcial" badge on the same card carries the
-  // semantic load.
+  // Manifests written during recording (before /complete) carry a null
+  // `completed_at`. Render an explicit em-dash so the row still looks
+  // structured — the badge on the same card carries the semantic load.
   if (iso === null) return '—';
   // Locale-aware human format; fallback to the raw ISO if Date parsing
   // fails for any reason (corrupt manifest snuck past the validator,
@@ -75,14 +78,6 @@ function formatDate(iso: string | null): string {
 
 function modeIcon(mode: 'audio' | 'video'): string {
   return mode === 'video' ? '🎥' : '🎤';
-}
-
-function protectionLabel(
-  status: 'complete' | 'partial',
-): { label: string; color: string } {
-  return status === 'complete'
-    ? { label: 'Protegido', color: '#3ddc84' }
-    : { label: 'Protección parcial', color: '#d29922' };
 }
 
 export default function RecoverScreen() {
@@ -307,7 +302,11 @@ export default function RecoverScreen() {
 
       {state.kind === 'list' &&
         state.sessions.map((s) => {
-          const protection = protectionLabel(s.protection_status);
+          // `protection_status` classifies the manifest/upload lifecycle
+          // (derived from `is_partial`, `completed_at` and uploaded
+          // evidence), never whether the recording itself ran to the
+          // end. The label says exactly that and no more.
+          const protection = recoveryListLabel(s.protection_status);
           return (
             <View
               key={s.session_id}
