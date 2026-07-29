@@ -57,7 +57,9 @@ import {
 } from '@/recording/orphanScan';
 import {
   deriveGuardianStatus,
-  type GuardianStatus,
+  deriveProtectionStatement,
+  isChunkConfirmedOffDevice,
+  isEntryFullyProtected,
 } from '@/recording/deriveGuardianStatus';
 import {
   startBackgroundProtection,
@@ -1560,33 +1562,6 @@ export function shapeError(
 
 function sleep(ms: number): Promise<void> {
   return new Promise(r => setTimeout(r, ms));
-}
-
-/**
- * User-facing label for a `GuardianStatus`. Pure read-only mapping —
- * does NOT compute the status itself (that is the sole job of
- * `deriveGuardianStatus`). Lives here so the home screen can render
- * the human text above the main button without duplicating the
- * status precedence logic.
- *
- * Returns the literal copy specified by the UX spec for each branch.
- */
-function getStatusLabel(status: GuardianStatus): string {
-  switch (status) {
-    case 'grabando':
-      return 'Protegiendo evidencia';
-    case 'subiendo':
-      return 'Subiendo evidencia';
-    case 'protegido':
-      return 'Evidencia protegida';
-    case 'recuperando':
-      return 'Recuperando evidencia';
-    case 'error':
-      return 'Error en evidencia';
-    case 'listo':
-    default:
-      return 'Listo';
-  }
 }
 
 // ----- pending remote-session registrations (offline-first) -----
@@ -3596,23 +3571,40 @@ export default function Index() {
   const [hasNas, setHasNas] = useState<boolean>(false);
 
   /**
-   * X / N progress counter.
+   * X / N progress counters, maintained by the 500ms GC_QUEUE poll.
+   * Purely additive UI — never gates logic. We never show 0 / 0; the
+   * UI only renders a denominator when total > 0 AND the capture is
+   * closed.
    *
-   * Mirrors the in-flight chunk upload from existing state (Phase 1 total
-   * comes from the derived chunk count; Phase 2 total comes from the
-   * persisted `remaining` array). Purely additive UI — never gates logic.
+   * Chunks of the current session PROVEN to exist off the device —
+   * `isChunkConfirmedOffDevice`, i.e. `uploaded` AND carrying a real
+   * `remote_reference`. Named for the proof rather than the queue
+   * status on purpose: this is the only counter allowed to feed a
+   * visible protection claim, and a bare `status === 'uploaded'` tally
+   * is not proof — the `DRIVE_CHUNK_UPLOAD_ENABLED=false` rollback
+   * records `remote_reference: null`, and legacy entries predate the
+   * field.
    *
-   * Lifecycle:
-   *   - Phase 1 start → setTotal(chunks.length), setUploaded(0)
-   *   - each successful POST /chunks → setUploaded(u => u + 1)
-   *   - Phase 2 start → setTotal(pending.remaining.length), setUploaded(0)
-   *   - each successful POST /chunks → setUploaded(u => u + 1)
-   *   - final DONE → setTotal(0), setUploaded(0) so the UI resets
-   *
-   * We never show 0 / 0 — the UI only renders the counter when total > 0.
+   * `totalCount` below stays the FULL chunk count of the entry, so an
+   * uploaded-but-unreferenced chunk shows up as a gap in the
+   * denominator instead of vanishing.
    */
-  const [uploadedCount, setUploadedCount] = useState(0);
+  const [confirmedOffDeviceCount, setConfirmedOffDeviceCount] = useState(0);
   const [totalCount, setTotalCount] = useState(0);
+  /**
+   * `recording_closed` of the current GC_QUEUE entry, mirrored into
+   * render state by the same 500ms poll that maintains the counters
+   * above. GC_QUEUE stays the single source of truth — this is one
+   * extra field read from the entry the tick already has in hand, not
+   * a second store.
+   *
+   * Needed because `totalCount` is only a trustworthy denominator once
+   * no further chunk can join the session. Video emits every chunk
+   * AFTER the recorder stops (`chunkVideoFile` runs post-`stop()`), so
+   * the phase is already `subiendo` while the total is still climbing
+   * from 0 — the phase alone cannot gate the denominator.
+   */
+  const [recordingClosed, setRecordingClosed] = useState(false);
   /**
    * Chunks still in motion: status='pending' (waiting for the worker)
    * or status='uploading' (in flight). Drives the "Subiendo evidencia"
@@ -3623,8 +3615,9 @@ export default function Index() {
   const [activeCount, setActiveCount] = useState(0);
   /**
    * Chunks at terminal `failed` status. Same data source and lifecycle
-   * as `activeCount` / `uploadedCount` — the polling tick already walks
-   * the queue, this is one extra branch in the existing for-loop. Used
+   * as `activeCount` / `confirmedOffDeviceCount` — the polling tick
+   * already walks the queue, this is one extra branch in the existing
+   * for-loop. Used
    * by `deriveGuardianStatus` to flip the pill to `error` so a chunk
    * that the worker has given up on does not silently sit at the bottom
    * of `Subiendo evidencia (N-1 / N)` forever.
@@ -3945,10 +3938,14 @@ export default function Index() {
   }, []);
 
   function resetProgress() {
-    setUploadedCount(0);
+    setConfirmedOffDeviceCount(0);
     setTotalCount(0);
     setActiveCount(0);
     setFailedCount(0);
+    // A fresh session starts open; resetting to false keeps the
+    // denominator suppressed until the poll observes a real
+    // `recording_closed` on the new entry.
+    setRecordingClosed(false);
     setLastFailedError(null);
     setBackgroundSessions(0);
   }
@@ -5822,15 +5819,33 @@ export default function Index() {
         // element is the authoritative "current" session.
         const current = q.length > 0 ? q[q.length - 1] : null;
         let total = 0;
-        let uploaded = 0;
+        let confirmedOffDevice = 0;
         let active = 0;
         let failed = 0;
         let firstFailedError: QueueChunk['last_error'] | null = null;
+        // Defaults to false: with no current entry there is no closed
+        // capture to report, and false is the branch that refuses to
+        // print a denominator.
+        let closed = false;
         if (current) {
+          closed = current.recording_closed;
           total = current.chunks.length;
           for (const c of current.chunks) {
-            if (c.status === 'uploaded') uploaded += 1;
-            else if (c.status === 'pending' || c.status === 'uploading') active += 1;
+            // PROOF, not queue status. `isChunkConfirmedOffDevice`
+            // also requires a real `remote_reference`, so a chunk left
+            // at `uploaded` with none — the
+            // `DRIVE_CHUNK_UPLOAD_ENABLED=false` rollback, or a legacy
+            // entry — is never counted towards a protection claim.
+            // `total` stays the full chunk count, so such a chunk
+            // shows as a gap in the denominator rather than vanishing.
+            if (isChunkConfirmedOffDevice(c)) confirmedOffDevice += 1;
+            // Deliberately a separate `if`, not `else if`: an
+            // `uploaded` chunk without a reference is neither
+            // confirmed nor active nor failed. It is simply not
+            // counted anywhere — A-2 only suppresses unprovable
+            // claims, it never reclassifies a chunk or touches the
+            // error surface.
+            if (c.status === 'pending' || c.status === 'uploading') active += 1;
             else if (c.status === 'failed') {
               failed += 1;
               if (firstFailedError === null && c.last_error) {
@@ -5858,8 +5873,11 @@ export default function Index() {
           let u = 0;
           let hasActive = false;
           for (const c of entry.chunks) {
-            if (c.status === 'uploaded') u += 1;
-            else if (c.status === 'pending' || c.status === 'uploading') hasActive = true;
+            // Same proof standard as the current session: this count
+            // is rendered to the user as "(X / Y)" on the background
+            // pill, so it may not be built from queue status alone.
+            if (isChunkConfirmedOffDevice(c)) u += 1;
+            if (c.status === 'pending' || c.status === 'uploading') hasActive = true;
           }
           if (hasActive) {
             bgActiveSessions_ += 1;
@@ -5869,17 +5887,32 @@ export default function Index() {
         }
 
         // Per-session protected detection. Walk the WHOLE queue and
-        // for every entry whose chunks are non-empty AND all uploaded,
-        // stamp `protectedShownAt` once — guarded by a Set so we never
+        // stamp `protectedShownAt` once for every entry that is CLOSED
+        // and fully confirmed off-device — guarded by a Set so we never
         // re-stamp the same session_id. The first poll tick seeds the
         // set silently so a recovered queue with already-finished
         // entries does not flash a stale banner at boot.
+        //
+        // Two conditions beyond "all known chunks uploaded", both
+        // required, neither implied by the other:
+        //
+        //   - `recording_closed` — an OPEN session can still emit more
+        //     chunks. During an audio capture the worker routinely
+        //     catches up with the producer for a tick or two, and
+        //     without this gate that transient tie fired the green
+        //     "Evidencia protegida / Guardada fuera de tu móvil"
+        //     banner mid-recording.
+        //   - a real `remote_reference` on every chunk — the proof the
+        //     bytes exist somewhere that is not this phone. Same test
+        //     the export path already applies.
+        //
+        // Both live in `isEntryFullyProtected`, which delegates the
+        // closed-and-complete arithmetic to the same `isProtectedTally`
+        // that `deriveGuardianStatus` uses, so the banner and the main
+        // status cannot drift apart.
         const newlyProtected: string[] = [];
         for (const entry of q) {
-          const t = entry.chunks.length;
-          if (t === 0) continue;
-          const u = entry.chunks.filter(c => c.status === 'uploaded').length;
-          if (u !== t) continue;
+          if (!isEntryFullyProtected(entry)) continue;
           if (seenProtectedSessionIdsRef.current.has(entry.session_id)) continue;
           seenProtectedSessionIdsRef.current.add(entry.session_id);
           if (!firstPollTickRef.current) newlyProtected.push(entry.session_id);
@@ -5888,9 +5921,10 @@ export default function Index() {
 
         if (!cancelled) {
           setTotalCount(total);
-          setUploadedCount(uploaded);
+          setConfirmedOffDeviceCount(confirmedOffDevice);
           setActiveCount(active);
           setFailedCount(failed);
+          setRecordingClosed(closed);
           // Stable-update guard so the 500ms tick does not allocate a
           // fresh state reference (and force a re-render) when the
           // underlying error has not changed. Two values are equal when
@@ -5920,12 +5954,15 @@ export default function Index() {
               session_ids: newlyProtected,
             });
           }
-          if (total > 0 && uploaded === total) {
+          // Operator/debug line. Uses the same confirmed count as every
+          // user-facing claim so the two can never tell the operator
+          // different stories about the same session.
+          if (total > 0 && confirmedOffDevice === total) {
             setTestStatus(prev =>
               prev !== null &&
               (prev.startsWith('PHASE 1 DONE') || prev.startsWith('READY'))
                 ? prev
-                : `UPLOADED ${uploaded} / ${total}`,
+                : `UPLOADED ${confirmedOffDevice} / ${total}`,
             );
           }
         }
@@ -6086,10 +6123,12 @@ export default function Index() {
     isRecording,
     isRecovering,
     isStarting,
+    isStopping,
     totalCount,
-    uploadedCount,
+    confirmedOffDeviceCount,
     activeCount,
     failedCount,
+    recordingClosed,
   });
   const hasPendingUploads = guardianStatus === 'subiendo';
 
@@ -6161,32 +6200,20 @@ export default function Index() {
   // and `deriveGuardianStatus` is unchanged.
   const showProtectedBanner = protectedShownAt !== null;
   const showVideoBackgroundStop = videoBackgroundStopAt !== null;
-  // Subiendo label is conditional on whether at least one chunk has
-  // physically uploaded:
-  //   - uploadedCount === 0  → "Protegiendo evidencia"  — first chunk
-  //                            in flight, nothing safe yet
-  //   - uploadedCount > 0    → "Evidencia protegida parcialmente"
-  //                            — at least one chunk confirmed
-  //                            server-side
-  // The completion gate (queue + reapEntry) and the green 'protegido'
-  // banner remain unchanged: only the in-flight LABEL is more honest
-  // about partial protection.
-  //
-  // The numeric counter `(X / Y)` is rendered SEPARATELY via
-  // `phaseSubLabel` so the long Spanish copy + counter never collapse
-  // into a misaligned single-Text wrap. Pure layout split — no string
-  // parsing, no width constants.
-  const subiendoLabel =
-    uploadedCount > 0
-      ? 'Evidencia protegida parcialmente'
-      : 'Protegiendo evidencia';
+  // The main label states the PHASE only — it makes no claim about how
+  // much evidence is outside the device. That claim is a separate fact
+  // and lives on its own line below (`phaseSubLabel`), derived by
+  // `deriveProtectionStatement`. Collapsing the two is GC-AUD-004: the
+  // previous `subiendoLabel` said "Protegiendo evidencia" while
+  // `confirmedOffDeviceCount === 0`, i.e. while nothing was protected
+  // at all.
   const phaseLabel =
     guardianStatus === 'grabando'
       ? 'Grabando'
       : guardianStatus === 'iniciando'
         ? 'Iniciando grabación…'
         : guardianStatus === 'subiendo'
-          ? subiendoLabel
+          ? 'Subiendo evidencia'
           : guardianStatus === 'recuperando'
             ? 'Cerrando grabación anterior…'
             : guardianStatus === 'protegido'
@@ -6194,12 +6221,17 @@ export default function Index() {
               : guardianStatus === 'error'
                 ? 'Error'
                 : 'Listo';
-  // Numeric progress shown only when a counter is meaningful — today
-  // that is the 'subiendo' state. Rendered as its own centred Text
-  // beneath the main label so the dot/label row never has to wrap a
-  // long "label (X / Y)" string.
-  const phaseSubLabel: string | null =
-    guardianStatus === 'subiendo' ? `${uploadedCount} / ${totalCount}` : null;
+  // Secondary line: how much evidence is CONFIRMED outside the device.
+  // Rendered as its own centred Text beneath the main label so the
+  // dot/label row never has to wrap a long string. All the semantics
+  // live in the pure function — the screen only renders what it
+  // returns, and renders nothing when it returns null.
+  const phaseSubLabel: string | null = deriveProtectionStatement({
+    status: guardianStatus,
+    confirmedOffDeviceCount,
+    totalCount,
+    recordingClosed,
+  });
   const phaseColor =
     guardianStatus === 'grabando'
       ? '#ff4d4d'
@@ -6678,9 +6710,16 @@ export default function Index() {
           </Text>
         </View>
         {phaseSubLabel !== null ? (
+          // Neutral secondary colour rather than `phaseColor`. This
+          // line now carries protection facts, not phase, and the two
+          // must not be confused: inheriting the phase palette would
+          // paint "3 partes protegidas fuera del dispositivo" in the
+          // red of `grabando` (good news as alarm) and "Todavía no
+          // protegido fuera del dispositivo" in the amber of
+          // `subiendo`. Same slot, same layout — colour only.
           <Text
             style={{
-              color: phaseColor,
+              color: '#8b949e',
               fontSize: 14,
               fontWeight: '500',
               textAlign: 'center',
