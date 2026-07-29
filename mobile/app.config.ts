@@ -57,6 +57,7 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
   ...config,
   name: 'Guardian Cloud',
   slug: 'guardian-cloud',
+  owner: 'amarus',
   scheme: 'guardiancloud',
   version: '0.1.0',
   orientation: 'portrait',
@@ -266,7 +267,7 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
   },
   extra: {
     eas: {
-      projectId: '65029e8e-1af4-4070-80ce-4d6a1b4baa01',
+      projectId: '772ab007-5bf6-40cc-9dbf-46c8da04a49e',
     },
   },
 });
