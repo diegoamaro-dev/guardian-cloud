@@ -7,6 +7,7 @@
 | **Decide** | Propietario del producto |
 | **Afecta a** | `GC-AUD-001`, fase C y D del plan de remediación 2026-07-28 |
 | **Reemplaza** | El enfoque de leer un MP4 en escritura desde JavaScript |
+| **Refinado por** | [`ADR-VIDEO-PIPELINE-SELECTION`](./ADR-VIDEO-PIPELINE-SELECTION.md) |
 
 ---
 
