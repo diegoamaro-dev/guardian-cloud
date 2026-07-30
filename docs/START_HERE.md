@@ -17,7 +17,9 @@ Veredicto vigente: NO APTO. Las afirmaciones de validación contenidas más abaj
 Es el punto de retorno reproducible del proyecto y lo primero que hay que leer
 antes de tocar nada.
 
-* commit construido `5ac4a03` · build EAS `e98dd3a2-…` · **198/198 tests verdes**
+* commit construido `5ac4a03` · build EAS `e98dd3a2-…` · **198/198 tests
+  verdes** *(resultado histórico de esa baseline; la condición vigente es que
+  toda la suite actual pase, sin cifra fija)*
 * **12 errores TypeScript heredados** — el typecheck **no** está verde
 * validada en un OnePlus 6 con Android 11; la rama Android 13+ del código nuevo
   **no ha sido probada**
@@ -27,6 +29,14 @@ antes de tocar nada.
 El veredicto `NO APTO` **sigue vigente**: la baseline no resuelve que el vídeo no
 saque evidencia del dispositivo durante la grabación, ni la ausencia de
 `capture_end_reason`.
+
+> **Qué está implementado y qué está validado** se decide en la tabla de tres
+> niveles de
+> [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md#capacidades-por-nivel-referencia-canónica).
+> Es la referencia canónica: cualquier afirmación de este documento que la
+> contradiga es incorrecta. En particular, **todo el vídeo segmentado, su subida
+> durante la grabación, su recuperación y el export `.mp4` son nivel 3: no
+> implementados ni validados.**
 
 Cómo se trabaja a partir de aquí:
 [`DEVELOPMENT_WORKFLOW.md`](./DEVELOPMENT_WORKFLOW.md).

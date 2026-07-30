@@ -13,6 +13,57 @@ Veredicto vigente: NO APTO. Las afirmaciones de validación contenidas más abaj
 
 ---
 
+## Capacidades por nivel (referencia canónica)
+
+Esta tabla es la **fuente única** para saber qué está implementado y qué está
+validado. Cualquier afirmación en otro documento que la contradiga es
+incorrecta, y prevalece esta.
+
+### Nivel 1 — Implementado y validado
+
+| Capacidad | Matiz |
+|---|---|
+| Grabación de audio | — |
+| Fragmentación (chunking) | En vivo cada 1,5 s, **sólo en audio** |
+| Subida durante la grabación | **Sólo audio.** En vídeo no ocurre (`GC-AUD-001`) |
+| `GC_QUEUE` como fuente de verdad | — |
+| Cola persistente | AsyncStorage; sobrevive a cierre forzado y a reinicio |
+| Worker single-flight con reintentos | — |
+| Recovery automático | Tras kill y al abrir la app. **No** tras reinicio sin abrirla (`I5c`) |
+| Evidencia fuera del dispositivo cuanto antes | **Sólo audio**, por lo anterior |
+| Exportación utilizable en `.m4a` | — |
+
+### Nivel 2 — Implementado, pendiente de validación completa
+
+| Capacidad | Qué falta |
+|---|---|
+| Reliability Card | No se observó en Home durante la instalación de validación y la causa sigue sin determinar. Cubierta por pruebas unitarias, sin validación en dispositivo |
+| Comportamiento y permisos en Android 13+ | `POST_NOTIFICATIONS` es SDK 33+ y el único dispositivo probado es API 30. Las tres ramas están cubiertas por pruebas unitarias, pero **prueba unitaria no es validación en dispositivo** |
+| Matriz completa de resiliencia | Mala red, segundo plano prolongado, cierre forzado, reinicio, recovery y export, sin reejecutar con el artefacto vigente |
+
+### Nivel 3 — Planificado: no implementado ni validado
+
+| Capacidad | Estado |
+|---|---|
+| Vídeo segmentado | No implementado |
+| Subida del vídeo durante la grabación | **No implementado.** Es `GC-AUD-001`, causa central del veredicto `NO APTO` |
+| Recuperación del vídeo | No implementado |
+| Exportación `.mp4` | No implementada ni validada |
+
+> **Criterio de incompatibilidad.** Cualquier propuesta de «vídeo post-stop»
+> —fragmentar y encolar **después** de detener la captura— es **incompatible
+> con el principio central del producto**: «si grabas unos segundos, al menos
+> una parte ya está fuera del dispositivo». No resuelve `GC-AUD-001`: lo
+> documenta. Una solución válida debe sacar evidencia del dispositivo
+> **durante** la grabación de vídeo.
+
+Fuera de estos tres niveles, y explícitamente **no** capacidades actuales:
+cifrado local de chunks (sólo `TODO` en el código), recovery autónomo tras
+reinicio sin abrir la app (`I5c`), `capture_end_reason`, Closed Testing,
+usuarios externos y publicación en Play Store.
+
+---
+
 ## Baseline técnica congelada — `v0.3.0-rc.1` (2026-07-30)
 
 Registro completo: [`releases/v0.3.0-rc.1.md`](./releases/v0.3.0-rc.1.md).
