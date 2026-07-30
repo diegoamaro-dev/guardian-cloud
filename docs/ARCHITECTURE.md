@@ -1,5 +1,15 @@
 # Guardian Cloud — Architecture
 
+> **Aviso de estado.** Este documento describe la **arquitectura de destino**,
+> no un informe de implementación. Partes de lo descrito aquí no están
+> implementadas o no están validadas. El estado real por niveles está en
+> [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md#capacidades-por-nivel-referencia-canónica),
+> que es la referencia canónica y prevalece sobre este texto.
+>
+> En particular: el cifrado local **no** está implementado, y todo el vídeo
+> —segmentación, subida durante la grabación, recuperación y export `.mp4`— es
+> nivel 3, **no implementado ni validado** (`GC-AUD-001`).
+
 ## Visión general
 
 Guardian Cloud se compone de cuatro bloques:
@@ -123,9 +133,13 @@ El cliente es responsable de reconstruir la evidencia final:
 * verifica integridad (hash)
 * ordena por `chunk_index`
 * concatena en orden
-* genera archivo final (`.m4a` / `.mp4`)
+* genera archivo final:
+  * **`.m4a` (audio) — implementado y validado**
+  * **`.mp4` (vídeo) — planificado, no implementado ni validado**
 
-Este flujo está implementado en cliente y forma parte del MVP validado.
+El flujo está implementado en cliente. **Sólo la ruta de audio (`.m4a`) forma
+parte del MVP validado**; la de vídeo depende de que primero exista vídeo
+segmentado con subida durante la grabación, que es nivel 3.
 
 ---
 

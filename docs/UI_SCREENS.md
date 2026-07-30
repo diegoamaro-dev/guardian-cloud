@@ -1,5 +1,14 @@
 # Guardian Cloud — UI SCREENS
 
+> **Aviso de estado.** Especificación de **diseño de pantallas**, no informe de
+> implementación. Una pantalla descrita aquí puede no existir, o existir sin
+> estar validada. El estado real por niveles está en
+> [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md#capacidades-por-nivel-referencia-canónica),
+> que prevalece sobre este texto.
+>
+> La **Reliability Card** está implementada pero es **nivel 2**: no se observó
+> en Home durante la instalación de validación y la causa sigue sin determinar.
+
 ## 1. PRINCIPIO
 
 Cada pantalla debe:

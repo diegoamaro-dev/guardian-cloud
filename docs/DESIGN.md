@@ -1,5 +1,12 @@
 # Guardian Cloud — DESIGN.md
 
+> **Aviso de estado.** Documento de **diseño**, no informe de implementación.
+> Describe la intención de producto; no acredita que nada esté implementado ni
+> validado. El estado real por niveles está en
+> [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md#capacidades-por-nivel-referencia-canónica),
+> que prevalece sobre este texto. Lo relativo a vídeo es **objetivo futuro**
+> (nivel 3), no capacidad actual.
+
 ## 1. Objetivo del diseño
 
 El diseño de Guardian Cloud debe transmitir:

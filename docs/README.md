@@ -41,6 +41,14 @@ Guardian Cloud permite:
 ⛔ **Veredicto vigente: `NO APTO`** — auditoría 2026-07-28. Empezar por
 [`START_HERE.md`](./START_HERE.md).
 
+> **Qué está implementado y qué está validado:** la referencia canónica es la
+> tabla de tres niveles en
+> [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md#capacidades-por-nivel-referencia-canónica).
+> Resumen: **nivel 1** audio completo de extremo a extremo; **nivel 2**
+> Reliability Card, Android 13+ y matriz de resiliencia implementados pero sin
+> validar; **nivel 3** todo el vídeo segmentado, su subida en directo, su
+> recuperación y el export `.mp4` no están implementados.
+
 **Baseline técnica congelada:** [`v0.3.0-rc.1`](./releases/v0.3.0-rc.1.md)
 (2026-07-30) — punto de retorno reproducible, **no** una release pública.
 
@@ -81,8 +89,8 @@ por la auditoría. Ver [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md).
 
 Export:
 
-* archivo `.m4a` / `.mp4`
-* usable fuera de la app
+* **`.m4a` (audio) — implementado y validado**, usable fuera de la app
+* **`.mp4` (vídeo) — planificado, no implementado ni validado**
 
 ---
 
@@ -112,8 +120,15 @@ Auditoría y estado real:
 
 ## 🧪 Validación
 
-**198/198 tests automáticos verdes** · **12 errores TypeScript heredados**
-(typecheck NO verde) · sin CI.
+**Condición vigente: toda la suite actual debe pasar, sin tests saltados.** No
+se fija aquí ninguna cifra: quedaría obsoleta al añadir pruebas y empujaría a
+«arreglar» el documento en vez del código. Registrar el total observado al
+ejecutarla.
+
+**12 errores TypeScript heredados** (typecheck **NO** verde) · sin CI.
+
+Resultados históricos, por baseline: **198/198** en `v0.3.0-rc.1`, **263/263** en
+`baseline-fea160c-android11-20260730`.
 
 La baseline `v0.3.0-rc.1` distingue tres niveles de evidencia —verificado por
 instrumentación, atestiguado manualmente, y no ejecutado— y **no marca como

@@ -33,11 +33,13 @@ kill, exportar.
       para seguir; cero absolutos es el requisito de release.
 - [ ] `cd mobile && npm test` → **suite completa verde, sin tests saltados**,
       y registrar el total observado (`___ / ___`).
-      Referencia vigente: **198/198** en la baseline `v0.3.0-rc.1`.
-      No fijar la cifra en este documento: las cifras `99` y `138` que
-      aparecían antes quedaron obsoletas (99 era anterior a la auditoría, 138
-      el baseline previo a A-1/A-2) y empujaban a «arreglar» el checklist en
-      vez del código.
+      **La condición es «toda la suite actual pasa», no alcanzar una cifra.**
+      Resultados históricos, sólo como referencia: **198/198** en
+      `v0.3.0-rc.1` y **263/263** en `baseline-fea160c-android11-20260730`.
+      No fijar la cifra como requisito en este documento: las cifras `99` y
+      `138` que aparecían antes quedaron obsoletas (99 era anterior a la
+      auditoría, 138 el baseline previo a A-1/A-2) y empujaban a «arreglar» el
+      checklist en vez del código.
       Los tests se ejecutan **en local, sin CI**: ningún resultado es
       reproducible de forma independiente todavía.
 - [ ] `mobile/package.json` versión actualizada a `0.3.x`.
