@@ -28,11 +28,13 @@ import {
   setPreferredDestinationType,
 } from '@/destinations/preference';
 import { claimDriveOAuthCode } from '@/oauth/exchangeGuard';
-import { openBatteryOptimizationSettings } from '@/permissions/batteryOptimization';
 // ReliabilityCard — same component the home screen mounts in 'home' mode.
 // Here we mount it in 'settings' mode so it stays visible as a permanent
-// "Fiabilidad" section. The card uses isolated helpers in
-// `src/permissions/*` and never touches recording / upload / queue.
+// "Fiabilidad" section, and it owns the only battery-optimisation entry
+// point in the app (the direct `openBatteryOptimizationSettings` import
+// this file used to carry is gone with the legacy duplicate button).
+// The card uses isolated helpers in `src/permissions/*` and never
+// touches recording / upload / queue.
 import { ReliabilityCard } from '@/components/ReliabilityCard';
 // DEV-only queue wipe — surfaced as a button at the bottom of this screen.
 // Does NOT touch auth/Drive/anything else; only Guardian Cloud queue keys.
@@ -796,66 +798,16 @@ export default function SettingsScreen() {
       >
         FIABILIDAD
       </Text>
-      <ReliabilityCard mode="settings" />
+      {/* The card is the ONLY battery-optimisation control in the app.
+          The legacy "Batería ilimitada" button that used to sit here was
+          a second, equivalent entry point to the same system settings
+          page and was removed.
 
-      {/* Battery-optimisation exemption. Android Doze pauses background
-          network reads for unwhitelisted apps; that throttles our upload
-          worker when the screen is locked for long periods. We do not
-          query exemption status (would require a native module) and we
-          do not request the dialog programmatically (Play Store policy
-          friction). Tapping the button opens the system "Battery
-          optimisation" settings page so the user can grant the
-          exemption manually. Recording is unaffected if they skip.
-          NOTE: this legacy button is kept intentionally for this
-          iteration alongside the new ReliabilityCard above. We will
-          retire it in a follow-up once the card is validated on real
-          devices. */}
-      <Text
-        style={{
-          color: '#8b949e',
-          fontSize: 12,
-          letterSpacing: 1,
-          marginTop: 28,
-          marginBottom: 8,
-        }}
-      >
-        SUBIDA EN SEGUNDO PLANO
-      </Text>
-      <Pressable
-        onPress={() => {
-          openBatteryOptimizationSettings().catch(() => {
-            /* helper already swallows; this catch is defensive */
-          });
-        }}
-        style={{
-          padding: 14,
-          borderWidth: 1,
-          borderColor: '#30363d',
-          borderRadius: 8,
-          backgroundColor: '#161b22',
-        }}
-      >
-        <Text style={{ color: '#c9d1d9', fontSize: 14, fontWeight: '600' }}>
-          Batería ilimitada
-        </Text>
-        <Text
-          style={{ color: '#6e7681', fontSize: 11, marginTop: 4, lineHeight: 15 }}
-        >
-          Para que la subida no se pause con la pantalla apagada, Android
-          necesita una excepción de batería. Pulsa para abrir los ajustes
-          del sistema y permitir Guardian Cloud.
-        </Text>
-        <Text
-          style={{
-            color: '#58a6ff',
-            fontSize: 12,
-            fontWeight: '600',
-            marginTop: 10,
-          }}
-        >
-          Abrir ajustes →
-        </Text>
-      </Pressable>
+          In `mode='settings'` the card ignores both persistence flags
+          ("Ahora no" and battery-guidance-opened), so this access is
+          permanent: a user who hid the recommendation on Home always
+          finds it here. */}
+      <ReliabilityCard mode="settings" />
 
       {/* Beta-feedback CTA. Promoted from a discreet dark card to a
           solid blue button matching the primary action chrome

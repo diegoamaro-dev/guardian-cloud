@@ -3,7 +3,6 @@ import {
   ActivityIndicator,
   Alert,
   AppState,
-  Linking,
   Modal,
   View,
   Text,
@@ -76,13 +75,15 @@ import {
 } from '@/recording/backgroundService';
 import { usePermissionsStore } from '@/permissions/permissionsStore';
 // ReliabilityCard — contextual ask for POST_NOTIFICATIONS + battery
-// optimisation. Strictly additive: never reads or mutates GC_QUEUE,
-// the upload worker, recovery, chunking, export, the FG service, the
-// AudioEngine, or any module beyond the two new helpers in
-// `src/permissions/*`. The yellow notification-denied pill below
-// remains as a persistent low-key fallback after the card is
-// dismissed.
+// optimisation, and the ONLY reliability recommendation on Home.
+// Strictly additive: never reads or mutates GC_QUEUE, the upload
+// worker, recovery, chunking, export, the FG service, the AudioEngine,
+// or any module beyond the helpers in `src/permissions/*`.
 import { ReliabilityCard } from '@/components/ReliabilityCard';
+// Pure predicate; aggregates the screen's own isStarting/isRecording/
+// isStopping flags so the card can hide across the whole capture
+// window. Adds no recording state of its own.
+import { isRecordingBusy } from '@/permissions/reliabilityVisibility';
 import { humanizeFailure } from '@/errors/humanError';
 
 /**
@@ -3427,10 +3428,10 @@ export default function Index() {
   const [testStatus, setTestStatus] = useState<string | null>(null);
   const [isRecording, setIsRecording] = useState(false);
   // POST_NOTIFICATIONS denial flag, written by `startBackgroundProtection`
-  // through the `onPostNotificationsResult` callback. When true the home
-  // screen renders a small read-only pill explaining that the foreground-
-  // service notification will not appear; recording itself is unaffected.
-  const notificationDenied = usePermissionsStore((s) => s.notificationDenied);
+  // through the `onPostNotificationsResult` callback. Detection and the
+  // diagnostic breadcrumbs below still depend on it; the home screen no
+  // longer subscribes to read it, because the ReliabilityCard is now the
+  // single notifications surface there (the old duplicate pill is gone).
   const setNotificationDenied = usePermissionsStore(
     (s) => s.setNotificationDenied,
   );
@@ -6876,61 +6877,25 @@ export default function Index() {
       />
 
       {/* Reliability card — proactive contextual ask shown after Drive
-          connect, hidden during recording, and dismissed permanently
-          after the user taps "Ahora no". Strictly additive UI; the
-          card's helpers do not touch the FG service, the queue, the
-          worker, or recovery. The yellow pill below stays in place as
-          the persistent low-key fallback once the card is dismissed —
-          the two surfaces are deliberately complementary. */}
+          connect and dismissed permanently after the user taps "Ahora
+          no". Strictly additive UI; the card's helpers do not touch the
+          FG service, the queue, the worker, or recovery.
+
+          Hidden for the WHOLE capture window via `isRecordingBusy`, not
+          via `showStop`: `showStop` is `isRecording || isStopping` and
+          would leave the card on screen throughout `isStarting`.
+
+          This card is the single reliability recommendation on Home.
+          The former POST_NOTIFICATIONS pill that used to sit below was
+          removed — it duplicated the card's notifications action. The
+          denial is still detected and still stored (see
+          `setNotificationDenied` on the FG-service result path); the
+          user grants the permission from this card or from Settings. */}
       <ReliabilityCard
         mode="home"
         driveConnected={Boolean(drive)}
-        isRecording={showStop}
+        recordingBusy={isRecordingBusy({ isStarting, isRecording, isStopping })}
       />
-
-      {/* POST_NOTIFICATIONS denial pill. Read-only info: the recording
-          and upload paths still work, but the foreground-service
-          notification ("Guardian Cloud está protegiendo tu evidencia")
-          will not appear, so the user has no system-level confirmation
-          while the app is in the background. Tap opens the per-app
-          settings page so the user can grant the permission and
-          restart. Hidden during recording — it would compete with the
-          live state — and silenced while the gate has not resolved
-          yet (default `false`). */}
-      {!showStop && notificationDenied ? (
-        <Pressable
-          onPress={() => {
-            Linking.openSettings().catch(() => {
-              /* best-effort */
-            });
-          }}
-          style={{
-            flexDirection: 'row',
-            alignItems: 'center',
-            paddingHorizontal: 12,
-            paddingVertical: 8,
-            borderWidth: 1,
-            borderColor: '#9e7c2a',
-            borderRadius: 8,
-            marginTop: 8,
-            marginBottom: 4,
-            backgroundColor: '#1f1a09',
-          }}
-        >
-          <Text style={{ fontSize: 14, marginRight: 8 }}>🔔</Text>
-          <Text
-            style={{
-              color: '#e0c46c',
-              fontSize: 12,
-              flexShrink: 1,
-              lineHeight: 16,
-            }}
-          >
-            Sin notificación de fondo. La grabación funciona, pero al cerrar
-            la app no verás el indicador. Tocar para configurar.
-          </Text>
-        </Pressable>
-      ) : null}
 
       {/* Discreet "Inicio rápido activado" pill. Surfaces the panic
           preference so the user can confirm at a glance that the home
