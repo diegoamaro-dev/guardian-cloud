@@ -14,7 +14,7 @@ Guardian Cloud se compone de cuatro bloques:
 Responsabilidades:
 - capturar audio/vídeo
 - fragmentar
-- cifrar
+- cifrar — **previsto, no implementado en `v0.3.0-rc.1`** (ver «Flujo de datos»)
 - encolar
 - subir
 - reintentar
@@ -85,10 +85,15 @@ Destinos futuros (NO en MVP):
 1. el usuario pulsa grabar
 2. la app crea sesión
 3. se generan chunks
-4. se cifran localmente
+4. *(previsto, **no implementado en `v0.3.0-rc.1`**)* se cifran localmente
 5. se suben al destino
 6. se actualiza estado en backend
 7. al cerrar se completa la sesión
+
+> **El paso 4 no se ejecuta hoy.** El cifrado local está previsto en el diseño
+> —ver `MVP_SCOPE.md` y `SECURITY.md`— pero **no está implementado**: en el
+> código sólo existe un `TODO`. En `v0.3.0-rc.1` los chunks se encolan y se
+> suben **sin cifrado en el cliente**. El transporte sí va sobre TLS.
 
 ## Principios de arquitectura
 

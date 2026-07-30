@@ -46,9 +46,12 @@ kill, exportar.
       aplicación.
 - [ ] `mobile/app.config.ts` `version` actualizada. **SIN CUMPLIR** (`0.1.0`).
 - [ ] `mobile/android/app/build.gradle` `versionName` / `versionCode`
-      coherentes con lo anterior. **SIN CUMPLIR** (`0.1.0` / `1`).
+      coherentes con lo anterior, y **`versionCode` incrementado respecto a la
+      release anterior**. **SIN CUMPLIR** (`0.1.0` / `1`).
       Requiere decidir el esquema: `eas.json` declara
       `appVersionSource: "remote"` pero no hay versiones remotas configuradas.
+      **Ésta es la única exigencia operativa de versionado del documento**; §3.2
+      remite aquí en lugar de duplicarla.
 - [ ] No hay `console.log` con secretos (los logs `TOKEN`, `SUB`,
       `ACCESS_TOKEN` solo loguean longitud + prefijo, nunca el valor).
 - [ ] `DEBUG_QUEUE`, `DEBUG_INJECT_CHUNK1_FAILURE`, `DEBUG_DUPLICATE_SUBMISSION`,
@@ -116,7 +119,10 @@ cd android && ./gradlew assembleRelease
 
 - [ ] AAB / APK firmado con keystore de release (NO con el debug.keystore).
 - [ ] `applicationId` = `com.guardiancloud.app`.
-- [ ] `versionCode` incrementado respecto a la release anterior.
+
+> **Versionado:** el requisito completo —incluido el incremento de `versionCode`
+> respecto a la release anterior— vive en **§1 · Pre-flight (código)**. No se
+> repite aquí para que exista una sola exigencia operativa.
 
 ### 3.3 Comprobaciones obligatorias en toda build de EAS
 
@@ -228,6 +234,27 @@ adb install mobile/android/app/build/outputs/apk/release/app-release.apk
 - [ ] Tap → app abre Home con texto verde "Listo para grabar".
 - [ ] **NO** debe arrancar grabación sola (Play Store policy).
 
+### 4.10 Test con usuarios reales (obligatorio)
+
+> **NO REALIZADO.** Ningún usuario externo ha usado la aplicación. La baseline
+> `v0.3.0-rc.1` sólo se ha ejecutado en un dispositivo del desarrollador.
+
+* [ ] 3 personas sin contexto técnico usan la app. **NO REALIZADO.**
+* [ ] No se les explica cómo funciona
+* [ ] Se les pide: "usa esto si te pasa algo raro"
+
+Verificar:
+
+* [ ] Tiempo hasta empezar a grabar < 2 segundos
+* [ ] No hay dudas durante grabación
+* [ ] El usuario **distingue** grabación, subida y protección confirmada — y no
+      asume que grabar equivale a estar protegido
+* [ ] El usuario puede recuperar la evidencia sin ayuda
+
+Si falla:
+
+> NO lanzar release
+
 ---
 
 ## 5. Closed Testing en Play Console
@@ -297,24 +324,3 @@ NUNCA force-push a main.
 **Punto de retorno técnico disponible hoy:** la baseline
 [`v0.3.0-rc.1`](./releases/v0.3.0-rc.1.md), con criterios de rollback y
 comandos de reversión por commit en su §8.
-
-## 4.10 Test con usuarios reales (obligatorio)
-
-> **NO REALIZADO.** Ningún usuario externo ha usado la aplicación. La baseline
-> `v0.3.0-rc.1` sólo se ha ejecutado en un dispositivo del desarrollador.
-
-* [ ] 3 personas sin contexto técnico usan la app. **NO REALIZADO.**
-* [ ] No se les explica cómo funciona
-* [ ] Se les pide: "usa esto si te pasa algo raro"
-
-Verificar:
-
-* [ ] Tiempo hasta empezar a grabar < 2 segundos
-* [ ] No hay dudas durante grabación
-* [ ] El usuario **distingue** grabación, subida y protección confirmada — y no
-      asume que grabar equivale a estar protegido
-* [ ] El usuario puede recuperar la evidencia sin ayuda
-
-Si falla:
-
-> NO lanzar release

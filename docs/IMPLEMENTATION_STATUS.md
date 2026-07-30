@@ -60,8 +60,24 @@ no lo que hace.
 | Nivel | Alcance |
 |---|---|
 | **Verificado por instrumentación** | instalación, arranque estable, ausencia de excepciones fatales, `ENV READY`, `GC_BOOT_*`, worker en bucle, firma del APK, contenido del bundle, casos T2/T5/T9/T11/T12 |
-| **Atestiguado manualmente** | grabación audio y vídeo, subida durante grabación, segundo plano y bloqueo, mala red, cierre forzado, reinicio con cola pendiente, recovery y exportación |
+| **Atestiguado manualmente** | grabación **de audio** y grabación **de vídeo** (ambas ejecutadas a mano); **subida de audio durante la grabación**; segundo plano y bloqueo; mala red; cierre forzado; reinicio con cola pendiente; recovery; exportación |
 | **No ejecutado** | rama Android 13+ de `POST_NOTIFICATIONS`, T1/T3/T4/T6/T7/T8/T10, Closed Testing, usuarios externos |
+
+> **Sólo el audio saca fragmentos del dispositivo durante la grabación.** El
+> chunker en vivo corre cada 1,5 s únicamente en modo audio. **El vídeo se
+> fragmenta y se encola DESPUÉS de detener la captura** (`chunkVideoFile` se
+> ejecuta post-`stop()`), así que durante una grabación de vídeo **no sale nada
+> del dispositivo**.
+>
+> Esta limitación es **`GC-AUD-001`**. Su consecuencia directa: **el vídeo
+> todavía no cumple el principio central de supervivencia** del producto —«si
+> grabas unos segundos, al menos una parte ya está fuera del dispositivo»—.
+> Ante kill, crash o pérdida del dispositivo mientras se graba vídeo puede
+> perderse toda la evidencia.
+>
+> «Grabación de vídeo atestiguada» significa que la captura, el chunking
+> post-stop, la subida posterior y la exportación funcionaron. **No** significa
+> que hubiera subida durante la captura. Resolverlo corresponde a la **fase D**.
 
 **Discrepancia de versión conocida:** la etiqueta se llama `v0.3.0-rc.1` pero la
 aplicación declara `0.1.0` / `versionCode 1`. La etiqueta marca un punto de git,

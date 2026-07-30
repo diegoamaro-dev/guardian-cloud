@@ -1,5 +1,26 @@
 # Guardian Cloud — STATE v0.2 (Background + Recovery Stable)
 
+> ⚠️ **Baseline anterior — v0.2. Superada.** El título dice «Estado actual» pero
+> este documento describe un punto del pasado, no el estado de hoy.
+>
+> **Baseline vigente: [`v0.3.0-rc.1`](./releases/v0.3.0-rc.1.md)** — técnica y
+> reproducible, pero **`NO APTO` para publicación** (auditoría 2026-07-28).
+>
+> Sus dos afirmaciones de cierre —«MVP CORE: VALIDADO» y «Esto ya no es un
+> prototipo»— **quedaron retiradas por la auditoría**: no tenían registro de
+> prueba detrás. No las tomes como veredicto.
+>
+> Dos límites que este documento no recoge:
+> - **el vídeo no sube evidencia durante la captura** (`GC-AUD-001`): se
+>   fragmenta y encola tras detenerse. Su §«Limitaciones actuales» menciona sólo
+>   el vídeo *en background*, que es un problema distinto y menor;
+> - **el recovery autónomo tras reiniciar el dispositivo (`I5c`) no está
+>   implementado**; lo que existe es el drenaje al reabrir la app (`I5a`).
+>
+> Fuentes vigentes: [`releases/v0.3.0-rc.1.md`](./releases/v0.3.0-rc.1.md) ·
+> [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md) ·
+> [`START_HERE.md`](./START_HERE.md)
+
 ## 🧠 Estado actual del sistema
 
 Este punto marca la primera versión **realmente robusta** del sistema.

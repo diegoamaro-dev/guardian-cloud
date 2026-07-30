@@ -48,11 +48,21 @@ No protege completamente contra:
 
 ### Obligatorio en MVP
 
-- cifrado local antes de subida
+- cifrado local antes de subida — **PENDIENTE: no implementado en `v0.3.0-rc.1`**
 - uso de almacenamiento interno seguro
 - no exponer rutas de archivos
 - no logs con datos sensibles
 - control de permisos (cámara, micro)
+
+> **El requisito se mantiene; su estado es pendiente.** El cifrado local sigue
+> siendo obligatorio para el MVP, pero **`v0.3.0-rc.1` todavía no lo satisface**:
+> en el código sólo existe un `TODO` y los chunks se suben sin cifrado en el
+> cliente. El transporte va sobre TLS, lo que **no** equivale a cifrado local.
+>
+> Consecuencia: la RC **no cumple** esta sección de seguridad y ése es uno de
+> los motivos por los que permanece `NO APTO` para publicación. Ver
+> [`releases/v0.3.0-rc.1.md`](./releases/v0.3.0-rc.1.md) §7.2 y
+> [`PLAYSTORE_RELEASE_PLAN.md`](./PLAYSTORE_RELEASE_PLAN.md) §3.1.
 
 ### Recomendado
 

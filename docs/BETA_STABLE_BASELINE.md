@@ -2,6 +2,28 @@
 
 # Guardian Cloud — Stable Beta Baseline
 
+> ⚠️ **Baseline anterior de la beta (`beta-preview-v0.3.1`, commit `a9e6e23`).
+> Ya no es el punto de retorno vigente.**
+>
+> **Baseline vigente: [`v0.3.0-rc.1`](./releases/v0.3.0-rc.1.md)** — técnica y
+> reproducible, con commit, Build ID y SHA-256 registrados. **Permanece
+> `NO APTO` para publicación** (auditoría 2026-07-28).
+>
+> Este documento sigue siendo útil por sus **reglas de depuración y su lista de
+> invariantes**, que no han cambiado. Lo que ha cambiado es el artefacto al que
+> se vuelve en caso de rollback.
+>
+> Dos límites que el documento no refleja:
+> - **el vídeo no sube evidencia durante la captura** (`GC-AUD-001`): se
+>   fragmenta y encola tras detenerse. La invariante nº 1 de abajo lleva ahora
+>   esa acotación;
+> - **el recovery autónomo tras reiniciar el dispositivo (`I5c`) no está
+>   implementado**; existe el drenaje al reabrir la app (`I5a`).
+>
+> Fuentes vigentes: [`releases/v0.3.0-rc.1.md`](./releases/v0.3.0-rc.1.md) ·
+> [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) ·
+> [`DEBUGGING_RULES.md`](./DEBUGGING_RULES.md)
+
 Este documento define el punto estable oficial de la beta.
 
 Objetivo:
@@ -82,9 +104,17 @@ INVARIANTES CRÍTICAS
 
 Estas reglas NO deben romperse:
 
-1. Subida durante grabación
+1. Subida de audio durante grabación
 
 La evidencia debe salir del dispositivo DURANTE la grabación.
+
+Cumplido hoy **sólo en modo audio**: el chunker en vivo corre cada 1,5 s y los
+fragmentos se suben mientras se graba.
+
+**El vídeo se procesa después de detenerse:** `chunkVideoFile` se ejecuta
+post-`stop()`, así que durante una captura de vídeo no sale nada del
+dispositivo. Es `GC-AUD-001` y sigue abierto — la invariante se mantiene como
+objetivo del producto, pero el vídeo aún no la satisface.
 
 2. Cola persistente
 

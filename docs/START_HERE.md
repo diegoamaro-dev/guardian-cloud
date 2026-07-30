@@ -84,7 +84,7 @@ Regla principal:
 ### Cliente (App móvil)
 - Graba audio/vídeo
 - Divide en chunks (2–5s)
-- Cifra localmente
+- Cifra localmente — **previsto, no implementado en `v0.3.0-rc.1`**
 - Sube automáticamente
 - Mantiene cola persistente
 

@@ -1,6 +1,9 @@
 # Guardian Cloud
 
-Aplicación móvil de evidencia segura centrada en supervivencia temprana de grabaciones mediante chunking, cifrado local y subida al almacenamiento del usuario.
+Aplicación móvil de evidencia centrada en la supervivencia temprana de grabaciones: fragmenta la captura, mantiene una cola persistente y sube los fragmentos al almacenamiento del propio usuario.
+
+> **El cifrado local no está implementado.** Figura en `MVP_SCOPE.md` y
+> `SECURITY.md` como objetivo del producto, no como capacidad actual.
 
 ---
 
@@ -10,18 +13,26 @@ Guardian Cloud permite:
 
 * grabar audio/vídeo
 * dividir en chunks
-* subir en tiempo real
+* **subir en tiempo real durante la grabación — sólo en modo audio.** El vídeo
+  se fragmenta y encola **después** de detener la captura (`GC-AUD-001`)
 * sobrevivir a:
 
   * pérdida de conexión
   * cierre forzado
-  * reinicio del dispositivo
+  * **reinicio del dispositivo, con matiz:** la cola persistida sobrevive al
+    reinicio y **continúa drenándose cuando el usuario vuelve a abrir la
+    aplicación**. El arranque automático o recovery autónomo tras reiniciar
+    —sin abrir la app— **sigue sin implementarse** (`I5c`): no hay receptor de
+    `BOOT_COMPLETED` ni planificador de trabajo diferido
 
 ---
 
 ## 🎯 Objetivo
 
 > Si grabas durante unos segundos, al menos una parte de esa evidencia ya está fuera del dispositivo.
+
+**Cumplido hoy sólo en audio.** En vídeo, este objetivo todavía no se satisface
+(`GC-AUD-001`): resolverlo es la fase D y la siguiente prioridad funcional.
 
 ---
 
