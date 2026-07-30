@@ -85,6 +85,48 @@ no una versión de aplicación. Ver §7.1 del registro de baseline.
 
 ---
 
+## Baseline funcional — `baseline-fea160c-android11-20260730` (2026-07-30)
+
+Registro completo:
+[`baselines/BASELINE_FEA160C_2026-07-30.md`](./baselines/BASELINE_FEA160C_2026-07-30.md).
+
+| | |
+|---|---|
+| Commit | `fea160ccc5a7bb53997d60c901711106176fe9b5` |
+| Rama publicada | `feat/reliability-card` |
+| Build EAS | `0986770d-0f52-4eaf-956a-8811c8fc9122` (perfil `preview`, APK) |
+| SHA-256 del APK | `cb8120af483a66a99e5a5fab711f4e1094f883dd56e458e51440a17dcbf24301` |
+| Firmante (SHA-256) | `6aa7fa91a0d28c897ce008be184a1b9b7b98761283e035f605a8e33b126c921a` |
+| Dispositivo | OnePlus 6, Android 11 (SDK 30), `arm64-v8a` |
+
+### Dos cosas distintas que no deben mezclarse
+
+**1 · Validaciones históricas del sistema.** Todo lo registrado en el resto de
+este documento —incluida la tabla «Validación por nivel de evidencia» de la
+baseline `v0.3.0-rc.1` y los apartados de audio, recovery y export— corresponde
+a artefactos **anteriores**. No fue reejecutado con la APK de esta baseline.
+
+**2 · Validación concreta de esta APK.** Se limita a: **instalación limpia
+correcta**, **arranque del paquete en dispositivo real**, **interfaz renderizada
+sin cierre inmediato** y **uso observado por el propietario**. Nada más.
+
+La frase del tag *«Core application works on the tested device»* se interpreta
+de forma estricta con ese alcance: instalación, arranque y uso observado en ese
+dispositivo. **No** es validación de resiliencia.
+
+### Qué sigue sin validar con esta APK
+
+Android 13+ y `POST_NOTIFICATIONS`; la matriz completa de mala red, segundo
+plano, cierre forzado, reinicio, recovery y export; actualización conservando
+datos previos; múltiples dispositivos; usuarios externos; publicación en Play
+Store; y el motivo por el que la Reliability Card no apareció en Home
+—cuestión abierta que impide considerarla validada en dispositivo—.
+
+Esta baseline **no levanta** el veredicto `NO APTO` de la auditoría 2026-07-28.
+`GC-AUD-001` sigue abierto.
+
+---
+
 ## Current MVP status
 
 The MVP currently supports:

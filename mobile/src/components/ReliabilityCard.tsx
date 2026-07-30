@@ -24,27 +24,27 @@
  *     start path still requests POST_NOTIFICATIONS when needed (via
  *     the FG-service module — untouched by this card)
  *
- * Visibility model (intentionally tiny):
- *   - `mode='home'` visible iff `driveConnected && !isRecording &&
- *     !dismissed`. Three booleans, ANDed together. Once `dismissed`
- *     flips true via "Ahora no", the home card is gone until the app
- *     is reinstalled.
- *   - `mode='settings'` always visible. No dismissed gate. No
- *     driveConnected gate. The Settings card is the Fiabilidad
- *     section and never goes away.
+ * Visibility is NOT decided here. Every rule lives in
+ * `@/permissions/reliabilityVisibility` as pure functions, so it can be
+ * unit-tested without a React renderer and so this file stays free of
+ * business logic. This component reads state, hands it to
+ * `decideReliabilityCard`, and renders the answer.
  *
- * Button visibility:
- *   - "Activar notificaciones": hidden iff status is `'granted'` or
- *     `'not_applicable'`. Shown otherwise (`'denied'`, `'unknown'`).
- *   - "Mejorar segundo plano": always shown. We cannot detect the
- *     current battery-exemption state without a native module, and
- *     retapping the button is harmless (just re-opens Settings).
- *   - "Ahora no": shown only in `mode='home'`. Hidden in Settings
- *     where the card is permanent.
+ * The home surface hides itself during the whole capture window
+ * (`isStarting || isRecording || isStopping`, aggregated by the caller
+ * via `isRecordingBusy`) — it must never compete with the STOP button
+ * or shift the layout mid-capture.
  *
- * No mini state machine. Two `useState` slots, two `useEffect` blocks,
- * three handlers, one conditional render. If a future feature needs
- * more behaviour, it should live in a SEPARATE component, not by
+ * The battery recommendation disappears from Home once the user has
+ * opened the system settings page. That flag records a navigation, not
+ * an outcome: we cannot read the exemption state without a native
+ * module, so no copy in this file claims the optimisation is disabled
+ * or resolved. Settings keeps the action permanently for exactly that
+ * reason.
+ *
+ * No mini state machine. Three `useState` slots, two `useEffect`
+ * blocks, three handlers, one conditional render. If a future feature
+ * needs more behaviour, it should live in a SEPARATE component, not by
  * extending this one.
  */
 
@@ -63,18 +63,26 @@ import {
   type PostNotifStatus,
 } from '@/permissions/notifications';
 import {
+  hasOpenedBatteryGuidance,
   isReliabilityCardDismissed,
+  markBatteryGuidanceOpened,
   markReliabilityCardDismissed,
 } from '@/permissions/reliabilityDismissal';
 import { openBatteryOptimizationSettings } from '@/permissions/batteryOptimization';
+import { decideReliabilityCard } from '@/permissions/reliabilityVisibility';
 
 export type ReliabilityCardProps =
   | {
       mode: 'home';
       /** True when a Drive destination is connected for this user. */
       driveConnected: boolean;
-      /** True when a recording session is currently active. */
-      isRecording: boolean;
+      /**
+       * True while a capture is in flight in ANY phase — starting,
+       * recording or stopping. Callers build this with
+       * `isRecordingBusy()` from the screen's existing flags; this
+       * component never derives recording state itself.
+       */
+      recordingBusy: boolean;
     }
   | { mode: 'settings' };
 
@@ -89,21 +97,25 @@ export type ReliabilityCardProps =
 export function ReliabilityCard(props: ReliabilityCardProps) {
   const [notifStatus, setNotifStatus] = useState<PostNotifStatus>('unknown');
   const [dismissed, setDismissed] = useState(false);
+  const [batteryOpened, setBatteryOpened] = useState(false);
 
-  // One-shot initial read: notification status + dismissed flag. Both
-  // reads are best-effort; if either fails the helper returns a safe
-  // default ('unknown' / false) so the card may simply appear. Neither
-  // failure mode affects recording or upload.
+  // One-shot initial read: notification status + both persisted flags.
+  // Every read is best-effort; on failure the helpers return a safe
+  // default ('unknown' / false) so the card may simply appear. No
+  // failure mode here affects recording or upload — this effect touches
+  // nothing outside the card's own state.
   useEffect(() => {
     let cancelled = false;
     void (async () => {
-      const [status, isDismissed] = await Promise.all([
+      const [status, isDismissed, batteryGuidanceOpened] = await Promise.all([
         getPostNotificationsStatus(),
         isReliabilityCardDismissed(),
+        hasOpenedBatteryGuidance(),
       ]);
       if (cancelled) return;
       setNotifStatus(status);
       setDismissed(isDismissed);
+      setBatteryOpened(batteryGuidanceOpened);
     })();
     return () => {
       cancelled = true;
@@ -135,27 +147,46 @@ export function ReliabilityCard(props: ReliabilityCardProps) {
     return () => sub.remove();
   }, []);
 
-  // Visibility — home mode only. Settings mode renders unconditionally.
-  if (props.mode === 'home') {
-    if (!props.driveConnected) return null;
-    if (props.isRecording) return null;
-    if (dismissed) return null;
-  }
+  // Every visibility rule lives in the pure module — see its docblock.
+  const decision = decideReliabilityCard(
+    props.mode === 'home'
+      ? {
+          mode: 'home',
+          driveConnected: props.driveConnected,
+          recordingBusy: props.recordingBusy,
+          dismissed,
+          notifStatus,
+          batteryGuidanceOpened: batteryOpened,
+        }
+      : { mode: 'settings', notifStatus },
+  );
 
-  const showNotificationsButton =
-    notifStatus !== 'granted' && notifStatus !== 'not_applicable';
+  if (!decision.visible) return null;
 
   async function handleNotifications(): Promise<void> {
-    const granted = await requestPostNotifications();
-    setNotifStatus(granted ? 'granted' : 'denied');
+    await requestPostNotifications();
+    // Re-read instead of trusting the request's boolean: `false` covers
+    // both "user denied" and "not verifiable on this build", and the
+    // status checker is the single source of truth for which one it
+    // was. Recording is never gated on either outcome.
+    const status = await getPostNotificationsStatus();
+    setNotifStatus(status);
   }
 
-  function handleBattery(): void {
+  async function handleBattery(): Promise<void> {
     // Voluntary action only. Triggered exclusively from this onPress.
-    // The helper itself never throws; the .catch is defensive.
-    openBatteryOptimizationSettings().catch(() => {
+    // The opener never throws and never reports success — best-effort
+    // by contract — so the .catch is purely defensive.
+    await openBatteryOptimizationSettings().catch(() => {
       /* best-effort — see helper docblock */
     });
+    // Record that we sent the user to the system page so Home stops
+    // repeating the recommendation. This is a navigation receipt, NOT a
+    // claim that the exemption was granted — the app cannot know that.
+    // Storage failures are swallowed inside the helper and never reach
+    // the UI or the capture path.
+    await markBatteryGuidanceOpened();
+    setBatteryOpened(true);
   }
 
   async function handleDismiss(): Promise<void> {
@@ -197,7 +228,7 @@ export function ReliabilityCard(props: ReliabilityCardProps) {
         puede necesitar dos ajustes adicionales.
       </Text>
 
-      {showNotificationsButton ? (
+      {decision.showNotificationsAction ? (
         <View style={{ marginBottom: 12 }}>
           <Text
             style={{
@@ -231,35 +262,39 @@ export function ReliabilityCard(props: ReliabilityCardProps) {
         </View>
       ) : null}
 
-      <View style={{ marginBottom: 12 }}>
-        <Text
-          style={{
-            color: '#8b949e',
-            fontSize: 12,
-            lineHeight: 16,
-            marginBottom: 8,
-          }}
-        >
-          Algunos móviles cierran apps para ahorrar batería. Este ajuste
-          ayuda a que la subida no se corte.
-        </Text>
-        <Pressable
-          onPress={handleBattery}
-          style={{
-            paddingVertical: 10,
-            paddingHorizontal: 14,
-            borderRadius: 6,
-            backgroundColor: '#1f6feb',
-            alignItems: 'center',
-          }}
-        >
+      {decision.showBatteryAction ? (
+        <View style={{ marginBottom: 12 }}>
           <Text
-            style={{ color: '#ffffff', fontSize: 14, fontWeight: '600' }}
+            style={{
+              color: '#8b949e',
+              fontSize: 12,
+              lineHeight: 16,
+              marginBottom: 8,
+            }}
           >
-            Mejorar segundo plano
+            Algunos móviles cierran apps para ahorrar batería. Este ajuste
+            ayuda a que la subida no se corte.
           </Text>
-        </Pressable>
-      </View>
+          <Pressable
+            onPress={() => {
+              void handleBattery();
+            }}
+            style={{
+              paddingVertical: 10,
+              paddingHorizontal: 14,
+              borderRadius: 6,
+              backgroundColor: '#1f6feb',
+              alignItems: 'center',
+            }}
+          >
+            <Text
+              style={{ color: '#ffffff', fontSize: 14, fontWeight: '600' }}
+            >
+              Mejorar segundo plano
+            </Text>
+          </Pressable>
+        </View>
+      ) : null}
 
       <Text
         style={{
@@ -267,13 +302,13 @@ export function ReliabilityCard(props: ReliabilityCardProps) {
           fontSize: 11,
           lineHeight: 15,
           marginTop: 4,
-          marginBottom: props.mode === 'home' ? 12 : 0,
+          marginBottom: decision.showDismiss ? 12 : 0,
         }}
       >
         Guardian Cloud solo graba cuando tú pulsas grabar.
       </Text>
 
-      {props.mode === 'home' ? (
+      {decision.showDismiss ? (
         <Pressable
           onPress={() => {
             void handleDismiss();

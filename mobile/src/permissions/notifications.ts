@@ -45,9 +45,11 @@ export type PostNotifStatus =
  * that survives older react-native bundles (where the key may be missing
  * because the bundle predates Android 13 support).
  *
- * Returns null when the constant is unavailable; callers treat that as
- * "permission infrastructure missing" and short-circuit to a safe value
- * (`true` for the requester, `'unknown'` for the status checker).
+ * Returns null when the constant is unavailable. On Android 13+ that is a
+ * NOT-VERIFIABLE state, never a grant: both callers short-circuit to the
+ * pessimistic value (`'unknown'` for the status checker, `false` for the
+ * requester). Claiming "granted" here would silently hide the contextual
+ * ask on exactly the devices where the permission is required.
  */
 function resolvePostNotificationsPerm():
   | Parameters<typeof PermissionsAndroid.check>[0]
@@ -73,9 +75,11 @@ function resolvePostNotificationsPerm():
  */
 export async function getPostNotificationsStatus(): Promise<PostNotifStatus> {
   if (Platform.OS !== 'android') return 'not_applicable';
-  if (typeof Platform.Version !== 'number' || Platform.Version < 33) {
-    return 'not_applicable';
-  }
+  // An Android build whose version we cannot read is NOT provably
+  // pre-13, so it cannot be dismissed as 'not_applicable' — that would
+  // be an implicit grant. Report it as unverifiable instead.
+  if (typeof Platform.Version !== 'number') return 'unknown';
+  if (Platform.Version < 33) return 'not_applicable';
   const perm = resolvePostNotificationsPerm();
   if (!perm) return 'unknown';
   try {
@@ -88,13 +92,23 @@ export async function getPostNotificationsStatus(): Promise<PostNotifStatus> {
 
 /**
  * Request the POST_NOTIFICATIONS runtime permission. Returns `true`
- * when:
- *   - the permission is already granted, OR
+ * ONLY when the permission is effectively in place:
  *   - it does not apply on this platform/version (iOS, Android < 13), OR
+ *   - it is already granted, OR
  *   - the user grants it through the system dialog this call surfaces.
  *
- * Returns `false` only when the user actively denies via the system
- * dialog, or when an exception is thrown by the platform API.
+ * Returns `false` in every other case — the user denies via the system
+ * dialog, the platform API throws, the Android version cannot be read,
+ * or the POST_NOTIFICATIONS constant is missing from the bundle on an
+ * Android 13+ device. The last two are "not verifiable", and an
+ * unverifiable permission is reported as NOT granted, never as granted:
+ * a false positive would hide the contextual ask on precisely the
+ * devices that need it, and the user would lose the foreground-service
+ * notification with no way to notice.
+ *
+ * `false` is an informational result, not an error: recording and
+ * upload never consult it. The only consumer is the reliability card,
+ * which uses it to decide whether to keep showing its button.
  *
  * Idempotent: calling twice when already granted skips the dialog.
  * Caller-friendly: never throws, never logs OEM-diagnostic side effects
@@ -103,11 +117,11 @@ export async function getPostNotificationsStatus(): Promise<PostNotifStatus> {
  */
 export async function requestPostNotifications(): Promise<boolean> {
   if (Platform.OS !== 'android') return true;
-  if (typeof Platform.Version !== 'number' || Platform.Version < 33) {
-    return true;
-  }
+  // Unreadable Android version — see `getPostNotificationsStatus`.
+  if (typeof Platform.Version !== 'number') return false;
+  if (Platform.Version < 33) return true;
   const perm = resolvePostNotificationsPerm();
-  if (!perm) return true;
+  if (!perm) return false;
   try {
     const already = await PermissionsAndroid.check(perm);
     if (already) return true;
