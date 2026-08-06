@@ -491,7 +491,7 @@ class SegmentCoordinator(
     retained.clear()
     retainedBytes = 0
     cutKeyframe = null
-    setState(GateState.RECORDING_SECOND)
+    setState(GateState.RECORDING)
     Log.i(
       TAG,
       "GC_P2_GATE rotation_complete cut_pts_us=$cutPtsUs " +
