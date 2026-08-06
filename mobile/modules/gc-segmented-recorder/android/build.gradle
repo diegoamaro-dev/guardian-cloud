@@ -1,0 +1,26 @@
+plugins {
+  id 'com.android.library'
+  id 'expo-module-gradle-plugin'
+}
+
+group = 'com.guardiancloud.segrec'
+version = '0.0.0'
+
+android {
+  namespace "com.guardiancloud.segrec"
+  defaultConfig {
+    versionCode 1
+    versionName "0.0.0"
+  }
+}
+
+// SPIKE — early gate for P2 (Camera2 + MediaCodec + AudioRecord + MediaMuxer).
+//
+// No dependencies. Everything used here is a platform API available from
+// API 24: android.hardware.camera2, android.media.MediaCodec,
+// android.media.AudioRecord, android.media.MediaMuxer.
+//
+// `expo-module-gradle-plugin` supplies compileSdk/minSdk/targetSdk from the
+// host project's rootProject.ext, so this module inherits minSdk 24.
+dependencies {
+}
