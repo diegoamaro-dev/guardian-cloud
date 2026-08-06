@@ -23,7 +23,7 @@ import { View, Text, Pressable, ScrollView } from 'react-native';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import { Audio } from 'expo-av';
 import * as FileSystem from 'expo-file-system/legacy';
-import { Stack } from 'expo-router';
+import { Redirect, Stack } from 'expo-router';
 
 type LogLine = { t: number; line: string };
 
@@ -82,7 +82,13 @@ async function listCandidateFiles(): Promise<CacheFile[]> {
   return out;
 }
 
-export default function DebugCameraProbe() {
+/**
+ * The diagnostic screen itself. NOT the route export — see the wrapper at the
+ * bottom of this file. It is deliberately not exported: nothing outside the
+ * access wrapper may mount it, because mounting it is what brings up the
+ * camera and requests permissions.
+ */
+function DebugCameraProbeScreen() {
   const [, requestCamPerm] = useCameraPermissions();
   const [running, setRunning] = useState(false);
   const [done, setDone] = useState(false);
@@ -387,4 +393,23 @@ export default function DebugCameraProbe() {
       </ScrollView>
     </View>
   );
+}
+
+/**
+ * Access wrapper — the actual route export.
+ *
+ * Everything under `app/` ships in the production bundle and stays reachable
+ * by deep link (`guardiancloud://debug-camera-probe`). Without this gate a
+ * release build would mount a camera preview and request camera and
+ * microphone permissions on an unlisted URL.
+ *
+ * The wrapper holds NO hooks, so its early return cannot produce a
+ * conditional hook order. The diagnostic component keeps its hooks
+ * unconditional and is simply never mounted in release: `__DEV__` is a
+ * compile-time constant that Metro replaces with `false`, so the branch is
+ * dead code there.
+ */
+export default function DebugCameraProbeRoute() {
+  if (!__DEV__) return <Redirect href="/" />;
+  return <DebugCameraProbeScreen />;
 }
