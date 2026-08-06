@@ -33,6 +33,24 @@ class GCSegmentedRecorderModule : Module() {
   private val main = Handler(Looper.getMainLooper())
   private var sessionId: String = ""
 
+  /**
+   * Harness rotation scheduling — DIAGNOSTIC ONLY.
+   *
+   * `activeConfig` is the config the running session was accepted with, so a
+   * chained rotation reads the same interval the session started with even if a
+   * later start proposed a different one.
+   *
+   * `pendingRotation` holds the single armed runnable. Exactly one rotation is
+   * ever pending: the first is armed on camera-open, and every later one is
+   * armed from `onSegmentClosed`, which only fires once the previous rotation
+   * has produced a closed, stability-verified segment. There is therefore no
+   * path on which two rotations are in flight, and no timer keeps firing into a
+   * session that stopped responding.
+   */
+  private var activeConfig: CaptureConfig = CaptureConfig()
+  private var pendingRotation: Runnable? = null
+  private var rotationsRequested = 0
+
   /** Ordered-close guards, reset on every valid start. */
   private var stopping = false
   private var eosSettled = false
@@ -111,8 +129,14 @@ class GCSegmentedRecorderModule : Module() {
     // `sessionId` is NOT touched here: the identity only changes once the
     // start has been accepted. Assigning it up front let a rejected second
     // start overwrite the running session's identifier.
-    AsyncFunction("startSegmentedCapture") { id: String ->
-      startCapture(id)
+    /**
+     * `options` is a DIAGNOSTIC-ONLY harness override, reachable in practice
+     * only from `/debug-p2-gate`, which is itself dead code in a release
+     * bundle. Passing null — what every other caller does — reproduces the
+     * historical 7 s / one-rotation session exactly.
+     */
+    AsyncFunction("startSegmentedCapture") { id: String, options: Map<String, Any?>? ->
+      startCapture(id, options)
     }
 
     AsyncFunction("stopSegmentedCapture") {
@@ -150,8 +174,107 @@ class GCSegmentedRecorderModule : Module() {
     return File(base, "gc-p2-gate").also { it.mkdirs() }
   }
 
+  /**
+   * Builds the capture config from a diagnostic override map.
+   *
+   * Returns null and REJECTS the start on any invalid value rather than
+   * clamping: a harness run whose parameters were silently altered produces
+   * evidence that does not match what the operator asked for, which is worse
+   * than not running at all.
+   */
+  private fun harnessConfig(id: String, options: Map<String, Any?>?): CaptureConfig? {
+    val base = CaptureConfig()
+    if (options == null) return base
+
+    fun longOf(key: String, fallback: Long): Long? = when (val v = options[key]) {
+      null -> fallback
+      is Number -> v.toLong()
+      else -> null
+    }
+
+    val rotateAt = longOf("rotateAtMs", base.rotateAtMs)
+    val interval = longOf("rotationIntervalMs", base.rotationIntervalMs)
+    val session = longOf("sessionMs", base.sessionMs)
+
+    fun reject(msg: String): CaptureConfig? {
+      rejectStart(id, ErrorCode.INVALID_STATE, "invalid harness options: $msg")
+      return null
+    }
+
+    if (rotateAt == null || interval == null || session == null) {
+      return reject("rotateAtMs, rotationIntervalMs and sessionMs must be numbers")
+    }
+    if (rotateAt < HarnessBounds.MIN_ROTATE_AT_MS || rotateAt > HarnessBounds.MAX_ROTATE_AT_MS) {
+      return reject(
+        "rotateAtMs=$rotateAt outside " +
+          "[${HarnessBounds.MIN_ROTATE_AT_MS}, ${HarnessBounds.MAX_ROTATE_AT_MS}]",
+      )
+    }
+    // 0 is the historical "single rotation" value and stays legal.
+    if (interval != 0L &&
+      (interval < HarnessBounds.MIN_ROTATION_INTERVAL_MS ||
+        interval > HarnessBounds.MAX_ROTATION_INTERVAL_MS)
+    ) {
+      return reject(
+        "rotationIntervalMs=$interval must be 0 or within " +
+          "[${HarnessBounds.MIN_ROTATION_INTERVAL_MS}, " +
+          "${HarnessBounds.MAX_ROTATION_INTERVAL_MS}]",
+      )
+    }
+    if (session < HarnessBounds.MIN_SESSION_MS || session > HarnessBounds.MAX_SESSION_MS) {
+      return reject(
+        "sessionMs=$session outside " +
+          "[${HarnessBounds.MIN_SESSION_MS}, ${HarnessBounds.MAX_SESSION_MS}]",
+      )
+    }
+    // Without a tail after the first rotation the session would stop mid-cut and
+    // never produce the second segment the operator asked for.
+    if (session - rotateAt < HarnessBounds.MIN_TAIL_AFTER_FIRST_ROTATION_MS) {
+      return reject(
+        "sessionMs=$session must exceed rotateAtMs=$rotateAt by at least " +
+          "${HarnessBounds.MIN_TAIL_AFTER_FIRST_ROTATION_MS}ms",
+      )
+    }
+
+    return base.copy(
+      rotateAtMs = rotateAt,
+      rotationIntervalMs = interval,
+      sessionMs = session,
+    )
+  }
+
+  /**
+   * Arms THE rotation. Any previously armed one is removed first, so the
+   * invariant "at most one pending rotation" holds even if this were ever
+   * called twice for the same generation.
+   */
+  private fun scheduleRotation(gen: Long, delayMs: Long) {
+    cancelPendingRotation()
+    val r = Runnable {
+      if (!genActive(gen)) return@Runnable
+      val v = video ?: return@Runnable
+      val c = coordinator ?: return@Runnable
+      rotationsRequested++
+      Log.i(
+        TAG,
+        "GC_P2_GATE harness_rotation_requested n=$rotationsRequested " +
+          "delay_ms=$delayMs gen=$gen",
+      )
+      v.requestSyncFrame()
+      c.requestRotation()
+    }
+    pendingRotation = r
+    main.postDelayed(r, delayMs)
+  }
+
+  /** Safe cancellation: used on stop, on failure and on release. */
+  private fun cancelPendingRotation() {
+    pendingRotation?.let { main.removeCallbacks(it) }
+    pendingRotation = null
+  }
+
   @Synchronized
-  private fun startCapture(id: String) {
+  private fun startCapture(id: String, options: Map<String, Any?>? = null) {
     // TERMINAL GATE. A previous session ended holding native resources it
     // could not safely free. Starting again would stack a second AudioRecord
     // or codec on top of the leaked ones.
@@ -212,7 +335,21 @@ class GCSegmentedRecorderModule : Module() {
     sessionActive = true
     sessionId = id
 
-    val config = CaptureConfig()
+    // Validated BEFORE any resource is built. On rejection the start is refused
+    // and nothing has been allocated.
+    val config = harnessConfig(id, options) ?: run {
+      sessionActive = false
+      sessionId = ""
+      return
+    }
+    activeConfig = config
+    cancelPendingRotation()
+    rotationsRequested = 0
+    Log.i(
+      TAG,
+      "GC_P2_GATE harness_config rotate_at_ms=${config.rotateAtMs} " +
+        "rotation_interval_ms=${config.rotationIntervalMs} session_ms=${config.sessionMs}",
+    )
     val dir = outputDir()
     dir.listFiles()?.forEach { it.delete() }
 
@@ -294,6 +431,21 @@ class GCSegmentedRecorderModule : Module() {
               "audioSamples" to m.audioSamples,
             ),
           )
+          // Chain the next rotation HERE and nowhere else. Reaching this point
+          // means the previous rotation produced a segment that closed and
+          // passed its stability check, which is the only evidence available
+          // that it finished correctly. Scheduling from a free-running timer
+          // instead would let a second rotation be armed while the first was
+          // still draining its muxer.
+          //
+          // `genActive` is re-tested inside the post because the session may
+          // have been stopped between the coordinator emitting and this
+          // running; `stopping` is tested so a segment closing during teardown
+          // does not arm a rotation nobody will service.
+          val interval = activeConfig.rotationIntervalMs
+          if (interval > 0L && genActive(gen) && !stopping && !releasing) {
+            scheduleRotation(gen, interval)
+          }
         }
       },
       onFailure = { code, msg -> reportError(gen, code, msg) },
@@ -349,10 +501,9 @@ class GCSegmentedRecorderModule : Module() {
     v.onSurfaceLost = { if (genActive(gen)) beginOrderedStop(gen) }
     cam.open(cameraId, v.surfaceView.holder.surface, vid.inputSurface) {
       if (!genActive(gen)) return@open
-      // Rotation is requested by the module, never by JavaScript.
-      main.postDelayed({
-        if (genActive(gen)) { vid.requestSyncFrame(); coord.requestRotation() }
-      }, config.rotateAtMs)
+      // Rotation is requested by the module, never by JavaScript. Later
+      // rotations are chained from `onSegmentClosed`, not armed here.
+      scheduleRotation(gen, config.rotateAtMs)
       main.postDelayed({ if (genActive(gen)) beginOrderedStop(gen) }, config.sessionMs)
     }
   }
@@ -423,7 +574,15 @@ class GCSegmentedRecorderModule : Module() {
   private fun beginOrderedStop(gen: Long) {
     if (!genValid(gen) || !sessionActive || releasing || stopping) return
     stopping = true
-    Log.i(TAG, "GC_P2_GATE close_phase=1 stop_production_and_signal_eos gen=$gen")
+    // No further rotation may be armed once the close has begun, and any
+    // rotation already armed is dropped rather than left to be filtered by its
+    // generation check.
+    cancelPendingRotation()
+    Log.i(
+      TAG,
+      "GC_P2_GATE close_phase=1 stop_production_and_signal_eos gen=$gen " +
+        "rotations_requested=$rotationsRequested",
+    )
 
     // Captured under the lock: the deadline below must reason about THESE
     // encoders, never whichever objects the fields hold when it fires.
@@ -648,6 +807,12 @@ class GCSegmentedRecorderModule : Module() {
       Log.w(TAG, "GC_P2_GATE finalize_ignored stale gen=$gen current=${sessionGen.get()}")
       return
     }
+    // Drop any armed rotation before the objects it would touch are cleared.
+    // The generation guard would already neutralise it, but leaving a runnable
+    // queued against a released session is exactly the kind of state this
+    // module refuses to keep.
+    cancelPendingRotation()
+
     coordinator = null
     video = null
     audio = null

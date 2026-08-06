@@ -28,9 +28,23 @@ import GCSegmentedRecorder, {
  * of this file. It is deliberately not exported: mounting it is what creates
  * the native preview surface, so only the access wrapper may do so.
  */
+/**
+ * Harness presets. `DEFAULT` is not merely a preset — passing it must produce
+ * byte-for-byte the historical session, so it restates the native defaults
+ * rather than omitting them, and any drift between the two shows up as a
+ * behaviour change in the very first validation run.
+ */
+const HARNESS_PRESETS = {
+  DEFAULT: { rotateAtMs: 3_000, rotationIntervalMs: 0, sessionMs: 7_000 },
+  SHORT_CONTINUITY: { rotateAtMs: 3_000, rotationIntervalMs: 3_000, sessionMs: 20_000 },
+} as const;
+
+type PresetName = keyof typeof HARNESS_PRESETS;
+
 function DebugP2GateScreen() {
   const [permission, requestPermission] = useCameraPermissions();
   const [micPermission, requestMicPermission] = useMicrophonePermissions();
+  const [preset, setPreset] = useState<PresetName>('DEFAULT');
   const [running, setRunning] = useState(false);
   const [lines, setLines] = useState<string[]>([]);
   const [segments, setSegments] = useState<SegmentClosedEvent[]>([]);
@@ -108,9 +122,13 @@ function DebugP2GateScreen() {
     // `setLines([])` above wipes the "[run N] start() entered" line, so the id
     // is restated here: on a run that reaches this point it is the first line
     // on screen, and on a denied run the "entered" line survives instead.
-    log(`[run ${run}] start ${id}`);
+    const opts = HARNESS_PRESETS[preset];
+    log(
+      `[run ${run}] start ${id} preset=${preset} ` +
+        `rotateAt=${opts.rotateAtMs} interval=${opts.rotationIntervalMs} session=${opts.sessionMs}`,
+    );
     try {
-      await GCSegmentedRecorder.startSegmentedCapture(id);
+      await GCSegmentedRecorder.startSegmentedCapture(id, opts);
     } catch (err) {
       log(`[run ${run}] start threw: ${String(err)}`);
       setRunning(false);
@@ -131,6 +149,30 @@ function DebugP2GateScreen() {
       <Text style={{ color: '#c9d1d9', fontSize: 16, fontWeight: '700', marginBottom: 8 }}>
         P2 early gate — segmented capture
       </Text>
+
+      <View style={{ flexDirection: 'row', gap: 8, marginBottom: 8 }}>
+        {(Object.keys(HARNESS_PRESETS) as PresetName[]).map((p) => (
+          <Pressable
+            key={p}
+            onPress={() => setPreset(p)}
+            disabled={running}
+            style={{
+              flex: 1,
+              paddingVertical: 8,
+              borderRadius: 6,
+              alignItems: 'center',
+              borderWidth: 1,
+              borderColor: preset === p ? '#58a6ff' : '#30363d',
+              backgroundColor: preset === p ? '#12263f' : 'transparent',
+              opacity: running ? 0.5 : 1,
+            }}
+          >
+            <Text style={{ color: preset === p ? '#58a6ff' : '#8b949e', fontSize: 11 }}>
+              {p}
+            </Text>
+          </Pressable>
+        ))}
+      </View>
 
       <View style={{ height: 220, backgroundColor: '#000', marginBottom: 8 }}>
         <GCSegmentedCameraView style={{ flex: 1 }} />

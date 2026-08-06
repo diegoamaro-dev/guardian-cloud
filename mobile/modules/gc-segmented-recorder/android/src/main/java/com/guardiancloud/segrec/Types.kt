@@ -161,9 +161,48 @@ data class CaptureConfig(
   val audioSampleRate: Int = 44_100,
   val audioChannels: Int = 1,
   val audioBitrate: Int = 64_000,
+  /** Delay from camera-open to the FIRST rotation. */
   val rotateAtMs: Long = 3_000,
+  /**
+   * Delay from a segment closing to the NEXT rotation.
+   *
+   * `0` means no further rotations, which is exactly the historical behaviour:
+   * one rotation at [rotateAtMs] and two segments. Any positive value chains
+   * rotations for as long as the session lasts.
+   *
+   * It is measured from the segment-closed callback, not from a wall clock, so
+   * the effective period is this value plus however long the muxer stop and the
+   * stability check took. That is deliberate: a closed, stability-verified
+   * segment is the only evidence available that the previous rotation actually
+   * finished, and chaining from it is what guarantees a single rotation in
+   * flight.
+   */
+  val rotationIntervalMs: Long = 0,
   val sessionMs: Long = 7_000,
 )
+
+/**
+ * Bounds for the harness parameters a diagnostic caller may override.
+ *
+ * These are NOT product limits. They exist so that a typo in the debug route
+ * cannot arm a rotation every five milliseconds, or a twelve-hour session, on a
+ * device that is holding evidence. Anything outside them is rejected before a
+ * session is accepted, with no resource allocated.
+ */
+object HarnessBounds {
+  const val MIN_ROTATE_AT_MS = 1_000L
+  const val MAX_ROTATE_AT_MS = 600_000L
+
+  /** 0 is legal and means "do not rotate again"; otherwise this floor applies. */
+  const val MIN_ROTATION_INTERVAL_MS = 1_000L
+  const val MAX_ROTATION_INTERVAL_MS = 600_000L
+
+  const val MIN_SESSION_MS = 2_000L
+  const val MAX_SESSION_MS = 3_600_000L
+
+  /** The session must outlast its first rotation by at least this much. */
+  const val MIN_TAIL_AFTER_FIRST_ROTATION_MS = 1_000L
+}
 
 /**
  * Immutable per-segment metrics snapshot.

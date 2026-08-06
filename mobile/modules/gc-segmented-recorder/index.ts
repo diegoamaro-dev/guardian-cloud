@@ -14,6 +14,7 @@ import type { ViewProps } from 'react-native';
 import type {
   CaptureErrorEvent,
   CaptureReleasedEvent,
+  GateHarnessOptions,
   GCSegmentedRecorderEvents,
   SegmentClosedEvent,
 } from './src/GCSegmentedRecorder.types';
@@ -21,13 +22,23 @@ import type {
 export type {
   CaptureErrorEvent,
   CaptureReleasedEvent,
+  GateHarnessOptions,
   GCSegmentedRecorderEvents,
   SegmentClosedEvent,
 };
 
 type GCSegmentedRecorderModuleType = {
-  /** Opens the camera, starts both encoders, and runs the gate session. */
-  startSegmentedCapture(sessionId: string): Promise<void>;
+  /**
+   * Opens the camera, starts both encoders, and runs the gate session.
+   *
+   * `options` is a diagnostic harness override and must only be passed from
+   * `/debug-p2-gate`, which does not exist in a release bundle. Called with the
+   * session id alone it behaves exactly as it always has.
+   */
+  startSegmentedCapture(
+    sessionId: string,
+    options?: GateHarnessOptions,
+  ): Promise<void>;
   /** Idempotent. Closes the active segment and releases the camera. */
   stopSegmentedCapture(): Promise<void>;
   /** Diagnostic read of the coordinator state machine. */

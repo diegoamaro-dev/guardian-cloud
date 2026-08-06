@@ -4,6 +4,31 @@
  * Not production code. Lives only on `spike/video-p2-early-gate`.
  */
 
+/**
+ * DIAGNOSTIC-ONLY harness overrides for `startSegmentedCapture`.
+ *
+ * Only `/debug-p2-gate` passes these, and that route renders nothing outside a
+ * development build. Omitting the argument — what any other caller does —
+ * reproduces the historical session exactly: one rotation at 3 s, stop at 7 s,
+ * two segments.
+ *
+ * Every value is validated natively against `HarnessBounds` and an out-of-range
+ * value REJECTS the start rather than being clamped, so a harness run can never
+ * silently differ from what was asked for.
+ */
+export type GateHarnessOptions = {
+  /** Delay from camera-open to the first rotation. Default 3000. */
+  rotateAtMs?: number;
+  /**
+   * Delay from a segment closing to the next rotation. `0` (the default) means
+   * no further rotations. Measured from the segment-closed callback, so the
+   * effective period includes the muxer stop and the stability check.
+   */
+  rotationIntervalMs?: number;
+  /** Total session duration before the ordered stop. Default 7000. */
+  sessionMs?: number;
+};
+
 /** Emitted when a segment has been closed AND verified stable on disk. */
 export type SegmentClosedEvent = {
   sessionId: string;
