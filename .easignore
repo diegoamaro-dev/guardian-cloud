@@ -1,0 +1,200 @@
+# =============================================================================
+# Guardian Cloud — EAS Build upload filter
+# =============================================================================
+#
+# WARNING: .easignore REPLACES .gitignore for EAS uploads. It does not layer on
+# top, and EAS does not appear to honour nested .gitignore files either. Every
+# protection that lives in the root .gitignore AND in mobile/.gitignore,
+# mobile/android/.gitignore, mobile/ios/.gitignore, app/.gitignore and
+# backend/.gitignore is therefore restated here. Deleting a line here can put a
+# secret, an evidence file or 260 MB of object code into a remote upload.
+#
+# Measured before this file existed: 983 files, 291 MB, of which
+# mobile/android/app/.cxx was 260 MB, .git 15 MB and "Pagina web" 10 MB.
+#
+# What must NEVER be excluded:
+#   - mobile/android/**            the Expo Android project AND the native
+#                                  gc-segmented-recorder module
+#   - mobile/app/**                expo-router routes (note the anchored /app/
+#                                  rule below targets the ROOT app/ only)
+#   - mobile/package.json, package-lock.json, app.config.ts, eas.json,
+#     tsconfig.json, metro.config.js, babel.config.js
+#   - spike/p2/*.js, *.md, *.sha256   three of the 21 checkpoint files live here
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# 1. FROM THE ROOT .gitignore — reproduced in full
+# -----------------------------------------------------------------------------
+
+# General
+.DS_Store
+*.log
+logs/
+tmp/
+*.tmp
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Node / backend
+node_modules/
+dist/
+build/
+coverage/
+
+# Expo / React Native
+.expo/
+.expo-shared/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Metro
+.metro-cache
+
+# Android
+android/app/build/
+android/.gradle/
+android/local.properties
+mobile/android/app/src/main/assets/index.android.bundle
+
+# iOS
+ios/Pods/
+ios/build/
+
+# SQLite / local data
+*.db
+*.sqlite
+*.sqlite3
+
+# Uploads / recordings — audiovisual evidence must never leave the machine
+captures/
+recordings/
+*.aac
+*.m4a
+*.mp4
+
+# Forensic evidence recovered from devices
+recovered_evidence/
+
+# ngrok / temporary URLs
+*.ngrok
+ngrok.yml
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# System
+Thumbs.db
+
+# Local dev noise
+.claude/
+.gradle/
+_deltas/
+local.properties
+
+
+# -----------------------------------------------------------------------------
+# 2. FROM NESTED .gitignore FILES — EAS does not read these, so restate them
+# -----------------------------------------------------------------------------
+
+# mobile/.gitignore
+web-build/
+expo-env.d.ts
+*.orig.*
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+.metro-health-check*
+*.pem
+.env.local
+.env*.local
+*.tsbuildinfo
+
+# mobile/android/.gitignore — .cxx is THE big one: 637 files, 260 MB of stale
+# CMake object code from a local Debug build. EAS regenerates all of it
+# remotely, and the CMakeCache.txt / build.ninja inside carry local absolute
+# paths.
+.cxx/
+*.hprof
+*.jsbundle
+
+# mobile/ios/.gitignore
+*.pbxuser
+!default.pbxuser
+*.mode1v3
+!default.mode1v3
+*.mode2v3
+!default.mode2v3
+*.perspectivev3
+!default.perspectivev3
+xcuserdata
+*.xccheckout
+*.moved-aside
+DerivedData
+*.hmap
+
+
+# -----------------------------------------------------------------------------
+# 3. EAS-ONLY EXCLUSIONS — never wanted in a remote build context
+# -----------------------------------------------------------------------------
+
+# Full git history. 15 MB, and it carries every secret ever committed plus the
+# entire audit trail. A build machine has no use for it.
+.git/
+/.git
+/.git/**
+**/.git/**
+
+# Archives. "Pagina web/Guardian Cloud pagina web.zip" alone is 7.9 MB.
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
+
+# Marketing site. 10 MB, unrelated to the Android build.
+/Pagina web/
+
+# Three tracked files created by mistyped `git stash` commands, plus a stray
+# note. Excluded from the upload only — they are NOT being deleted or
+# untracked here; that is separate historical cleanup.
+/tash push -u -m wip remaining mobile assets docs
+/tash show --stat
+/table-nas-routing
+
+# Unrelated root-level Android project. `settings.gradle.kts` declares
+# rootProject.name = "guardian-cloud" and never includes mobile/android;
+# mobile/android carries its own self-sufficient wrapper and settings.gradle.
+# Leading slashes are mandatory: a bare `app/` would also match mobile/app/.
+/app/
+/build.gradle.kts
+/settings.gradle.kts
+/gradle/
+/gradlew
+/gradlew.bat
+/gradle.properties
+
+# Orphan lockfile: there is no package.json at the repository root, so npm
+# never reads it. mobile/package-lock.json is the real one and stays.
+/package-lock.json
+
+# Documentation and non-build directories. Not needed to compile Android, and
+# docs/ additionally carries absolute local paths and a legacy personal email.
+/docs/
+/playbook/
+/strategy/
+/backend/
+/REBUILD.md
+/rebuild-mobile.sh
+/CLAUDE.md
+/CLAUDE_PRETASK_CHECK.md
+/AGENTS.md
