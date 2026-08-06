@@ -1,0 +1,8 @@
+0b32f698ca2d2d7de31dba3d53d4b875bba5ae21388d92c89c46ceef2e3ceacd *builds/gradle-minimal-format.log
+bd3155905492c5b340e53c8dd0a08d53ca216ad70213c428bcef945ca86144be *smoke-2/logcat-gate-smoke-2.log
+6bae0b7148198420a38c1ff63a7dabd73c8cca4bd303a48b41c54bef7c5035c0 *smoke-3/logcat-gate-smoke-3.log
+5d020ecda2f16ecd10e25f7d250e1127c17c4b684f602aa3055bef50b753aeb7 *smoke-3/seg_000-smoke-3-incomplete.mp4
+bf1cdb9ff23a2ab7773ff9fa449c85c2cc37e78ea82a6cc36a45bd63d0f91594 *smoke-4/logcat-gate-smoke-4.log
+9ae50421eb70e788463e2947f22c9e712b5b903b7d8e2708f36d8668fabbe9af *smoke-4/metro-5.log
+1bfa61d1c86cfd353d7fde91ad466349589e06f36c226db688dde5e5bcce9ae5 *smoke-4/seg_000-smoke-4.mp4
+a3e5b1c1b33b63111e752c9583d814ae642349afca0c709397acab48a30835a9 *smoke-4/seg_001-smoke-4.mp4
