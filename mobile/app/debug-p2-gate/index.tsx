@@ -37,6 +37,7 @@ import GCSegmentedRecorder, {
 const HARNESS_PRESETS = {
   DEFAULT: { rotateAtMs: 3_000, rotationIntervalMs: 0, sessionMs: 7_000 },
   SHORT_CONTINUITY: { rotateAtMs: 3_000, rotationIntervalMs: 3_000, sessionMs: 20_000 },
+  LONG_ROTATION: { rotateAtMs: 3_000, rotationIntervalMs: 3_000, sessionMs: 600_000 },
 } as const;
 
 type PresetName = keyof typeof HARNESS_PRESETS;
