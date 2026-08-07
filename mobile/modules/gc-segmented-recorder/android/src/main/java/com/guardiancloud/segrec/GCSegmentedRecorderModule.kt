@@ -2,6 +2,7 @@ package com.guardiancloud.segrec
 
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import expo.modules.kotlin.modules.Module
 import expo.modules.kotlin.modules.ModuleDefinition
@@ -258,7 +259,7 @@ class GCSegmentedRecorderModule : Module() {
       Log.i(
         TAG,
         "GC_P2_GATE harness_rotation_requested n=$rotationsRequested " +
-          "delay_ms=$delayMs gen=$gen",
+          "delay_ms=$delayMs gen=$gen mono_ns=${SystemClock.elapsedRealtimeNanos()}",
       )
       v.requestSyncFrame()
       c.requestRotation()
@@ -382,7 +383,7 @@ class GCSegmentedRecorderModule : Module() {
     Log.i(
       TAG,
       "GC_P2_GATE session_start id=$id alignment_quality=${ck.alignmentQuality} " +
-        "audio_timebase=${ck.audioTimebase}",
+        "audio_timebase=${ck.audioTimebase} mono_ns=${SystemClock.elapsedRealtimeNanos()}",
     )
 
     val coord = SegmentCoordinator(
@@ -837,7 +838,8 @@ class GCSegmentedRecorderModule : Module() {
       sessionActive = false
       Log.i(
         TAG,
-        "GC_P2_GATE session_released gen=$gen id=$closingSessionId resources_freed=true",
+        "GC_P2_GATE session_released gen=$gen id=$closingSessionId resources_freed=true " +
+          "mono_ns=${SystemClock.elapsedRealtimeNanos()}",
       )
       main.post {
         sendEvent(

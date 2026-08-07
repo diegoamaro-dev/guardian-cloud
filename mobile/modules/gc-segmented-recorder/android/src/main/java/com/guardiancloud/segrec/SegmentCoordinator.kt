@@ -496,7 +496,8 @@ class SegmentCoordinator(
       TAG,
       "GC_P2_GATE rotation_complete cut_pts_us=$cutPtsUs " +
         "audio_tail_us=$closingTailUs audio_lead_us=$pendingLead " +
-        "kf_wait_ms=$closingKfWaitMs watermark_wait_ms=$closingWatermarkMs",
+        "kf_wait_ms=$closingKfWaitMs watermark_wait_ms=$closingWatermarkMs " +
+        "mono_ns=${SystemClock.elapsedRealtimeNanos()}",
     )
   }
 
@@ -615,7 +616,8 @@ class SegmentCoordinator(
               Log.i(
                 TAG,
                 "GC_P2_GATE segment_stable index=${snapshot.segmentIndex} " +
-                  "size=${s0.first} sha256=${s0.second}",
+                  "size=${s0.first} sha256=${s0.second} " +
+                  "mono_ns=${SystemClock.elapsedRealtimeNanos()}",
               )
               onSegmentClosed(snapshot, file)
             } else {
