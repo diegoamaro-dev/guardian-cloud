@@ -615,8 +615,18 @@ class SegmentCoordinator(
             if (stable) {
               Log.i(
                 TAG,
+                // `coord_*_dropped` are samples the coordinator's state machine
+                // REJECTED — they are not encoder drops and not muxer drops.
+                // Duplication is deliberately absent: audioFramesDuplicated is
+                // never incremented anywhere, so printing it would be a
+                // structural zero, and there is no video equivalent.
                 "GC_P2_GATE segment_stable index=${snapshot.segmentIndex} " +
                   "size=${s0.first} sha256=${s0.second} " +
+                  "coord_audio_dropped=${snapshot.audioFramesDropped} " +
+                  "coord_video_dropped=${snapshot.videoFramesDropped} " +
+                  "pending_stability=$pendingStability " +
+                  "queue_peak_entries=${snapshot.queuePeakEntries} " +
+                  "queue_peak_bytes=${snapshot.queuePeakBytes} " +
                   "mono_ns=${SystemClock.elapsedRealtimeNanos()}",
               )
               onSegmentClosed(snapshot, file)
@@ -856,7 +866,14 @@ class SegmentCoordinator(
     val cb = onFullyReleased
     onFullyReleased = null
     releaseRequested = false
-    Log.i(TAG, "GC_P2_GATE release_complete segments=$segmentIndex state=$rawState")
+    // pendingStability is printed here too so P5 is checkable at the close: it
+    // must be 0 at this point, and until now that could only be inferred from
+    // the fact that maybeFinishRelease() reached this line at all.
+    Log.i(
+      TAG,
+      "GC_P2_GATE release_complete segments=$segmentIndex state=$rawState " +
+        "pending_stability=$pendingStability",
+    )
     cb?.invoke()
     handler.post { thread.quitSafely() }
     auxHandler.post { auxThread.quitSafely() }
