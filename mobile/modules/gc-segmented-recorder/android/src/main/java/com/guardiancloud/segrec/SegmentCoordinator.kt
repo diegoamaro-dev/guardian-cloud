@@ -460,8 +460,15 @@ class SegmentCoordinator(
 
     val aacFrameUs = 1024L * 1_000_000L / config.audioSampleRate
     val lastAacBefore = before.lastOrNull { it.kind == TrackKind.AUDIO }
+    // `raw` is hoisted ONLY so it can be logged. The value assigned to
+    // audioTailUs is byte-for-byte the previous expression: the clamp and the
+    // null branch are unchanged. A logged tail of 0 is otherwise ambiguous —
+    // it means either raw == 0 (a perfect boundary) or raw < 0 / no frame at
+    // all (a real gap), and the clamp destroys the difference.
+    val rawAudioTailUs =
+      if (lastAacBefore != null) lastAacBefore.ptsUs + aacFrameUs - cutPtsUs else 0L
     metrics.audioTailUs =
-      if (lastAacBefore != null) maxOf(0L, lastAacBefore.ptsUs + aacFrameUs - cutPtsUs) else 0L
+      if (lastAacBefore != null) maxOf(0L, rawAudioTailUs) else 0L
 
     // audioLead comes from the FIRST REAL AAC of segment 2, taken after the
     // barrier — not from whatever happened to be queued when the keyframe hit.
@@ -474,6 +481,8 @@ class SegmentCoordinator(
     val closingTailUs = metrics.audioTailUs
     val closingWatermarkMs = metrics.audioWatermarkWaitMs
     val closingKfWaitMs = metrics.keyframeWaitMs
+    val closingRawTailUs = rawAudioTailUs
+    val closingNoAacBefore = lastAacBefore == null
 
     if (!closeCurrentSegment()) return
 
@@ -497,6 +506,7 @@ class SegmentCoordinator(
       "GC_P2_GATE rotation_complete cut_pts_us=$cutPtsUs " +
         "audio_tail_us=$closingTailUs audio_lead_us=$pendingLead " +
         "kf_wait_ms=$closingKfWaitMs watermark_wait_ms=$closingWatermarkMs " +
+        "raw_audio_tail_us=$closingRawTailUs no_aac_before=$closingNoAacBefore " +
         "mono_ns=${SystemClock.elapsedRealtimeNanos()}",
     )
   }
