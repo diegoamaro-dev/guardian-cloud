@@ -343,7 +343,10 @@ describe('full chunk lifecycle: pending → uploading → uploaded', () => {
     await queueAppendNewSession(emptyEntry());
     await queueAppendChunk(SID, pendingChunk(0), null, 1);
 
-    // Worker marks failed (permanent) → base64Slice purged → no longer work
+    // Exercises the queue PRIMITIVE, not worker policy: the caller
+    // passes `base64Slice: undefined` explicitly here. Since phase 1A
+    // the worker itself only clears bytes after a confirmed upload —
+    // see evidencePreservation.test.ts for that rule.
     await queueUpdateChunk(SID, 0, {
       status: 'failed',
       base64Slice: undefined,

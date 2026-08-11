@@ -3,9 +3,14 @@
  * upload worker uses to decide whether a chunk failure should retry
  * (transient) or be marked terminal (permanent).
  *
- * Critical guarantee: anything classified `permanent` causes the
- * worker to drop `base64Slice` and lose the bytes. Anything misclassified
- * as permanent loses evidence. So the precedence rules really do matter.
+ * SCOPE NOTE (phase 1A): `classifyError` is no longer the worker's
+ * first decision point, and `permanent` no longer drops `base64Slice`
+ * — evidence is only released after a confirmed remote upload. The
+ * worker now consults `classifyFailure` (src/upload/errorPolicy.ts)
+ * first, which pauses on anything it cannot positively recognise as a
+ * transport fault; see errorPolicy.test.ts. The expectations below
+ * still describe `classifyError` accurately and are unchanged — they
+ * simply no longer describe what happens to the bytes.
  */
 
 import { describe, it, expect } from 'vitest';

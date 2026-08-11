@@ -42,6 +42,18 @@ import {
   subscribePreferredDestinationChange,
 } from '@/destinations/preference';
 import { ApiError } from '@/api/client';
+import { classifyFailure, type FailureDecision } from '@/upload/errorPolicy';
+import {
+  ensureReady as ensurePauseReady,
+  getSnapshot as getPauseSnapshot,
+  isDestinationBlocked,
+  isGloballyBlocked,
+  readState as readPauseState,
+  registerAuthRestoreHandler,
+  writeState as writePauseState,
+  PAUSE_POLICY_VERSION,
+  type GlobalPauseState,
+} from '@/upload/pauseStore';
 import { listSessionChunks } from '@/api/export';
 import { useAuthStore, getFreshAccessToken } from '@/auth/store';
 import { appendHistoryEntry, type SessionMode } from '@/api/history';
@@ -667,6 +679,30 @@ export interface PendingQueueEntry {
    * absence of the field is a meaningful "wasn't bound" signal.
    */
   destination_type?: DestinationType | undefined;
+  /**
+   * PHASE 1A — entry-scoped upload block.
+   *
+   * Set when a failure is unrepairable by repeating the same request
+   * but affects only this session (`409 SESSION_NOT_ACTIVE`) or is not
+   * recognised at all (`UNCLASSIFIED_PAUSE`). While present, the worker
+   * skips this entry entirely.
+   *
+   * This is a SELECTION filter, not a terminal state: the chunks stay
+   * `pending` and keep their bytes, hash and index, so the entry
+   * resumes intact the moment the pause is lifted. Nothing about the
+   * chunk format changes — the flag lives on the entry, never on
+   * `QueueChunk`.
+   *
+   * Optional for backward compatibility: entries written before this
+   * field existed simply have no pause, which is the correct default.
+   */
+  paused?:
+    | {
+        reason: 'SESSION_STATE_PAUSE' | 'UNCLASSIFIED_PAUSE';
+        at: number;
+        code?: string | undefined;
+      }
+    | undefined;
 }
 
 const CHUNK_TICK_MS = 1500;
@@ -1227,10 +1263,17 @@ export async function normalizeQueueOnRecovery(): Promise<NormalizationReport> {
           for (const c of group) {
             if (seenHashes.has(c.hash)) continue;
             seenHashes.add(c.hash);
+            // PHASE 1A: `base64Slice` is deliberately NOT cleared here.
+            // This branch runs on chunks the loop above has already
+            // confirmed have NO surviving upload (the `uploadedKept`
+            // check took the confirmed ones out). Pruning them meant
+            // recovery itself destroyed evidence that never reached the
+            // backend — the exact opposite of what recovery is for.
+            // Bytes, hash, index and size are all retained; only the
+            // status and the diagnostic error are set.
             finalChunks.push({
               ...c,
               status: 'failed',
-              base64Slice: undefined,
               last_error: {
                 status: 0,
                 code: 'CORRUPT_HASH_DIVERGENCE',
@@ -1874,8 +1917,19 @@ interface NextPick {
   destinationType?: DestinationType | undefined;
 }
 
-async function pickNext(queue: PendingQueueEntry[]): Promise<NextPick | null> {
+export async function pickNext(
+  queue: PendingQueueEntry[],
+  pause: GlobalPauseState,
+): Promise<NextPick | null> {
   for (const entry of queue) {
+    // PHASE 1A: pause filters live in SELECTION, not in chunk status.
+    // A paused entry keeps every chunk `pending` with its bytes intact
+    // — we simply do not choose it. That is what makes a pause fully
+    // reversible with no reconstruction when it is lifted.
+    if (entry.paused) continue;
+    if (isDestinationBlocked(pause, entry.destination_type ?? activeDestinationType)) {
+      continue;
+    }
     const candidate = entry.chunks
       .filter(c => c.status === 'pending')
       .sort((a, b) => a.chunk_index - b.chunk_index)[0];
@@ -1905,12 +1959,139 @@ async function pickNext(queue: PendingQueueEntry[]): Promise<NextPick | null> {
   return null;
 }
 
-async function uploadDrainLoop(): Promise<void> {
+/**
+ * PHASE 1A — persist a pause decision, plus the diagnostic error that
+ * caused it, in ONE serialized mutation.
+ *
+ * Everything runs inside `queueMutate` so the pause key and `GC_QUEUE`
+ * are written under the same `writeChain`. That is what makes "a new
+ * entry cannot slip past an existing global pause" true by
+ * construction: an append and a pause write can never interleave.
+ *
+ * Note what this function never does: it never clears `base64Slice`,
+ * never clears `local_uri`, never changes `hash` / `chunk_index` /
+ * `size`, and never moves a chunk out of `pending`. A pause is a
+ * selection filter, not a terminal state.
+ */
+async function persistFailurePause(
+  sessionId: string,
+  chunkIndex: number,
+  destinationType: DestinationType,
+  failure: Extract<FailureDecision, { kind: 'pause' }>,
+): Promise<void> {
+  await queueMutate(async (queue) => {
+    const entry = queue.find(e => e.session_id === sessionId);
+
+    // The worker flips the chunk to 'uploading' before the attempt. A
+    // pause must hand it back as 'pending', otherwise the chunk is
+    // stranded in the stuck-uploading state that boot recovery has to
+    // repair — and it would not be picked up when the pause lifts.
+    // `attempts` is deliberately NOT incremented: a pause is not a
+    // failed try, and letting it drive backoff would reintroduce the
+    // escalation we are removing.
+    const chunk = entry?.chunks.find(c => c.chunk_index === chunkIndex);
+    if (chunk && chunk.status === 'uploading') {
+      chunk.status = 'pending';
+    }
+
+    if (failure.scope === 'ENTRY') {
+      if (entry) {
+        entry.paused = {
+          reason:
+            failure.reason === 'SESSION_STATE_PAUSE'
+              ? 'SESSION_STATE_PAUSE'
+              : 'UNCLASSIFIED_PAUSE',
+          at: Date.now(),
+          code: failure.code,
+        };
+      }
+      return;
+    }
+
+    const current = await readPauseState();
+    const next: GlobalPauseState = {
+      ...current,
+      destinations: { ...current.destinations },
+    };
+    if (failure.scope === 'DESTINATION') {
+      next.destinations[destinationType] = {
+        at: Date.now(),
+        code: failure.code,
+      };
+    } else if (failure.reason === 'SYSTEMIC_CONFIG_PAUSE') {
+      next.systemic = {
+        at: Date.now(),
+        code: failure.code,
+        policy_version: PAUSE_POLICY_VERSION,
+      };
+    } else {
+      next.client_auth = { at: Date.now(), code: failure.code };
+    }
+    await writePauseState(next);
+  });
+}
+
+/**
+ * Test-only seam. `destinationResolved` / `activeDestinationType` are
+ * normally assigned by the component's `refreshDestination`, which
+ * cannot run headless. Exposed so the worker's pause behaviour can be
+ * exercised past the destination race-guard. Never called by
+ * production code.
+ */
+export function _setDrainPreconditionsForTests(opts: {
+  destinationResolved?: boolean;
+  activeDestinationType?: DestinationType;
+}): void {
+  if (opts.destinationResolved !== undefined) {
+    destinationResolved = opts.destinationResolved;
+  }
+  if (opts.activeDestinationType !== undefined) {
+    activeDestinationType = opts.activeDestinationType;
+  }
+}
+
+export async function uploadDrainLoop(): Promise<void> {
   if (DEBUG_QUEUE) console.log('GC_DEBUG drain called', { isDraining });
   if (isDraining) {
     if (DEBUG_QUEUE) console.log('GC_DEBUG drain skipped — isDraining=true');
     return;
   }
+  // Single-flight claim MUST stay synchronous with the check above.
+  // PHASE 1A introduces an `await` (pause hydration) before any network
+  // work; taking the flag first is what keeps two concurrent callers
+  // from both entering. Everything from here is wrapped so the flag is
+  // always released — see the outer `finally`.
+  isDraining = true;
+  try {
+    return await drainWithPauseGuard();
+  } finally {
+    isDraining = false;
+  }
+}
+
+/**
+ * PHASE 1A gate in front of the historical drain body.
+ *
+ * Nothing in this function may issue a network request before the
+ * persisted pause state has been read from disk. On a cold start the
+ * previous process may have paused for `NO_TOKEN` or `BODY_TOO_LARGE`;
+ * firing a request before hydrating would re-open the retry storm on
+ * every app launch. The background drain enters through the same
+ * `uploadDrainLoop`, so it inherits this gate — no separate wiring.
+ */
+async function drainWithPauseGuard(): Promise<void> {
+  const pause = await ensurePauseReady();
+  if (isGloballyBlocked(pause)) {
+    console.log('GC_QUEUE blocked: global pause', {
+      client_auth: pause.client_auth?.code ?? null,
+      systemic: pause.systemic?.code ?? null,
+    });
+    return;
+  }
+  return drainBody(pause);
+}
+
+async function drainBody(pause: GlobalPauseState): Promise<void> {
   // Hard race-guard: refuse to route any chunk until `refreshDestination`
   // has resolved the active destination at least once. Without this,
   // boot/recovery would happily drain pending chunks against the default
@@ -1923,7 +2104,8 @@ async function uploadDrainLoop(): Promise<void> {
     console.log('GC_QUEUE blocked: destination not resolved');
     return;
   }
-  isDraining = true;
+  // `isDraining` is claimed by `uploadDrainLoop` before it awaits, and
+  // released in its `finally`. This body must not touch it.
   if (DEBUG_QUEUE) console.log('GC_DEBUG drain entered loop');
   try {
     while (true) {
@@ -1932,7 +2114,7 @@ async function uploadDrainLoop(): Promise<void> {
       // applicable). Pure observation; no behavior change.
       const t_pickStart = Date.now();
       const queue = await queueRead();
-      const pick = await pickNext(queue);
+      const pick = await pickNext(queue, pause);
       perfLog('GC_PERF_DRAIN_PICK', {
         ms: Date.now() - t_pickStart,
         found: pick !== null,
@@ -1944,6 +2126,30 @@ async function uploadDrainLoop(): Promise<void> {
           : {}),
       });
       if (!pick) {
+        // PHASE 1A: distinguish "nothing left to do" from "everything
+        // left is paused". Without this the idle branch below sees a
+        // non-empty queue, concludes there is residual work, and spins
+        // on a 150ms sleep forever — a wakeup/battery hot loop standing
+        // in for the network one we just removed. If every remaining
+        // entry is blocked, there is nothing this pass can ever pick:
+        // exit and wait for a restoration event.
+        const blockedCheck = await queueRead();
+        const allBlocked =
+          blockedCheck.length > 0 &&
+          blockedCheck.every(
+            e =>
+              e.paused !== undefined ||
+              isDestinationBlocked(
+                pause,
+                e.destination_type ?? activeDestinationType,
+              ),
+          );
+        if (allBlocked) {
+          console.log('GC_QUEUE drain exit — all remaining entries paused', {
+            entries: blockedCheck.length,
+          });
+          return;
+        }
         // Nothing pending. Try to finalize any closed session whose chunks
         // are all done, then check if any session is still recording.
         const finalized = await tryFinalizeReadySessions();
@@ -2085,11 +2291,40 @@ async function uploadDrainLoop(): Promise<void> {
             destination_type: sessionDestinationType,
             size: chunk.size,
           });
+          // PHASE 1A — runtime validation of the confirmation token.
+          //
+          // `uploadChunkBytes` ends in `return parsed as
+          // DriveChunkUploadResponse` (src/api/destinations.ts) — a bare
+          // TypeScript cast over whatever the response body parsed to.
+          // There is NO runtime check there, so a 2xx carrying `{}`,
+          // `null`, or `remote_reference: ""` reaches us as a
+          // structurally invalid confirmation. Without this guard the
+          // worker would mark the chunk uploaded, drop `base64Slice`,
+          // delete `local_uri`, and leave the completion gate stuck
+          // forever on a chunk with no reference — evidence destroyed
+          // in exchange for nothing.
+          //
+          // A 2xx is necessary but NOT sufficient. The reference itself
+          // must be a non-empty string before anything local is
+          // released. Anything else is treated as a failed attempt:
+          // UNCLASSIFIED_PAUSE at entry scope, bytes untouched, and
+          // `postChunk` is never told the chunk is uploaded.
+          const remoteRef = (
+            drive as { remote_reference?: unknown } | null | undefined
+          )?.remote_reference;
+          if (typeof remoteRef !== 'string' || remoteRef.trim().length === 0) {
+            throw new ApiError(
+              0,
+              'REMOTE_REFERENCE_INVALID',
+              'Upload returned 2xx without a usable remote_reference',
+              null,
+            );
+          }
           if (DEBUG_QUEUE) {
             console.log('GC_DEBUG after uploadChunkBytes', {
               sessionId,
               chunk_index: chunk.chunk_index,
-              remote_reference: drive.remote_reference,
+              remote_reference: remoteRef,
             });
           }
           // GC_PERF_DRAIN_POST_CHUNKS isolates the metadata leg (mobile →
@@ -2101,24 +2336,58 @@ async function uploadDrainLoop(): Promise<void> {
             sessionId,
             { chunk_index: chunk.chunk_index, hash: chunk.hash, size: chunk.size },
             'uploaded',
-            drive.remote_reference,
+            // The validated value, not the raw response field, so the
+            // guard above cannot be bypassed by a later edit.
+            remoteRef,
           );
           perfLog('GC_PERF_DRAIN_POST_CHUNKS', {
             ms: Date.now() - t_postStart,
             session_id: sessionId,
             chunk_index: chunk.chunk_index,
           });
-          await queueUpdateChunk(sessionId, chunk.chunk_index, {
-            status: 'uploaded',
-            base64Slice: undefined,           // poda
-            remote_reference: drive.remote_reference,
-            last_error: undefined,
-          });
+          // PHASE 1A — the ONLY legal place in the codebase where local
+          // bytes may be released. Ordering is a hard requirement, not
+          // an optimisation:
+          //
+          //   2xx received
+          //     → remote_reference present
+          //       → 'uploaded' + remote_reference DURABLY persisted
+          //         → and only then may bytes/files be dropped.
+          //
+          // If this write throws (CursorWindow, storage full, ...) the
+          // remote copy exists but we have no durable record of it. We
+          // must NOT delete anything: the queue on disk still says
+          // pending, so the chunk will be retried and the backend's
+          // dedup will absorb it. Deleting here would strand evidence
+          // that our own queue no longer knows is safe.
+          let confirmationPersisted = false;
+          try {
+            await queueUpdateChunk(sessionId, chunk.chunk_index, {
+              status: 'uploaded',
+              base64Slice: undefined,         // released: confirmed remote
+              remote_reference: remoteRef,
+              last_error: undefined,
+            });
+            confirmationPersisted = true;
+          } catch (persistErr) {
+            console.log('GC_QUEUE_CONFIRMED_PERSIST_FAILED', {
+              sessionId,
+              chunk_index: chunk.chunk_index,
+              remote_reference: remoteRef,
+              err:
+                persistErr instanceof Error
+                  ? persistErr.message
+                  : String(persistErr),
+            });
+            // Surface to the outer catch so the chunk is re-attempted.
+            // Local bytes and local_uri are untouched.
+            throw persistErr;
+          }
           if (chunk.chunk_index === 0) {
             perfLog('GC_PERF_FIRST_CHUNK_UPLOADED', {
               session_id: sessionId,
               destination_type: sessionDestinationType,
-              remote_reference: drive.remote_reference,
+              remote_reference: remoteRef,
             });
           }
           // Best-effort cleanup of the on-disk video payload. The file
@@ -2126,7 +2395,10 @@ async function uploadDrainLoop(): Promise<void> {
           // backend AND in Drive; leaving it would just consume disk
           // until the session reaps. Audio chunks have no local_uri,
           // so this is a no-op for them.
-          if (chunk.local_uri) {
+          // `confirmationPersisted` is the gate. A local delete failure
+          // is still best-effort and never reverts the remote
+          // confirmation — the queue already records it as uploaded.
+          if (confirmationPersisted && chunk.local_uri) {
             try {
               await FileSystem.deleteAsync(chunk.local_uri, { idempotent: true });
             } catch (cleanupErr) {
@@ -2141,7 +2413,7 @@ async function uploadDrainLoop(): Promise<void> {
           console.log('GC_QUEUE chunk uploaded', {
             sessionId,
             chunk_index: chunk.chunk_index,
-            remote_reference: drive.remote_reference,
+            remote_reference: remoteRef,
           });
         })();
         // Suppress unhandled-rejection if the timer wins and the upload
@@ -2189,10 +2461,39 @@ async function uploadDrainLoop(): Promise<void> {
           ...errorDetail,
           classification: decision,
         });
+
+        // PHASE 1A — pause policy runs BEFORE the legacy
+        // transient/permanent split. `classifyFailure` uses a closed
+        // allow-list: only failures it positively recognises as
+        // transport faults fall through to the historical backoff. Any
+        // pause decision exits the loop immediately — no attempts++, no
+        // backoff sleep, no `continue`, and above all no pruning. The
+        // chunk stays `pending` with its bytes so it resumes intact.
+        const failure = classifyFailure(err);
+        if (failure.kind === 'pause') {
+          // The write is awaited before we return so the worker can
+          // never hand control back with the pause only in memory.
+          await persistFailurePause(
+            sessionId,
+            chunk.chunk_index,
+            sessionDestinationType,
+            failure,
+          );
+          console.log('GC_QUEUE chunk paused', {
+            ...errorDetail,
+            pause_reason: failure.reason,
+            pause_scope: failure.scope,
+          });
+          return;
+        }
+
         if (decision === 'permanent') {
+          // Unreachable in practice: every status that `classifyError`
+          // calls permanent is a pause above. Kept as a defensive
+          // branch, but it no longer prunes — nothing that was not
+          // confirmed off-device may lose its bytes.
           await queueUpdateChunk(sessionId, chunk.chunk_index, {
             status: 'failed',
-            base64Slice: undefined,         // poda — no sirve reintentar
             last_error: errShape,
           });
           console.log('GC_QUEUE chunk failed (permanent)', errorDetail);
@@ -2221,9 +2522,65 @@ async function uploadDrainLoop(): Promise<void> {
       }
     }
   } finally {
-    isDraining = false;
+    if (DEBUG_QUEUE) console.log('GC_DEBUG drain body exited');
   }
 }
+
+/**
+ * PHASE 1A — the only event that may lift `CLIENT_SESSION_EXPIRED`.
+ *
+ * Registered at module scope, so it exists from the moment this module
+ * is imported. `auth/store.ts` may fire before that (supabase-js
+ * restores a persisted session during its own init); `pauseStore`
+ * retains that notification and delivers it here exactly once on
+ * registration. The event cannot be lost, and it cannot be applied
+ * twice.
+ *
+ * Idempotence is what keeps repeated `TOKEN_REFRESHED` events from
+ * requesting repeated drains: if no client-auth pause is set, this is a
+ * no-op and no drain is requested. A valid login therefore requests
+ * exactly one drain.
+ *
+ * Scope discipline: this clears `client_auth` and nothing else. A
+ * Supabase login must not lift a Drive pause, a systemic pause, or any
+ * entry pause.
+ */
+registerAuthRestoreHandler((usable: boolean) => {
+  if (!usable) return;
+  void (async () => {
+    try {
+      // Cheap fast path: skip the write chain entirely for the common
+      // TOKEN_REFRESHED case where no pause is in force. This is an
+      // optimisation, NOT the decision point — see below.
+      const state = await ensurePauseReady();
+      if (!state.client_auth) return;
+
+      // The decision to request a drain must depend on THIS invocation
+      // having actually performed the `client_auth: value → null`
+      // transition. A burst of simultaneous events (init() + a
+      // subsequent INITIAL_SESSION, or several TOKEN_REFRESHED in one
+      // tick) all pass the check above while the pause still exists;
+      // they then serialize here, and only one of them finds a pause
+      // left to clear. Deciding on the pre-check instead would have
+      // every member of the burst request its own drain.
+      let clearedByThisInvocation = false;
+      await queueMutate(async () => {
+        const current = await readPauseState();
+        if (!current.client_auth) return;
+        await writePauseState({ ...current, client_auth: null });
+        clearedByThisInvocation = true;
+      });
+      if (!clearedByThisInvocation) return;
+
+      console.log('GC_QUEUE client auth pause cleared');
+      await uploadDrainLoop();
+    } catch (err) {
+      console.log('GC_QUEUE client auth restore failed', {
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+  })();
+});
 
 /**
  * For each entry whose recording is closed and whose chunks are all

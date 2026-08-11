@@ -16,6 +16,12 @@
 import { create } from 'zustand';
 import type { Session, User } from '@supabase/supabase-js';
 import { supabase } from './supabase';
+// PHASE 1A: the upload queue pauses globally on `401 NO_TOKEN`. Only a
+// usable Supabase session may lift that pause, so auth transitions have
+// to be observable by the worker. We notify a leaf module rather than
+// importing the queue directly — `app/index.tsx` imports THIS file, so
+// the reverse import would be a cycle.
+import { notifyClientAuth } from '@/upload/pauseStore';
 
 export type AuthStatus = 'loading' | 'signed-out' | 'signed-in';
 
@@ -71,9 +77,28 @@ export const useAuthStore = create<AuthState>((set) => ({
       set(applySession(data.session));
     }
 
+    // PHASE 1A: notify the SETTLED result of getSession() directly.
+    //
+    // A cold start with a valid persisted session is the exact case
+    // where the queue may hold a CLIENT_SESSION_EXPIRED pause from the
+    // previous process. Relying on supabase-js to also emit
+    // INITIAL_SESSION afterwards would make pause recovery depend on
+    // an event we do not control and have not verified. We notify
+    // here, unconditionally, from the value we actually observed.
+    //
+    // A later INITIAL_SESSION / SIGNED_IN for the same session is
+    // harmless: the restore handler only requests a drain when its own
+    // invocation performed the pause transition, so the duplicate is
+    // absorbed rather than producing a second drain.
+    notifyClientAuth(!error && !!data?.session?.access_token);
+
     if (!subscribed) {
       supabase.auth.onAuthStateChange((_event, session) => {
         set(applySession(session));
+        // "Usable" means a session that actually carries an access
+        // token — a null session, or one without a token, must never
+        // clear the pause. The handler on the other side is idempotent.
+        notifyClientAuth(!!session?.access_token);
       });
       subscribed = true;
     }
