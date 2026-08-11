@@ -25,6 +25,34 @@ class SegmentCoordinator(
   private val config: CaptureConfig,
   private val onSegmentClosed: (BoundaryMetrics, File) -> Unit,
   private val onFailure: (code: String, message: String) -> Unit,
+  /**
+   * Rotation REALLY finished: the previous segment is closed, the next muxer
+   * is open, the keyframe and the `after` partition are written, and the state
+   * is back to RECORDING. Fired exactly once per completed rotation, from the
+   * only place that can know all four are true — the tail of
+   * [maybeCompleteRotation].
+   *
+   * NOT fired when a rotation is merely requested, when `requestRotation()`
+   * returns (it only posts), on keyframe timeout, on audio-watermark timeout,
+   * or when closing/opening a segment fails. Every one of those paths returns
+   * before the tail, so a rotation that never reaches RECORDING never reports.
+   *
+   * `cutPtsUs` is the cut this rotation resolved. Its ONLY purpose here is
+   * correlation WITHIN ONE RUN, keyed as `sessionId + cutPtsUs`: it joins the
+   * module's own request ordinal to the coordinator's record of the same
+   * rotation, which is otherwise impossible because neither log line carries
+   * the other's key. PTS restart per session, so it is not a globally unique
+   * identity. It says nothing about which samples were actually written, and
+   * it does not stand in for the continuity instrumentation still to be
+   * designed.
+   *
+   * `segmentIndex` is deliberately NOT passed: the module never consumes it
+   * here, and the closed segment's index already reaches it through
+   * `BoundaryMetrics` in [onSegmentClosed].
+   *
+   * Runs on the coordinator thread. The consumer must not block it.
+   */
+  private val onRotationComplete: (cutPtsUs: Long) -> Unit,
 ) {
 
   private val thread = HandlerThread("gc-segrec-coordinator").apply { start() }
@@ -434,6 +462,26 @@ class SegmentCoordinator(
   }
 
   /**
+   * True while THIS rotation is still healthy.
+   *
+   * `writeToMuxer` returns Unit: on a negative rebase or a `writeSampleData`
+   * throw it calls `fail()` — which sets rawState to FAILED — and simply
+   * returns. The caller cannot see that through the return value, so without
+   * this check the rotation would carry on, reach `setState(RECORDING)` and
+   * resurrect a session that had already failed.
+   *
+   * `nativeStopStalled` is folded in for the same reason: a stalled
+   * `MediaMuxer.stop()` is a real native failure that deliberately does NOT
+   * write rawState, so testing the state alone would hide it under RECORDING.
+   *
+   * The state stays ROTATING for the whole body of [maybeCompleteRotation] —
+   * `closeCurrentSegment` and `openSegment` only change it by failing — so
+   * anything other than ROTATING means this rotation is already over.
+   */
+  private fun rotationStillHealthy(): Boolean =
+    rawState == GateState.ROTATING && !nativeStopStalled.get()
+
+  /**
    * The barrier. Because per-track PTS is monotonic, an audio sample with
    * `pts >= cutPtsUs` proves no earlier audio can still arrive. Only then is
    * the classification complete and segment 1 safe to close.
@@ -456,7 +504,14 @@ class SegmentCoordinator(
       .filter { it.ptsUs >= cutPtsUs && it !== keyframe }
       .sortedWith(orderWithin)
 
-    for (s in before) writeToMuxer(s)
+    // Every write is followed by a health check: a failed write reports through
+    // `fail()` and returns Unit, so this is the only way the rotation can see
+    // it. Classification, order, PTS, partitions and sample contents are
+    // untouched — the loop still writes exactly `before`, in the same order.
+    for (s in before) {
+      writeToMuxer(s)
+      if (!rotationStillHealthy()) return
+    }
 
     val aacFrameUs = 1024L * 1_000_000L / config.audioSampleRate
     val lastAacBefore = before.lastOrNull { it.kind == TrackKind.AUDIO }
@@ -495,7 +550,11 @@ class SegmentCoordinator(
     if (!openSegment()) return
 
     writeToMuxer(keyframe)          // first video sample of segment 2 — G4
-    for (s in after) writeToMuxer(s)
+    if (!rotationStillHealthy()) return
+    for (s in after) {
+      writeToMuxer(s)
+      if (!rotationStillHealthy()) return
+    }
 
     retained.clear()
     retainedBytes = 0
@@ -509,6 +568,19 @@ class SegmentCoordinator(
         "raw_audio_tail_us=$closingRawTailUs no_aac_before=$closingNoAacBefore " +
         "mono_ns=${SystemClock.elapsedRealtimeNanos()}",
     )
+
+    // The rotation is complete as of the line above: the previous segment was
+    // closed, the next muxer opened, the keyframe and the `after` partition
+    // were written, and the state is back to RECORDING. This is the ONLY
+    // invocation, and it is the last statement of the rotation — every
+    // failure path above returns first, including a `writeToMuxer` that
+    // reported through `fail()`, so a rotation that did not finish cleanly
+    // can never reach RECORDING, the log above, or this call.
+    //
+    // Stability for the just-closed segment was already scheduled inside
+    // `closeCurrentSegment()` and keeps running on `gc-segrec-aux`; it is
+    // untouched by this call and retains its power to fail the session.
+    onRotationComplete(cutPtsUs)
   }
 
   private val orderWithin =

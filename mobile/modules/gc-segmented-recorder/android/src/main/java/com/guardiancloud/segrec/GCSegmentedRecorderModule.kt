@@ -43,10 +43,21 @@ class GCSegmentedRecorderModule : Module() {
    *
    * `pendingRotation` holds the single armed runnable. Exactly one rotation is
    * ever pending: the first is armed on camera-open, and every later one is
-   * armed from `onSegmentClosed`, which only fires once the previous rotation
-   * has produced a closed, stability-verified segment. There is therefore no
-   * path on which two rotations are in flight, and no timer keeps firing into a
-   * session that stopped responding.
+   * armed from `onRotationComplete` — the coordinator's report that a rotation
+   * REALLY finished (previous segment closed, next muxer open, keyframe and
+   * `after` written, state back to RECORDING).
+   *
+   * It is deliberately NOT armed from `onSegmentClosed`. That callback fires
+   * only after the closed segment passes its ~5s stability verification, so
+   * chaining there serialised `rotationIntervalMs + stability` and produced an
+   * effective period of ~8.1s for a nominal 3s. Stability still runs — now
+   * concurrently, bounded by `STABILITY_MAX_PENDING`, and still able to fail
+   * the session.
+   *
+   * A rotation that does not complete reports nothing, so a failed rotation
+   * arms no successor: the session stalls into its existing deadlines instead
+   * of looping. There is no path on which two rotations are in flight, and no
+   * timer keeps firing into a session that stopped responding.
    */
   private var activeConfig: CaptureConfig = CaptureConfig()
   private var pendingRotation: Runnable? = null
@@ -432,21 +443,55 @@ class GCSegmentedRecorderModule : Module() {
               "audioSamples" to m.audioSamples,
             ),
           )
-          // Chain the next rotation HERE and nowhere else. Reaching this point
-          // means the previous rotation produced a segment that closed and
-          // passed its stability check, which is the only evidence available
-          // that it finished correctly. Scheduling from a free-running timer
-          // instead would let a second rotation be armed while the first was
-          // still draining its muxer.
+          // Cadence is NOT chained here any more. Reaching this point means
+          // the segment closed AND passed its ~5s stability verification —
+          // a state strictly later than the rotation finishing. Arming the
+          // next rotation from here serialised `interval + stability` and was
+          // the sole cause of the ~8.1s effective period. The re-arm now
+          // lives in `onRotationComplete`, which fires the moment the
+          // rotation actually completes. This callback keeps every other
+          // responsibility it had: it still publishes `onSegmentClosed`.
+        }
+      },
+      // Cadence governor. Fires once per COMPLETED rotation, on the
+      // coordinator thread, while the previous segment's stability check is
+      // still running concurrently on `gc-segrec-aux`.
+      onRotationComplete = rotationComplete@{ cutPtsUs ->
+        // Checked synchronously on the coordinator thread, before posting,
+        // for the same reason `onSegmentClosed` does it: release can complete
+        // and bump the generation before a posted runnable ever executes.
+        if (!genValid(gen)) return@rotationComplete
+        main.post {
+          // `rotationsRequested` is written only by the rotation runnable,
+          // which runs on `main`. It is read here, on `main`, so there is no
+          // cross-thread read to justify and no visibility contract needed.
           //
-          // `genActive` is re-tested inside the post because the session may
-          // have been stopped between the coordinator emitting and this
-          // running; `stopping` is tested so a segment closing during teardown
-          // does not arm a rotation nobody will service.
-          val interval = activeConfig.rotationIntervalMs
-          if (interval > 0L && genActive(gen) && !stopping && !releasing) {
-            scheduleRotation(gen, interval)
+          // The value is still the ordinal of the rotation that just
+          // completed: request N+1 cannot exist yet, because the timer that
+          // would emit it has not been armed — arming it is what this very
+          // block does, further down.
+          val n = rotationsRequested
+          // Re-tested after the hop: stop/release may have landed between the
+          // coordinator emitting and this running. `scheduleRotation` must not
+          // leave a live timer behind a teardown.
+          if (!genActive(gen) || stopping || releasing) {
+            Log.i(
+              TAG,
+              "GC_P2_GATE harness_rotation_complete n=$n cut_pts_us=$cutPtsUs " +
+                "next=none reason=teardown mono_ns=${SystemClock.elapsedRealtimeNanos()}",
+            )
+            return@post
           }
+          val interval = activeConfig.rotationIntervalMs
+          Log.i(
+            TAG,
+            "GC_P2_GATE harness_rotation_complete n=$n cut_pts_us=$cutPtsUs " +
+              "next_delay_ms=${if (interval > 0L) interval else -1} " +
+              "mono_ns=${SystemClock.elapsedRealtimeNanos()}",
+          )
+          // interval == 0 is the historical "single rotation" preset: complete
+          // the rotation, report it, and arm nothing.
+          if (interval > 0L) scheduleRotation(gen, interval)
         }
       },
       onFailure = { code, msg -> reportError(gen, code, msg) },
@@ -502,8 +547,9 @@ class GCSegmentedRecorderModule : Module() {
     v.onSurfaceLost = { if (genActive(gen)) beginOrderedStop(gen) }
     cam.open(cameraId, v.surfaceView.holder.surface, vid.inputSurface) {
       if (!genActive(gen)) return@open
-      // Rotation is requested by the module, never by JavaScript. Later
-      // rotations are chained from `onSegmentClosed`, not armed here.
+      // Rotation is requested by the module, never by JavaScript. This is the
+      // FIRST rotation only; every later one is chained from
+      // `onRotationComplete`, not from here and not from `onSegmentClosed`.
       scheduleRotation(gen, config.rotateAtMs)
       main.postDelayed({ if (genActive(gen)) beginOrderedStop(gen) }, config.sessionMs)
     }
@@ -973,6 +1019,13 @@ class GCSegmentedRecorderModule : Module() {
       return
     }
     releasing = true
+    // Drop the armed rotation HERE, not later. `finalizeSession` also cancels,
+    // but it only runs once both encoders have confirmed release — seconds
+    // away. Until then `sessionActive` is still true and the generation still
+    // matches, so `genActive(gen)` inside the pending runnable would pass and
+    // it would drive `requestSyncFrame()` / `requestRotation()` into a session
+    // that is already failing.
+    cancelPendingRotation()
 
     Log.e(TAG, "GC_P2_GATE error gen=$gen code=$code message=$message")
     val failingSessionId = sessionId
