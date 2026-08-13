@@ -60,6 +60,12 @@ enum class GateState {
 
 /** Every terminal failure the gate can report. No silent recovery anywhere. */
 object ErrorCode {
+  // Refusals raised before a session is accepted: the id is not a canonical
+  // UUID, or its output directory cannot be used without destroying evidence.
+  const val SESSION_ID_INVALID = "SESSION_ID_INVALID"
+  const val SESSION_DIR_NOT_EMPTY = "SESSION_DIR_NOT_EMPTY"
+  const val SESSION_DIR_UNAVAILABLE = "SESSION_DIR_UNAVAILABLE"
+
   const val AUDIO_TIMESTAMP_UNAVAILABLE = "AUDIO_TIMESTAMP_UNAVAILABLE"
   const val VIDEO_PTS_REORDERING_DETECTED = "VIDEO_PTS_REORDERING_DETECTED"
   const val AUDIO_PTS_REORDERING_DETECTED = "AUDIO_PTS_REORDERING_DETECTED"

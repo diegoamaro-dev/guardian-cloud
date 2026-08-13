@@ -181,9 +181,24 @@ class GCSegmentedRecorderModule : Module() {
     view = v
   }
 
-  private fun outputDir(): File {
+  /**
+   * Canonical lowercase UUID. Validated BEFORE the id is ever used as a path
+   * component: a canonical UUID cannot contain a separator or `..`, so path
+   * traversal is closed by construction rather than by trusting `File(...)`.
+   */
+  private val uuidRe = Regex(
+    "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+  )
+
+  /**
+   * One directory per session. Nothing here is ever wiped: those bytes can be
+   * the only copy of evidence not yet confirmed remotely. Cleanup belongs to an
+   * explicit operation that runs AFTER durable confirmation, and this module
+   * has no knowledge of that state.
+   */
+  private fun sessionDir(id: String): File {
     val base = appContext.reactContext?.cacheDir ?: error("no cache dir")
-    return File(base, "gc-p2-gate").also { it.mkdirs() }
+    return File(File(base, "gc-segmented-recorder"), id)
   }
 
   /**
@@ -327,6 +342,16 @@ class GCSegmentedRecorderModule : Module() {
       )
       return
     }
+    // The id becomes a directory name below, so it is validated here, before
+    // any generation is accepted and before any resource exists.
+    if (!uuidRe.matches(id)) {
+      rejectStart(
+        id,
+        ErrorCode.SESSION_ID_INVALID,
+        "sessionId must be a canonical lowercase UUID. Nothing was started.",
+      )
+      return
+    }
     // Happens BEFORE any generation is accepted, so the terminal `emitError`
     // must not be used: it would finalise a session that was never started and
     // report under the PREVIOUS session's identity.
@@ -362,8 +387,54 @@ class GCSegmentedRecorderModule : Module() {
       "GC_P2_GATE harness_config rotate_at_ms=${config.rotateAtMs} " +
         "rotation_interval_ms=${config.rotationIntervalMs} session_ms=${config.sessionMs}",
     )
-    val dir = outputDir()
-    dir.listFiles()?.forEach { it.delete() }
+    // Per-session directory. It is NEVER emptied: a pre-existing entry may be
+    // evidence whose upload was never confirmed, so the start is refused
+    // instead of silently overwriting it.
+    val dir = sessionDir(id)
+    if (dir.exists()) {
+      if (!dir.isDirectory) {
+        sessionActive = false
+        sessionId = ""
+        rejectStart(
+          id,
+          ErrorCode.SESSION_DIR_UNAVAILABLE,
+          "the session output location exists but is not a directory.",
+        )
+        return
+      }
+      val entries = dir.listFiles()
+      if (entries == null) {
+        sessionActive = false
+        sessionId = ""
+        rejectStart(
+          id,
+          ErrorCode.SESSION_DIR_UNAVAILABLE,
+          "the session directory could not be listed.",
+        )
+        return
+      }
+      if (entries.isNotEmpty()) {
+        sessionActive = false
+        sessionId = ""
+        rejectStart(
+          id,
+          ErrorCode.SESSION_DIR_NOT_EMPTY,
+          "the session directory already holds ${entries.size} entr" +
+            (if (entries.size == 1) "y" else "ies") +
+            "; refusing to overwrite. Nothing was started.",
+        )
+        return
+      }
+    } else if (!dir.mkdirs()) {
+      sessionActive = false
+      sessionId = ""
+      rejectStart(
+        id,
+        ErrorCode.SESSION_DIR_UNAVAILABLE,
+        "the session directory could not be created.",
+      )
+      return
+    }
 
     // The characterisation must know the timestamp source, and the source is
     // only known after the camera is resolved. Resolve first with a temporary
@@ -979,7 +1050,7 @@ class GCSegmentedRecorderModule : Module() {
    * running session's resources, generation or identity.
    */
   private fun rejectStart(id: String, code: String, message: String) {
-    Log.w(TAG, "GC_P2_GATE start_rejected requested=$id code=$code")
+    Log.w(TAG, "GC_P2_GATE start_rejected requested=${id.take(8)} code=$code")
     main.post {
       sendEvent(
         "onCaptureError",
