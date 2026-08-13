@@ -77,6 +77,27 @@ vi.mock('expo-camera', () => ({
   useCameraPermissions: () => [{ granted: true }, vi.fn(async () => ({ granted: true }))],
 }));
 
+// Native segmented recorder. `app/index.tsx` imports it at module load, and the
+// real module's first line is `import { requireNativeModule, requireNativeView }
+// from 'expo'` — the bare `expo` package, whose runtime setup dereferences
+// `__DEV__` and then looks for a registered native module. Neither exists under
+// vitest, so without this stub every suite that imports `../app/index` fails to
+// collect.
+//
+// The surface is limited to what the screen actually consumes: the three methods
+// it hands to `createNativeSegmentedSession` as `NativeRecorderApi`, plus the
+// preview view as a string component (same shape as `CameraView` above). No
+// native behaviour is simulated and no event is ever emitted from here — the
+// session module's own suite injects its own recorder double for that.
+vi.mock('../modules/gc-segmented-recorder', () => ({
+  default: {
+    startSegmentedCapture: vi.fn(async () => undefined),
+    stopSegmentedCapture: vi.fn(async () => undefined),
+    addListener: vi.fn(() => ({ remove: vi.fn() })),
+  },
+  GCSegmentedCameraView: 'GCSegmentedCameraView',
+}));
+
 vi.mock('expo-file-system/legacy', () => ({
   documentDirectory: 'file:///doc/',
   cacheDirectory: 'file:///cache/',
