@@ -26,7 +26,29 @@
 import * as Crypto from 'expo-crypto';
 import * as FileSystem from 'expo-file-system/legacy';
 
-import { queueAppendChunk, type QueueChunk } from '../../app/index';
+/**
+ * Contrato mínimo que este módulo consume. Se declara aquí, y no se importa
+ * de la capa de rutas, para que el adoptador sea comprobable de forma aislada
+ * y no invierta la dirección de dependencias.
+ */
+export interface AdoptableChunk {
+  chunk_index: number;
+  hash: string;
+  size: number;
+  status: 'pending';
+  attempts: number;
+  local_uri: string;
+}
+
+/** Destino de encolado. Se inyecta; nunca se resuelve por variable global. */
+export interface QueueSink {
+  appendChunk: (
+    sessionId: string,
+    chunk: AdoptableChunk,
+    emittedBase64Length: number | null,
+    nextChunkIndex: number,
+  ) => Promise<void>;
+}
 
 /** Where a verified copy lives. Deterministic in (sessionId, segmentIndex). */
 export function stableSegmentUri(sessionId: string, segmentIndex: number): string {
@@ -179,11 +201,15 @@ async function fileExists(uri: string): Promise<{ exists: boolean; size: number 
  *   7. enqueue the COPY only
  *   8. leave the source where it is
  */
-export function adoptSegment(ev: ClosedSegment, closedAtMs: number): Promise<AdoptionRecord> {
+export function adoptSegment(
+  ev: ClosedSegment,
+  closedAtMs: number,
+  queue: QueueSink,
+): Promise<AdoptionRecord> {
   const key = `${ev.sessionId}#${ev.segmentIndex}`;
   const running = inFlight.get(key);
   if (running) return running;
-  const p = adoptSegmentInner(ev, closedAtMs).finally(() => {
+  const p = adoptSegmentInner(ev, closedAtMs, queue).finally(() => {
     inFlight.delete(key);
   });
   inFlight.set(key, p);
@@ -193,6 +219,7 @@ export function adoptSegment(ev: ClosedSegment, closedAtMs: number): Promise<Ado
 async function adoptSegmentInner(
   ev: ClosedSegment,
   closedAtMs: number,
+  queue: QueueSink,
 ): Promise<AdoptionRecord> {
   const t0 = Date.now();
   const sourceUri = uriOf(ev.path);
@@ -229,7 +256,7 @@ async function adoptSegmentInner(
         // Same segment offered twice. Re-assert the queue append (idempotent
         // by chunk_index) so a repeat cannot leave the queue short.
         const tq = Date.now();
-        await enqueue(ev, stableUri, src.hash, src.size);
+        await enqueue(queue, ev, stableUri, src.hash, src.size);
         timings.enqueueMs = Date.now() - tq;
         timings.closedToEnqueueMs = Date.now() - closedAtMs;
         timings.totalMs = Date.now() - t0;
@@ -287,7 +314,7 @@ async function adoptSegmentInner(
 
     // 7 — only a verified copy is ever handed to GC_QUEUE.
     const tq = Date.now();
-    await enqueue(ev, stableUri, src.hash, src.size);
+    await enqueue(queue, ev, stableUri, src.hash, src.size);
     timings.enqueueMs = Date.now() - tq;
     const enqueuedAtMs = Date.now();
     timings.closedToEnqueueMs = enqueuedAtMs - closedAtMs;
@@ -314,12 +341,13 @@ async function adoptSegmentInner(
  * native recorder emits segments strictly in order.
  */
 async function enqueue(
+  queue: QueueSink,
   ev: ClosedSegment,
   stableUri: string,
   hash: string,
   size: number,
 ): Promise<void> {
-  const chunk: QueueChunk = {
+  const chunk: AdoptableChunk = {
     chunk_index: ev.segmentIndex,
     hash,
     size,
@@ -327,5 +355,5 @@ async function enqueue(
     attempts: 0,
     local_uri: stableUri,
   };
-  await queueAppendChunk(ev.sessionId, chunk, null, ev.segmentIndex + 1);
+  await queue.appendChunk(ev.sessionId, chunk, null, ev.segmentIndex + 1);
 }
