@@ -48,6 +48,28 @@ import { appendHistoryEntry, type SessionMode } from '@/api/history';
 import { hardResetAppState } from '@/dev/reset';
 import type { ChunkPayload } from '@/recording/chunkProducer';
 import { RecordingController } from '@/recording/recordingController';
+// Native segmented recorder. Imported eagerly (same shape the validated D_15S_2S
+// harness used) because the preview view has to exist at render time; the module
+// is autolinked from `mobile/modules/`, so a build that compiles the app also
+// contains it.
+import GCSegmentedRecorder, {
+  GCSegmentedCameraView,
+  type GateHarnessOptions,
+} from '../modules/gc-segmented-recorder';
+import { NATIVE_SEGMENTED_VIDEO } from '@/video/nativeSegmentedFlag';
+import {
+  selectVideoProducer,
+  type VideoProducer,
+} from '@/video/selectVideoProducer';
+import {
+  createNativeSegmentedSession,
+  type NativeSegmentedSession,
+} from '@/video/nativeSegmentedSession';
+import {
+  adoptSegment,
+  type AdoptableChunk,
+  type QueueSink,
+} from '@/video/segmentAdopter';
 import {
   scanOrphans,
   formatAgeHuman,
@@ -3087,6 +3109,63 @@ async function videoChunkSink(payload: ChunkPayload): Promise<void> {
   });
 }
 
+/**
+ * Capture parameters for the native segmented producer.
+ *
+ * The 6 s cadence is what the S2b cost model supports: at ~70 KB/s a segment is
+ * ~0.41 MiB, so `t_request = 2.64 s + 0.41/0.35 ≈ 3.8 s` per 6 s produced — a
+ * ~64 % duty cycle, which is why the backlog stayed flat in that run. The 2 s
+ * cadence of D_15S_2S produced faster than the uploader could drain.
+ *
+ * `sessionMs` is the module's ceiling (`HarnessBounds.MAX_SESSION_MS`) and
+ * matches `VIDEO_MAX_DURATION_S` exactly, so the native path inherits the same
+ * one-hour cap the expo-camera path already had rather than introducing a new
+ * one.
+ *
+ * DEBT: these travel through `GateHarnessOptions`, which the module documents as
+ * diagnostic-only. Without them a session would stop itself after 7 s with a
+ * single rotation. Promoting this to a real capture config is pending and blocks
+ * the merge to main, not this branch's validation.
+ */
+const NATIVE_SEGMENT_OPTIONS: GateHarnessOptions = {
+  rotateAtMs: 3_000,
+  rotationIntervalMs: 6_000,
+  sessionMs: 3_600_000,
+};
+
+/**
+ * The ONLY queue write the native segmented path performs.
+ *
+ * Deliberately does not wake the worker: every drain kick raised by this wiring
+ * is gated on `remoteSessionReady` inside `nativeSegmentedSession`, so keeping
+ * the kick out of the sink leaves one place that decides when the worker runs.
+ */
+const nativeSegmentProductionSink: QueueSink = {
+  appendChunk: async (sessionId, chunk, emittedBase64Length, nextChunkIndex) => {
+    await queueAppendChunk(sessionId, chunk, emittedBase64Length, nextChunkIndex);
+  },
+};
+
+/**
+ * Sink for segments that arrive AFTER `onCaptureReleased` — a native contract
+ * violation. The adopter still copies and verifies the bytes into
+ * `segments/<sid>/`; this sink is where its step 7 lands, and it writes nothing.
+ *
+ * The log deliberately carries no path and no hash, not even a truncated one: a
+ * stable path contains the session id and a hash prefix is still an identifier.
+ * `queue_write: false` is the point of the record.
+ */
+const nativeSegmentPreservationSink: QueueSink = {
+  appendChunk: async (sessionId, chunk: AdoptableChunk) => {
+    console.log('GC_SEGMENT_PRESERVED_ONLY', {
+      sid_prefix: sessionId.slice(0, 8),
+      idx: chunk.chunk_index,
+      size: chunk.size,
+      queue_write: false,
+    });
+  },
+};
+
 async function deriveChunksFromFile(uri: string): Promise<RealChunk[]> {
   const base64 = await FileSystem.readAsStringAsync(uri, {
     encoding: FileSystem.EncodingType.Base64,
@@ -3511,6 +3590,77 @@ export default function Index() {
     }
     return controllerRef.current;
   }
+  /**
+   * Producer that actually started THIS recording, captured at GRABAR time.
+   *
+   * The stop path dispatches on this rather than on `NATIVE_SEGMENTED_VIDEO`,
+   * so a flag that changed across a hot reload cannot strand a live capture
+   * with the wrong teardown.
+   */
+  const videoProducerRef = useRef<VideoProducer | null>(null);
+  /**
+   * The single native-session instance for this screen. Held in a ref rather
+   * than in module scope so consecutive sessions, hot reload and tests never
+   * share hidden state, and so `dispose()` on unmount is unambiguous.
+   */
+  const nativeSessionRef = useRef<NativeSegmentedSession | null>(null);
+  function getNativeSession(): NativeSegmentedSession {
+    if (!nativeSessionRef.current) {
+      nativeSessionRef.current = createNativeSegmentedSession({
+        recorder: GCSegmentedRecorder,
+        adopt: adoptSegment,
+        productionSink: nativeSegmentProductionSink,
+        preservationSink: nativeSegmentPreservationSink,
+        queue: {
+          read: queueRead,
+          markRecordingClosed: queueMarkRecordingClosed,
+          dropEntry: queueDropEntry,
+          drain: () => {
+            uploadDrainLoop().catch(err => {
+              if (DEBUG_QUEUE) {
+                console.log('GC_DEBUG drain rejected (from native segments)', {
+                  err: err instanceof Error ? err.message : String(err),
+                });
+              }
+            });
+          },
+        },
+        clock: {
+          now: () => Date.now(),
+          schedule: (fn, ms) => {
+            const handle = setTimeout(fn, ms);
+            return () => clearTimeout(handle);
+          },
+        },
+        logger: {
+          log: (event, fields) => {
+            console.log(event, fields);
+          },
+        },
+      });
+    }
+    return nativeSessionRef.current;
+  }
+  /**
+   * "A video producer is live." Single definition, substituted at every site
+   * that used to test `videoRecordPromiseRef.current !== null` — that ref is
+   * only ever set by the expo-camera path, so without this a native session
+   * would be invisible to PARAR, to the foreground-service predicate and to the
+   * background shutdown.
+   */
+  function videoProducerLive(): boolean {
+    return (
+      videoRecordPromiseRef.current !== null ||
+      nativeSessionRef.current?.isActive() === true
+    );
+  }
+  // Safety net: a screen unmount must not leave native listeners subscribed.
+  // Writes nothing — an in-flight close is owned by stopRecording, not by this.
+  useEffect(() => {
+    return () => {
+      nativeSessionRef.current?.dispose();
+    };
+  }, []);
   // Synchronous re-entrancy lock for startRecording. Closes the gap
   // between the user tap and setIsRecording(true) during which GRABAR is
   // still visible and re-tappable. Refs are read/written atomically on
@@ -4716,7 +4866,7 @@ export default function Index() {
               drain: () => uploadDrainLoop(),
               isRecordingActive: () =>
                 hasActiveAudioRecording() ||
-                videoRecordPromiseRef.current !== null ||
+                videoProducerLive() ||
                 postStopChunkingInFlightRef.current,
               hasPendingWork: hasPendingUploadWork,
               onPostNotificationsResult: (granted) =>
@@ -4848,7 +4998,7 @@ export default function Index() {
       isRecordingActive: () =>
         isStartingRef.current ||
         hasActiveAudioRecording() ||
-        videoRecordPromiseRef.current !== null ||
+        videoProducerLive() ||
         postStopChunkingInFlightRef.current,
       hasPendingWork: hasPendingUploadWork,
       onPostNotificationsResult: (granted) =>
@@ -4945,6 +5095,102 @@ export default function Index() {
       // parameter-less so the call site never needs to know which
       // platform-specific knobs are being flipped.
       await configureAudioMode();
+
+      // Producer selection happens ONCE, here, and is remembered for the whole
+      // recording. `null` for audio — audio has no video producer at all.
+      const videoProducer = selectVideoProducer(
+        recordingMode,
+        NATIVE_SEGMENTED_VIDEO,
+      );
+      videoProducerRef.current = videoProducer;
+
+      if (videoProducer === 'native-segmented') {
+        // === Native segmented video: a different start ORDER ===
+        //
+        // Local-first, and nothing here waits on the network. Every field the
+        // queue entry needs was resolved synchronously long before this point —
+        // `localSessionId` at GRABAR time and `pinnedDestinationType` one line
+        // later — so the entry is committed BEFORE the camera opens. That
+        // ordering is not cosmetic: with `rotateAtMs` at 3 s a segment can close
+        // ~4 s in, and a segment closing into a session that has no queue entry
+        // yet would hit `GC_QUEUE_APPEND_CHUNK_NO_SESSION` and leave its bytes
+        // outside the pipeline.
+        //
+        // `sessionCreatePromise` keeps running in parallel and is awaited by
+        // nobody on this path; it is handed to the session module as a signal
+        // and consumed once more below, purely to detect a non-retryable
+        // refusal.
+        sessionIdRef.current = localSessionId;
+        recordingModeRef.current = recordingMode;
+        AsyncStorage.setItem(LAST_SESSION_ID_KEY, localSessionId).catch(() => {});
+        appendHistoryEntry({
+          session_id: localSessionId,
+          created_at: new Date().toISOString(),
+          mode: recordingMode,
+        });
+        console.log('GC_QUEUE session destination pinned', {
+          sessionId: localSessionId,
+          destinationType: pinnedDestinationType,
+        });
+        await queueAppendNewSession({
+          session_id: localSessionId,
+          // No single growing file exists on this path: each segment is a
+          // self-contained MP4 carried by its chunk's `local_uri`. Empty is
+          // safe — `deleteRecordingBestEffort` returns on a falsy uri and
+          // `rehydrateChunkSlice` never reads `entry.uri` for a chunk that has
+          // `local_uri`.
+          uri: '',
+          recording_closed: false,
+          session_completed: false,
+          complete_attempts: 0,
+          emitted_base64_length: 0,
+          next_chunk_index: 0,
+          chunks: [],
+          destination_type: pinnedDestinationType,
+        });
+        console.log('PRODUCER_SELECTED', {
+          mode: recordingMode,
+          producer: videoProducer,
+        });
+
+        perfLog('GC_PERF_RECORDER_START_START', { mode: 'video' });
+        // Registers the three listeners and only then opens the camera.
+        await getNativeSession().start(
+          localSessionId,
+          NATIVE_SEGMENT_OPTIONS,
+          sessionCreatePromise,
+        );
+        perfLog('GC_PERF_RECORDER_STARTED', { mode: 'video' });
+        console.log('GC_VALIDATION: SESSION_CREATED', {
+          session_id: localSessionId,
+          phase: 1,
+          mode: recordingMode,
+        });
+
+        // The capture is live and the entry is committed, so "Grabando" is a
+        // true statement about both. The remote row may still be in flight —
+        // waiting for it here would hold the UI on a slow network while bytes
+        // are already being captured and adopted.
+        setIsRecording(true);
+        perfLog('GC_PERF_UI_RECORDING_VISIBLE', {
+          session_id: localSessionId,
+          mode: recordingMode,
+        });
+        setTestStatus('REC STARTED');
+
+        // SOLE owner of the non-retryable refusal. The session module only
+        // suppresses its own drain kicks when this rejects; it never stops the
+        // recorder on its own initiative. `stopRecording` is single-flight
+        // through the session module, so a refusal racing a manual PARAR still
+        // stops the recorder once and closes the queue at most once.
+        sessionCreatePromise.catch(err => {
+          const message = err instanceof Error ? err.message : String(err);
+          console.log('SESSION_CREATE_NON_RETRYABLE_ABORT', { err: message });
+          setTestStatus(`ERROR REC: ${message}`);
+          void stopRecording();
+        });
+        return;
+      }
 
       let cacheUri: string;
       if (recordingMode === 'audio') {
@@ -5169,7 +5415,10 @@ export default function Index() {
     // decide which branch we were on — capture the bool up front.
     const hadAudio = hasActiveAudioRecording();
     const videoPromise = videoRecordPromiseRef.current;
-    if (!hadAudio && !videoPromise) {
+    // `videoProducerLive()` rather than `videoPromise` alone: the native
+    // producer never sets that ref, so without this a native session would
+    // report "no active recording" and PARAR would silently do nothing.
+    if (!hadAudio && !videoProducerLive()) {
       setTestStatus('ERROR REC: no active recording');
       console.log('ERROR REC: no active recording on stop');
       return;
@@ -5191,6 +5440,91 @@ export default function Index() {
     // false-but-temporarily — which is what was killing the service
     // mid-`chunkVideoFile` for video sessions.
     postStopChunkingInFlightRef.current = true;
+
+    if (videoProducerRef.current === 'native-segmented') {
+      // === Native segmented stop ===
+      //
+      // The session module owns the entire close: it asks the recorder to stop
+      // exactly once (single-flight, so a PARAR racing the non-retryable-refusal
+      // abort still stops it once), waits for `onCaptureReleased` or its
+      // deadline, drains every adoption registered before that event, and only
+      // then reads GC_QUEUE to decide what — if anything — to persist.
+      //
+      // Nothing from the expo-camera tail applies: there is no single growing
+      // file to move out of the cache and nothing to chunk after the fact, so
+      // this path deliberately does not reach `chunkVideoFile` or the
+      // `queueMarkRecordingClosed` call further down.
+      try {
+        setTestStatus('REC STOPPING');
+        const report = await getNativeSession().stop();
+        setIsRecording(false);
+        console.log('GC_SEGMENT_STOP_REPORT', {
+          sid_prefix: report.sessionId.slice(0, 8),
+          outcome: report.outcome,
+          segments_observed: report.segmentsObserved,
+          observed_contiguous_from_zero: report.observedContiguousFromZero,
+          adoptions_settled: report.adoptionsSettled,
+          durable_chunks: report.durableChunks,
+          next_chunk_index: report.nextChunkIndex,
+        });
+        switch (report.outcome) {
+          case 'closed':
+            setTestStatus(null);
+            break;
+          case 'no_capture':
+            // Reachable by a normal user: GRABAR and PARAR in quick succession
+            // ends below the preroll and no segment is ever produced.
+            setTestStatus(
+              'La grabación fue demasiado corta. No se guardó ninguna evidencia.',
+            );
+            break;
+          case 'adoption_failed':
+            setTestStatus('No se pudo guardar la evidencia de esta grabación.');
+            break;
+          case 'timeout':
+            setTestStatus(
+              'ERROR REC STOP: la cámara no confirmó el cierre. La evidencia se conserva y se reintenta al abrir la app.',
+            );
+            break;
+          case 'no_entry':
+            setTestStatus('ERROR REC STOP: la sesión ya no estaba en la cola.');
+            break;
+        }
+      } catch (error) {
+        const message = (error as Error).message ?? String(error);
+        setIsRecording(false);
+        setTestStatus(`ERROR REC STOP: ${message}`);
+        console.log('ERROR REC STOP (native):', error);
+      } finally {
+        sessionIdRef.current = null;
+        recordingModeRef.current = null;
+        videoProducerRef.current = null;
+        setIsStopping(false);
+        postStopChunkingInFlightRef.current = false;
+        // Same conditional shutdown the expo-camera tail performs: stop the
+        // service now only when both predicates are already clean, otherwise
+        // leave it to its own tick, which stops on `no_pending_work`.
+        (async () => {
+          try {
+            const stillRecording =
+              hasActiveAudioRecording() ||
+              videoProducerLive() ||
+              postStopChunkingInFlightRef.current;
+            const pending = await hasPendingUploadWork();
+            if (!stillRecording && !pending) {
+              await stopBackgroundProtection('rec_stopped_no_pending_work');
+            }
+          } catch (err) {
+            console.log('GC_BACKGROUND_UPLOAD_ERROR', {
+              phase: 'native_stop_in_finally',
+              err: err instanceof Error ? err.message : String(err),
+            });
+          }
+        })();
+      }
+      return;
+    }
+
     let preMoveSize: number | null = null;
     let finalUri: string | null = null;
     try {
@@ -5415,7 +5749,7 @@ export default function Index() {
         try {
           const stillRecording =
             hasActiveAudioRecording() ||
-            videoRecordPromiseRef.current !== null ||
+            videoProducerLive() ||
             postStopChunkingInFlightRef.current;
           const pending = await hasPendingUploadWork();
           if (!stillRecording && !pending) {
@@ -5483,7 +5817,7 @@ export default function Index() {
     // Guard 2: there must actually be a live recording. The ref is the
     // single source of truth that startRecording succeeded past
     // `recordAsync()` and stopRecording has not yet captured the promise.
-    if (videoRecordPromiseRef.current === null) return;
+    if (!videoProducerLive()) return;
     // Guard 3: defer if start is still in flight. Two outcomes are both
     // acceptable per the design decision:
     //   - start succeeds → user can stop manually, OR a later background
@@ -6005,8 +6339,7 @@ export default function Index() {
   useEffect(() => {
     const sub = AppState.addEventListener('change', nextState => {
       const wasRecording =
-        hasActiveAudioRecording() ||
-        videoRecordPromiseRef.current !== null;
+        hasActiveAudioRecording() || videoProducerLive();
       console.log('GC_BACKGROUND_STATE_CHANGE', {
         next: nextState,
         recording: wasRecording,
@@ -6352,28 +6685,57 @@ export default function Index() {
           queue, worker, recovery, export, or AudioEngine. Pure
           presentation layer. */}
       {mode === 'video' && (isStarting || isRecording) ? (
-        <View
-          pointerEvents="none"
-          style={{
-            position: 'absolute',
-            top: -1000,
-            left: -1000,
-            width: 1,
-            height: 1,
-            overflow: 'hidden',
-            opacity: 0,
-          }}
-        >
-          <CameraView
-            ref={(r) => {
-              cameraRef.current = r;
+        NATIVE_SEGMENTED_VIDEO ? (
+          /* VISIBLE_NATIVE_PREVIEW = TEST_CONFIGURATION.
+             HIDDEN_OR_LOCKED_CAPTURE_UX = NOT_VALIDATED.
+
+             `GCSegmentedCameraView` is a SurfaceView and the module refuses to
+             start without it (`SURFACE_LOST — preview view not mounted`). The
+             only configuration ever exercised on a device is the one the
+             D_15S_2S harness used: laid out, visible, ~170 px tall. The 1×1
+             off-screen trick below is validated for expo-camera's TextureView
+             and NOT for a SurfaceView, so it is deliberately not reused here.
+
+             This is a validation surface, not a UX decision. Whether Guardian
+             Cloud should show a preview, hide it, or replace it with another
+             screen during capture is undecided and blocks the merge to main. */
+          <View
+            style={{
+              position: 'absolute',
+              top: 96,
+              left: 16,
+              right: 16,
+              height: 170,
+              backgroundColor: '#000',
+              overflow: 'hidden',
             }}
-            mode="video"
-            videoQuality={VIDEO_RECORDING_QUALITY}
-            videoBitrate={VIDEO_RECORDING_BITRATE_BPS}
-            style={{ width: 1, height: 1 }}
-          />
-        </View>
+          >
+            <GCSegmentedCameraView style={{ flex: 1 }} />
+          </View>
+        ) : (
+          <View
+            pointerEvents="none"
+            style={{
+              position: 'absolute',
+              top: -1000,
+              left: -1000,
+              width: 1,
+              height: 1,
+              overflow: 'hidden',
+              opacity: 0,
+            }}
+          >
+            <CameraView
+              ref={(r) => {
+                cameraRef.current = r;
+              }}
+              mode="video"
+              videoQuality={VIDEO_RECORDING_QUALITY}
+              videoBitrate={VIDEO_RECORDING_BITRATE_BPS}
+              style={{ width: 1, height: 1 }}
+            />
+          </View>
+        )
       ) : null}
 
       {/* Top shortcuts — Configuración (right) and Historial (left).
