@@ -27,6 +27,35 @@ export type {
   SegmentClosedEvent,
 };
 
+/**
+ * Closed result set for `cleanupCompletedSession`. Mirrors the Kotlin side
+ * exactly — anything outside this union means the two got out of step, and the
+ * caller must treat it as a failure rather than guess.
+ *
+ *   CLEANED             directory and its files removed
+ *   ALREADY_ABSENT      nothing was there; terminal, same as done
+ *   PARTIAL             some files went, some remain; retry converges
+ *   SESSION_ACTIVE      that session is live or still releasing; refused
+ *   SESSION_ID_INVALID  not a canonical lowercase UUID; nothing touched
+ *   DIR_UNAVAILABLE     no cache dir, unlistable, not a directory, or the
+ *                       canonical path fell outside the base directory
+ */
+export type NativeCleanupResult =
+  | 'CLEANED'
+  | 'ALREADY_ABSENT'
+  | 'PARTIAL'
+  | 'SESSION_ACTIVE'
+  | 'SESSION_ID_INVALID'
+  | 'DIR_UNAVAILABLE';
+
+export type NativeCleanupOutcome = {
+  result: NativeCleanupResult;
+  /** Files removed by this call. */
+  removed: number;
+  /** Files still present afterwards; `-1` when it could not be determined. */
+  remaining: number;
+};
+
 type GCSegmentedRecorderModuleType = {
   /**
    * Opens the camera, starts both encoders, and runs the gate session.
@@ -41,6 +70,16 @@ type GCSegmentedRecorderModuleType = {
   ): Promise<void>;
   /** Idempotent. Closes the active segment and releases the camera. */
   stopSegmentedCapture(): Promise<void>;
+  /**
+   * Deletes `cacheDir/gc-segmented-recorder/<sessionId>/`. Idempotent.
+   *
+   * The module does not know whether a session finished — that is a remote fact
+   * the caller must have proven durably before asking. This only executes,
+   * refuses, or reports that nothing was there.
+   *
+   * Never throws for an expected refusal: every outcome comes back as a code.
+   */
+  cleanupCompletedSession(sessionId: string): Promise<NativeCleanupOutcome>;
   /** Diagnostic read of the coordinator state machine. */
   getState(): string;
   addListener<K extends keyof GCSegmentedRecorderEvents>(

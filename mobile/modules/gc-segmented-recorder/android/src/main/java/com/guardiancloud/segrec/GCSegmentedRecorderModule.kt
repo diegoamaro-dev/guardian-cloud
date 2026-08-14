@@ -156,6 +156,23 @@ class GCSegmentedRecorderModule : Module() {
     }
 
     /**
+     * Deletes one completed session's output directory. Idempotent.
+     *
+     * This module has no idea whether a session finished: that is a remote fact
+     * the JS side proves with its cleanup journal. So this function does not
+     * decide anything — it executes, refuses, or reports that there was nothing
+     * there, and every outcome is a code the caller records.
+     *
+     * It never deletes anything it was not asked for and never accepts a path:
+     * the directory is rebuilt from [sessionDir] out of a validated UUID, and
+     * the result is re-checked against the base directory's canonical path
+     * before a single file is touched.
+     */
+    AsyncFunction("cleanupCompletedSession") { id: String ->
+      cleanupSession(id)
+    }
+
+    /**
      * EXPLICIT DIAGNOSTIC EXCEPTION to the generation/monitor discipline.
      *
      * Reads the current coordinator's state without taking the lock and
@@ -199,6 +216,124 @@ class GCSegmentedRecorderModule : Module() {
   private fun sessionDir(id: String): File {
     val base = appContext.reactContext?.cacheDir ?: error("no cache dir")
     return File(File(base, "gc-segmented-recorder"), id)
+  }
+
+  /** Base directory every session lives under. Null when there is no cache dir. */
+  private fun sessionsRoot(): File? {
+    val base = appContext.reactContext?.cacheDir ?: return null
+    return File(base, "gc-segmented-recorder")
+  }
+
+  private fun cleanupResult(code: String, removed: Int, remaining: Int): Map<String, Any> =
+    mapOf("result" to code, "removed" to removed, "remaining" to remaining)
+
+  /**
+   * Removes `cacheDir/gc-segmented-recorder/<id>/` and everything in it.
+   *
+   * Synchronized on the module monitor so the liveness checks are read
+   * atomically with respect to [startCapture] and the release path: without it,
+   * a capture could be accepted between "not active" and the first `delete()`,
+   * and this would erase a directory that had just started receiving evidence.
+   *
+   * Refusals are non-destructive and retryable. A partial delete is reported as
+   * such rather than dressed up as success — the caller keeps the resource
+   * pending and tries again, which converges because the operation is
+   * idempotent.
+   *
+   * Logs carry an eight-character prefix and counters only: never a path, never
+   * a full session id, never a filename.
+   */
+  @Synchronized
+  private fun cleanupSession(id: String): Map<String, Any> {
+    if (!uuidRe.matches(id)) {
+      Log.w(TAG, "GC_P2_GATE cleanup_rejected code=SESSION_ID_INVALID")
+      return cleanupResult("SESSION_ID_INVALID", 0, 0)
+    }
+
+    // A session that is live, or whose encoders have not confirmed release, may
+    // still write into this directory. `sessionId` is only meaningful while one
+    // of those is true, so both are tested together.
+    if ((sessionActive || releasing) && sessionId == id) {
+      Log.w(
+        TAG,
+        "GC_P2_GATE cleanup_rejected code=SESSION_ACTIVE sid=${id.take(8)} " +
+          "active=$sessionActive releasing=$releasing",
+      )
+      return cleanupResult("SESSION_ACTIVE", 0, -1)
+    }
+
+    val root = sessionsRoot() ?: run {
+      Log.w(TAG, "GC_P2_GATE cleanup_rejected code=DIR_UNAVAILABLE sid=${id.take(8)}")
+      return cleanupResult("DIR_UNAVAILABLE", 0, -1)
+    }
+    val dir = File(root, id)
+
+    // Confinement. The path was built here, not received, but a symlink planted
+    // inside the cache could still redirect it outside the base. Comparing
+    // canonical paths closes that, and a canonicalisation failure is a refusal,
+    // never a "probably fine".
+    val rootCanonical: String
+    val dirCanonical: String
+    try {
+      rootCanonical = root.canonicalPath + File.separator
+      dirCanonical = dir.canonicalPath
+    } catch (e: Exception) {
+      Log.w(
+        TAG,
+        "GC_P2_GATE cleanup_rejected code=DIR_UNAVAILABLE sid=${id.take(8)} reason=canonical",
+      )
+      return cleanupResult("DIR_UNAVAILABLE", 0, -1)
+    }
+    if (!dirCanonical.startsWith(rootCanonical)) {
+      Log.w(
+        TAG,
+        "GC_P2_GATE cleanup_rejected code=DIR_UNAVAILABLE sid=${id.take(8)} reason=outside_base",
+      )
+      return cleanupResult("DIR_UNAVAILABLE", 0, -1)
+    }
+
+    if (!dir.exists()) {
+      Log.i(TAG, "GC_P2_GATE cleanup_absent sid=${id.take(8)}")
+      return cleanupResult("ALREADY_ABSENT", 0, 0)
+    }
+    if (!dir.isDirectory) {
+      Log.w(
+        TAG,
+        "GC_P2_GATE cleanup_rejected code=DIR_UNAVAILABLE sid=${id.take(8)} reason=not_a_directory",
+      )
+      return cleanupResult("DIR_UNAVAILABLE", 0, -1)
+    }
+
+    val entries = dir.listFiles()
+    if (entries == null) {
+      Log.w(
+        TAG,
+        "GC_P2_GATE cleanup_rejected code=DIR_UNAVAILABLE sid=${id.take(8)} reason=unlistable",
+      )
+      return cleanupResult("DIR_UNAVAILABLE", 0, -1)
+    }
+
+    var removed = 0
+    for (entry in entries) {
+      // One level deep by construction: the coordinator only ever writes plain
+      // segment files here. A nested directory is not ours to interpret, so it
+      // is left alone and counted as remaining.
+      if (entry.isDirectory) continue
+      if (entry.delete()) removed++
+    }
+
+    val leftover = dir.listFiles()?.size ?: -1
+    if (leftover == 0 && dir.delete()) {
+      Log.i(TAG, "GC_P2_GATE cleanup_done sid=${id.take(8)} removed=$removed")
+      return cleanupResult("CLEANED", removed, 0)
+    }
+
+    val remaining = if (leftover >= 0) leftover else -1
+    Log.w(
+      TAG,
+      "GC_P2_GATE cleanup_partial sid=${id.take(8)} removed=$removed remaining=$remaining",
+    )
+    return cleanupResult("PARTIAL", removed, remaining)
   }
 
   /**
