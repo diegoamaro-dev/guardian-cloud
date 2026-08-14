@@ -67,9 +67,22 @@ import {
 } from '@/video/nativeSegmentedSession';
 import {
   adoptSegment,
+  stableSegmentDir,
   type AdoptableChunk,
   type QueueSink,
 } from '@/video/segmentAdopter';
+import {
+  classifyCompletion,
+  classifyCompletionFailure,
+  createSessionCleanupJournal,
+  type AuthorizationWriteResult,
+  type CompletionFailureCode,
+  type CompletionOutcome,
+} from '@/video/sessionCleanupJournal';
+import {
+  createSessionCleanupRunner,
+  type CleanupOutcome,
+} from '@/video/sessionCleanupRunner';
 import {
   scanOrphans,
   formatAgeHuman,
@@ -1483,42 +1496,29 @@ export async function reconcileStaleSessionsWithBackend(): Promise<{
     // session completed server-side. 200 OK or 409 SESSION_ALREADY_-
     // COMPLETED both mean "backend agrees we're done" and trigger reap.
     // Any other error → don't reap; the entry stays for next boot.
-    let completeOk = false;
-    try {
-      await completeSession(token, entry.session_id);
-      completeOk = true;
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (
-        msg.includes('SESSION_ALREADY_COMPLETED') ||
-        msg.includes('HTTP 409')
-      ) {
-        completeOk = true;
-      } else {
-        console.log('GC_QUEUE_STALE_LOCAL_ERROR_NOT_RECONCILED', {
-          session_id: entry.session_id,
-          expected,
-          backend_uploaded: backendUploaded,
-          reason: 'complete_session_failed',
-          err: msg,
-        });
-        not_reconciled += 1;
-        continue;
-      }
-    }
-
-    if (!completeOk) {
-      // Defensive — the if/else above should already have continued.
+    //
+    // Same helper as the finalize loop, so this path cannot drift out of the
+    // ordering that keeps the cleanup journal safe. `reapEntry` still drops the
+    // queue entry, the rehydration cache, the completion-gate log map, the
+    // local recording file (if any) and the chunks/<sid>/ directory; the local
+    // 'failed' chunks die WITH the entry — they were stale.
+    const finalized = await finalizeAndAuthorizeCleanup(
+      token,
+      entry.session_id,
+      entry.uri,
+    );
+    if (finalized.kind === 'failed') {
+      console.log('GC_QUEUE_STALE_LOCAL_ERROR_NOT_RECONCILED', {
+        session_id: entry.session_id,
+        expected,
+        backend_uploaded: backendUploaded,
+        reason: 'complete_session_failed',
+        detail: finalized.reason,
+      });
       not_reconciled += 1;
       continue;
     }
 
-    // Backend confirms whole. Mark + reap. `reapEntry` drops the queue
-    // entry, the rehydration cache, the completion-gate log map, the
-    // local recording file (if any), and the chunks/<sid>/ directory.
-    // The local 'failed' chunks die WITH the entry — they were stale.
-    await queueMarkSessionCompleted(entry.session_id);
-    await reapEntry(entry.session_id, entry.uri);
     console.log('GC_QUEUE_STALE_LOCAL_ERROR_RECONCILED', {
       session_id: entry.session_id,
       expected,
@@ -2274,6 +2274,164 @@ interface CompletionGateLogState {
 const completionGateLogState = new Map<string, CompletionGateLogState>();
 const COMPLETION_GATE_LOG_TTL_MS = 10_000;
 
+/** Canonical lowercase UUID — the only shape a session directory may carry. */
+const CANONICAL_SESSION_ID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/**
+ * Removes `documentDirectory/segments/<sid>/` — the verified stable copies.
+ *
+ * Deliberately NOT part of `reapEntry`. That runs on paths with no durable
+ * confirmation at all, including the give-up after MAX_COMPLETE_ATTEMPTS, and
+ * deleting evidence there would destroy bytes whose remote existence was never
+ * proven. This only ever runs from a journal entry.
+ *
+ * Idempotent, and reports partial progress instead of claiming success: the
+ * runner keeps the resource pending and the next pass finishes the job.
+ */
+async function cleanStableSegmentsDir(sessionId: string): Promise<CleanupOutcome> {
+  if (!CANONICAL_SESSION_ID.test(sessionId)) {
+    return { result: 'SESSION_ID_INVALID', removed: 0, remaining: 0 };
+  }
+  const dir = stableSegmentDir(sessionId);
+  try {
+    const info = await FileSystem.getInfoAsync(dir);
+    if (!info.exists) return { result: 'ALREADY_ABSENT', removed: 0, remaining: 0 };
+    const before = await FileSystem.readDirectoryAsync(dir);
+    await FileSystem.deleteAsync(dir, { idempotent: true });
+    const after = await FileSystem.getInfoAsync(dir);
+    if (!after.exists) {
+      return { result: 'CLEANED', removed: before.length, remaining: 0 };
+    }
+    const rest = await FileSystem.readDirectoryAsync(dir).catch(() => [] as string[]);
+    return {
+      result: 'PARTIAL',
+      removed: Math.max(0, before.length - rest.length),
+      remaining: rest.length,
+    };
+  } catch {
+    return { result: 'DIR_UNAVAILABLE', removed: 0, remaining: -1 };
+  }
+}
+
+/**
+ * The durable authorization record for deleting a completed session's local
+ * evidence. Its own AsyncStorage key — never GC_QUEUE, never the history index.
+ */
+const sessionCleanupJournal = createSessionCleanupJournal({
+  storage: {
+    getItem: (k) => AsyncStorage.getItem(k),
+    setItem: (k, v) => AsyncStorage.setItem(k, v),
+  },
+  clock: { now: () => Date.now() },
+  logger: {
+    log: (event, fields) => {
+      console.log(event, fields);
+    },
+  },
+});
+
+const sessionCleanupRunner = createSessionCleanupRunner({
+  journal: sessionCleanupJournal,
+  cleanNativeCache: (sid) => GCSegmentedRecorder.cleanupCompletedSession(sid),
+  cleanStableSegments: cleanStableSegmentsDir,
+  logger: {
+    log: (event, fields) => {
+      console.log(event, fields);
+    },
+  },
+});
+
+/**
+ * THE single place where a session's local evidence becomes deletable.
+ *
+ * Calls `completeSession`, classifies what actually happened, and only for a
+ * real 200 or 409 performs the four durable steps, in this order:
+ *
+ *   1. journal.authorize   — persistent proof the backend confirmed
+ *   2. queueMarkSessionCompleted
+ *   3. reapEntry
+ *
+ * Step 1 must precede step 2, not merely step 3. `session_completed = true` is
+ * on its own enough to reap — `reapAlreadyDoneEntries` and the branch at the
+ * top of the finalize loop both do it without asking the backend again — and
+ * reaping destroys the last reference to the session id. Writing the journal
+ * after step 2 would leave a window where a process death produces a completed,
+ * reaped session with no authorization, and its directory would then be
+ * indistinguishable from an interrupted capture: unreachable forever.
+ *
+ * The backend and AsyncStorage are not one transaction. What covers the gap
+ * between the 200 and step 1 is the queue entry itself: it is still there, so
+ * the next drain retries, the backend answers 409, and that is an equally
+ * durable authorization.
+ *
+ * Anything that is not a 200 or a 409 returns `failed` and writes NOTHING. The
+ * caller decides how to report it; no caller may authorize a cleanup by itself,
+ * because `authorize` takes a branded value only `classifyCompletion` produces.
+ */
+/**
+ * Every failure reason is a closed literal. Nothing derived from an exception
+ * message reaches a caller, and therefore no log.
+ */
+type FinalizeFailureReason =
+  | CompletionFailureCode
+  | 'session_id_invalid'
+  | 'journal_unusable'
+  | 'authorization_conflict'
+  | 'clock_invalid'
+  | 'authorization_threw';
+
+type FinalizeOutcome =
+  | { kind: 'completed' }
+  | { kind: 'already_completed' }
+  | { kind: 'failed'; reason: FinalizeFailureReason };
+
+async function finalizeAndAuthorizeCleanup(
+  token: string,
+  sessionId: string,
+  uri: string,
+): Promise<FinalizeOutcome> {
+  let outcome: CompletionOutcome;
+  try {
+    await completeSession(token, sessionId);
+    outcome = { kind: 'resolved' };
+  } catch (err) {
+    outcome = {
+      kind: 'threw',
+      message: err instanceof Error ? err.message : String(err),
+    };
+  }
+
+  const authorization = classifyCompletion(outcome);
+  if (!authorization) {
+    // Not confirmed. Nothing local changes, and the queue entry stays so the
+    // next drain retries. The message itself never leaves this function.
+    return { kind: 'failed', reason: classifyCompletionFailure(outcome) };
+  }
+
+  // The authorization must be ON DISK before anything downstream runs. A write
+  // that refused — invalid id, unusable journal, conflicting entry — or that
+  // threw leaves the queue entry exactly where it is: reaping on the strength
+  // of an authorization that was never recorded is precisely how a directory
+  // becomes unreachable forever.
+  let written: AuthorizationWriteResult;
+  try {
+    written = await sessionCleanupJournal.authorize(sessionId, authorization);
+  } catch {
+    return { kind: 'failed', reason: 'authorization_threw' };
+  }
+  if (!written.ok) {
+    return { kind: 'failed', reason: written.reason };
+  }
+
+  await queueMarkSessionCompleted(sessionId);
+  await reapEntry(sessionId, uri);
+
+  return authorization.code === 'http_200'
+    ? { kind: 'completed' }
+    : { kind: 'already_completed' };
+}
+
 export async function tryFinalizeReadySessions(): Promise<boolean> {
   const queue = await queueRead();
   let anyFinalized = false;
@@ -2425,39 +2583,41 @@ export async function tryFinalizeReadySessions(): Promise<boolean> {
     try {
       const token = await getFreshAccessToken();
       if (!token) throw new ApiError(401, 'NO_TOKEN', 'No access token in store', null);
-      await completeSession(token, entry.session_id);
-      await queueMarkSessionCompleted(entry.session_id);
-      await reapEntry(entry.session_id, entry.uri);
-      anyFinalized = true;
-      console.log('GC_QUEUE session completed', { sessionId: entry.session_id });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      // Defensive recognition of "already completed server-side": a
-      // previous attempt's response may have been lost (network blip,
-      // app kill between 200 OK and queueMarkSessionCompleted) so the
-      // backend now answers 409 SESSION_ALREADY_COMPLETED on retry.
-      // Same final state as a fresh 200 — mark + reap immediately
-      // rather than burning 5 retries before the give-up branch
-      // eventually reaps anyway. No invariant change: the entry still
-      // gets cleaned up; we just skip 5 round-trips of noise so beta
-      // logs stay readable under bad-network conditions.
-      if (
-        msg.includes('SESSION_ALREADY_COMPLETED') ||
-        msg.includes('HTTP 409')
-      ) {
-        console.log('GC_QUEUE session already completed (server) — reaping', {
+      // Both the fresh-200 and the already-completed-409 branches now go
+      // through one helper, so the ordering that makes the cleanup journal
+      // safe cannot drift between them. A 409 is recognised because a
+      // previous attempt's response may have been lost (network blip, app
+      // kill between the 200 and the local write) and the backend answers
+      // it on retry — the same terminal fact, reached later.
+      const finalized = await finalizeAndAuthorizeCleanup(
+        token,
+        entry.session_id,
+        entry.uri,
+      );
+      if (finalized.kind === 'failed') {
+        const attempts = await queueBumpCompleteAttempts(entry.session_id);
+        console.log('GC_QUEUE session complete failed', {
           sessionId: entry.session_id,
+          attempts,
+          reason: finalized.reason,
         });
-        await queueMarkSessionCompleted(entry.session_id);
-        await reapEntry(entry.session_id, entry.uri);
-        anyFinalized = true;
         continue;
       }
+      anyFinalized = true;
+      console.log(
+        finalized.kind === 'completed'
+          ? 'GC_QUEUE session completed'
+          : 'GC_QUEUE session already completed (server) — reaping',
+        { sessionId: entry.session_id },
+      );
+    } catch {
+      // Only reachable from the token lookup above; the helper never throws.
+      // Closed reason, so nothing from the exception is logged.
       const attempts = await queueBumpCompleteAttempts(entry.session_id);
       console.log('GC_QUEUE session complete failed', {
         sessionId: entry.session_id,
         attempts,
-        err: msg,
+        reason: 'token_or_unexpected',
       });
     }
   }
@@ -4730,6 +4890,31 @@ export default function Index() {
           }
         } catch (err) {
           console.log('GC_QUEUE recovery reap failed', err);
+        }
+
+        // Finish any cleanup a previous run authorized but did not complete.
+        //
+        // Runs unguarded against a concurrent GRABAR, and it does not need a
+        // gate: a journal entry only exists for a session the backend already
+        // confirmed as finished, and a finished session is by definition not
+        // the one a new capture is about to start. The native side refuses
+        // SESSION_ACTIVE anyway, so even a same-id collision — which cannot
+        // happen, the id is a fresh UUID — would be declined rather than
+        // destroy anything.
+        //
+        // Directories with no journal entry are invisible here. That is the
+        // whole design: age, emptiness and absence from GC_QUEUE never
+        // authorize a deletion.
+        try {
+          const report = await sessionCleanupRunner.reconcile();
+          if (report.considered > 0) {
+            console.log('GC_CLEANUP_BOOT_RECONCILED', { ...report });
+          }
+        } catch {
+          // Closed reason only: a storage or bridge failure can carry a path or
+          // an identifier in its message, and this log must not become the
+          // channel that leaks one.
+          console.log('GC_CLEANUP_BOOT_FAILED', { reason: 'reconcile_threw' });
         }
 
         // Backend reconciliation: for entries that locally still look
