@@ -13,8 +13,9 @@ Guardian Cloud permite:
 
 * grabar audio/vídeo
 * dividir en chunks
-* **subir en tiempo real durante la grabación — sólo en modo audio.** El vídeo
-  se fragmenta y encola **después** de detener la captura (`GC-AUD-001`)
+* **subir en tiempo real durante la grabación, en audio y en vídeo.** La ruta
+  nativa segmentada cierra, adopta y sube segmentos MP4 mientras la captura
+  sigue en curso; demostrado en hardware el 20/08
 * sobrevivir a:
 
   * pérdida de conexión
@@ -31,23 +32,28 @@ Guardian Cloud permite:
 
 > Si grabas durante unos segundos, al menos una parte de esa evidencia ya está fuera del dispositivo.
 
-**Cumplido hoy sólo en audio.** En vídeo, este objetivo todavía no se satisface
-(`GC-AUD-001`): resolverlo es la fase D y la siguiente prioridad funcional.
+**Cumplido en audio y en vídeo.** En vídeo quedó demostrado físicamente el
+20/08: primera subida confirmada a `+14,619 s` frente a un PARAR en `+75,514 s`,
+con 11 de 12 fragmentos confirmados fuera del dispositivo antes de detener la
+captura. `GC-AUD-001` deja de ser un defecto vigente.
 
 ---
 
 ## ⚙️ Estado actual
 
-⛔ **Veredicto vigente: `NO APTO`** — auditoría 2026-07-28. Empezar por
-[`START_HERE.md`](./START_HERE.md).
+⛔ **Veredicto vigente: `NO APTO PARA RELEASE`** — por cifrado local, recovery
+`I5c`, export `.mp4` y cobertura de dispositivos. **Ya no por `GC-AUD-001`.**
+Empezar por [`START_HERE.md`](./START_HERE.md).
 
 > **Qué está implementado y qué está validado:** la referencia canónica es la
 > tabla de tres niveles en
 > [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md#capacidades-por-nivel-referencia-canónica).
-> Resumen: **nivel 1** audio completo de extremo a extremo; **nivel 2**
-> Reliability Card, Android 13+ y matriz de resiliencia implementados pero sin
-> validar; **nivel 3** todo el vídeo segmentado, su subida en directo, su
-> recuperación y el export `.mp4` no están implementados.
+> Resumen: **nivel 1** audio completo de extremo a extremo, más vídeo nativo
+> segmentado con subida durante la captura y durable cleanup en su ruta normal,
+> `HARDWARE_VALIDATED` en un OnePlus A6000 con Android 11; **nivel 2**
+> Reliability Card, Android 13+, matriz de resiliencia y las rutas artificiales
+> de fallo del scheduler, implementados pero sin validar en dispositivo;
+> **nivel 3** recuperación completa del vídeo y export `.mp4`, no implementados.
 
 **Baseline técnica congelada:** [`v0.3.0-rc.1`](./releases/v0.3.0-rc.1.md)
 (2026-07-30) — punto de retorno reproducible, **no** una release pública.
@@ -55,17 +61,21 @@ Guardian Cloud permite:
 El sistema actualmente:
 
 * ✔ grabación funcional
-* ✔ chunking en tiempo real **sólo en audio**
+* ✔ chunking en tiempo real en audio **y en vídeo** (ruta nativa segmentada)
+* ✔ **el vídeo saca evidencia del dispositivo durante la grabación** —
+  `HARDWARE_VALIDATED` 20/08
 * ✔ subida a Google Drive
 * ✔ cola persistente (AsyncStorage)
 * ✔ recovery tras kill / arranque de la app
+* ✔ recovery de una sesión pendiente tras restaurar la autorización de Drive
 * ✔ subida en background
+* ✔ durable cleanup del almacenamiento local en la ruta normal
 * ✔ export de evidencia (`.m4a`)
-* ❌ **el vídeo NO saca evidencia del dispositivo durante la grabación**
-  (GC-AUD-001) — encola después de parar
 * ❌ sin `capture_end_reason`: no se puede probar finalización limpia
 * ❌ recovery automático tras reinicio del dispositivo (I5c) no implementado
 * ❌ cifrado local no implementado
+* ❌ export final `.mp4` no implementado
+* ❌ un solo dispositivo validado: sin cobertura multi-dispositivo ni Android 13+
 
 Las afirmaciones históricas de validación de este repositorio quedaron retiradas
 por la auditoría. Ver [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md).

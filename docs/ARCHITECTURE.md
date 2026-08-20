@@ -6,9 +6,13 @@
 > [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md#capacidades-por-nivel-referencia-canónica),
 > que es la referencia canónica y prevalece sobre este texto.
 >
-> En particular: el cifrado local **no** está implementado, y todo el vídeo
-> —segmentación, subida durante la grabación, recuperación y export `.mp4`— es
-> nivel 3, **no implementado ni validado** (`GC-AUD-001`).
+> El cifrado local **no** está implementado. La grabación nativa segmentada, la
+> subida durante la captura y el durable cleanup/scheduler en su ruta normal
+> están `HARDWARE_VALIDATED` desde el 20/08 en un OnePlus A6000 con Android 11.
+> Esa evidencia **no** valida el recovery completo de vídeo, un export final
+> `.mp4`, otros dispositivos ni las rutas artificiales de fallo del scheduler.
+> Véase la
+> [validación física del 20/08](./audits/GUARDIAN_CLOUD_NATIVE_SEGMENTED_DURABLE_CLEANUP_VALIDATION_2026-08-20.md).
 
 ## Visión general
 
@@ -38,7 +42,10 @@ Tecnologías reales (MVP actual):
   entries `PendingQueueEntry` (sesión + chunks + status). Lectura/escritura
   serializada con un `writeChain` para evitar carreras.
 - expo-file-system para los archivos de grabación y los chunks en disco
-- expo-av (audio) y expo-camera (vídeo)
+- expo-av para audio
+- módulo nativo Android `gc-segmented-recorder` para vídeo segmentado;
+  expo-camera permanece como fallback y ambos productores son mutuamente
+  excluyentes
 - react-native-background-actions para el foreground service Android
   (notificación persistente "Guardian Cloud está protegiendo tu evidencia")
 
@@ -94,9 +101,10 @@ Destinos futuros (NO en MVP):
 
 1. el usuario pulsa grabar
 2. la app crea sesión
-3. se generan chunks
+3. se generan chunks de audio o segmentos MP4 nativos independientes de vídeo
 4. *(previsto, **no implementado en `v0.3.0-rc.1`**)* se cifran localmente
-5. se suben al destino
+5. los chunks de audio se encolan y los segmentos nativos se adoptan; ambos se
+   suben al destino durante la captura
 6. se actualiza estado en backend
 7. al cerrar se completa la sesión
 
@@ -104,6 +112,57 @@ Destinos futuros (NO en MVP):
 > —ver `MVP_SCOPE.md` y `SECURITY.md`— pero **no está implementado**: en el
 > código sólo existe un `TODO`. En `v0.3.0-rc.1` los chunks se encolan y se
 > suben **sin cifrado en el cliente**. El transporte sí va sobre TLS.
+
+En vídeo, el productor nativo genera segmentos MP4 H.264/AAC independientes.
+La validación física del 13/08 comprobó su reproducción individual, adopción,
+integridad y subida durante la captura. El fallback Expo no corre en paralelo
+con el productor nativo y conserva la ruta histórica post-stop cuando se usa.
+
+## Durable cleanup local
+
+El cleanup local exige autorización durable y sigue esta secuencia:
+
+1. el backend confirma completion;
+2. la autorización de cleanup se persiste en el journal;
+3. `GC_QUEUE` se marca con `session_completed=true`;
+4. se intenta el reap local;
+5. el runner reconcilia únicamente sesiones visibles en el journal.
+
+Una sesión sin journal permanece fuera del alcance del runner. El scheduler no
+concede autorización; sólo solicita reconcile para entradas ya autorizadas.
+
+El scheduler es single-flight:
+
+* coalesce solicitudes del mismo tick;
+* establece `pending=false` antes de `reconcile`;
+* una solicitud durante una pasada produce exactamente una pasada adicional;
+* contiene sus errores para que no alcancen el completion flow.
+
+Los únicos triggers son:
+
+* `boot`, de forma no bloqueante;
+* `finalized`, después de un reap autorizado exitoso, incluido uno diferido;
+* `stale_reconciled`, cuando se reconcilia al menos una sesión stale.
+
+Después de completion y autorización durable, un fallo de mantenimiento local
+no incrementa `complete_attempts`, no repite `completeSession` y no degrada
+la finalización confirmada. Un reap diferido exitoso retira `GC_QUEUE` y
+vuelve a solicitar cleanup con motivo `finalized`.
+
+Esta arquitectura está implementada, cubierta por pruebas unitarias y
+`HARDWARE_VALIDATED` en su ruta normal desde el 20/08: autorización tras
+completion confirmada, trigger `finalized`, una única pasada de reconcile y
+borrado de ambos recursos sin reiniciar la aplicación.
+
+La **frontera de borrado exclusiva por journal** también está
+`HARDWARE_VALIDATED`: en una pasada real con `considered: 1`, el runner eliminó
+la sesión autorizada y dejó byte-identical dos directorios centinela de UUID
+canónico sin entrada en el journal. `authorized → eligible for cleanup`,
+`no journal → invisible`, demostrado por discriminación y no por inacción.
+
+Las rutas artificiales de fallo —boot con trabajo durable real, caso positivo de
+`stale_reconciled`, fallo de reap posterior a completion y reap diferido— siguen
+en `HARDWARE_HARDENING_PENDING` y **no bloquean la integración de la rama**.
 
 ## Principios de arquitectura
 
@@ -138,8 +197,9 @@ El cliente es responsable de reconstruir la evidencia final:
   * **`.mp4` (vídeo) — planificado, no implementado ni validado**
 
 El flujo está implementado en cliente. **Sólo la ruta de audio (`.m4a`) forma
-parte del MVP validado**; la de vídeo depende de que primero exista vídeo
-segmentado con subida durante la grabación, que es nivel 3.
+parte del export validado**. Ya existen segmentos MP4 nativos independientes,
+pero la evidencia disponible no demuestra recovery completo de vídeo ni la
+generación de un export final `.mp4`.
 
 ---
 
@@ -159,10 +219,14 @@ Archivo `manifest.json` asociado a cada sesión:
 
 #### Chunks
 
-Archivos binarios independientes:
+En el modelo histórico de chunks binarios de audio y del fichero de vídeo
+post-stop:
 
 * no reproducibles individualmente
 * diseñados para supervivencia, no reproducción
+
+Esta regla no se aplica a los segmentos de vídeo del productor nativo: son MP4
+independientes y su reproducción individual fue validada físicamente el 13/08.
 
 ---
 
@@ -186,7 +250,8 @@ Responsabilidades:
 
 ### Decisión arquitectónica clave
 
-> Los chunks NO son archivos reproducibles por diseño.
+> Los chunks binarios de audio y de la ruta post-stop requieren reconstrucción;
+> los segmentos MP4 del productor nativo son reproducibles individualmente.
 
 Motivo:
 
@@ -198,15 +263,17 @@ Motivo:
 
 ### Implicaciones
 
-* la reproducción siempre pasa por reconstrucción
+* la reproducción de audio y de chunks post-stop pasa por reconstrucción
+* cada segmento de vídeo nativo puede inspeccionarse de forma independiente
 * el sistema es tolerante a pérdida de chunks
-* el archivo final puede ser parcial en escenarios extremos
+* un archivo reconstruido final puede ser parcial en escenarios extremos
 
 ---
 
 ### Limitaciones conocidas
 
-* vídeo parcial puede no ser reproducible (estructura MP4)
+* un fragmento parcial de un único MP4 de la ruta post-stop puede no ser
+  reproducible por su estructura; esto no describe los segmentos MP4 nativos
 * export actual carga en memoria (mejora futura: streaming incremental)
 
 ---

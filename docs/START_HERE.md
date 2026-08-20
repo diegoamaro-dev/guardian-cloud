@@ -1,21 +1,66 @@
 # Guardian Cloud — START HERE
 
-⛔ NO APTO — auditoría 2026-07-28; validación anterior retirada; vídeo no protege durante la grabación
+⛔ NO APTO PARA RELEASE — por cifrado local, recovery `I5c`, export `.mp4` y cobertura de dispositivos. **Ya no por `GC-AUD-001`.**
 
-Este documento conserva afirmaciones históricas que ya no constituyen evidencia de validación.
-Hasta completar la reconciliación documental de la fase H, prevalecen estos informes:
+Este documento contiene referencias históricas que deben leerse con la fecha y
+el alcance de su evidencia. El estado vigente se reconstruye desde:
 
-* [Auditoría integral](./audits/GUARDIAN_CLOUD_FULL_AUDIT_2026-07-28.md)
-* [Matriz de trazabilidad](./audits/GUARDIAN_CLOUD_TRACEABILITY_2026-07-28.md)
-* [Plan de remediación](./audits/GUARDIAN_CLOUD_REMEDIATION_PLAN_2026-07-28.md)
+* [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md#capacidades-por-nivel-referencia-canónica),
+  referencia canónica del estado por capacidad;
+* [validación física del vídeo nativo con durable cleanup del 20/08](./audits/GUARDIAN_CLOUD_NATIVE_SEGMENTED_DURABLE_CLEANUP_VALIDATION_2026-08-20.md);
+* [validación física de la integración nativa segmentada del 13/08](./audits/GUARDIAN_CLOUD_NATIVE_SEGMENTED_INTEGRATION_VALIDATION_2026-08-13.md).
 
-Veredicto vigente: NO APTO. Las afirmaciones de validación contenidas más abajo no deben utilizarse como prueba de funcionamiento real.
+### Lo que cambió el 2026-08-20
 
-### Punto de partida actual (2026-07-30)
+El requisito crítico del producto quedó **demostrado físicamente**: la evidencia
+de vídeo sale del dispositivo **durante** la grabación. Primera subida
+confirmada a `+14,619 s`, PARAR a `+75,514 s`, margen de `60,895 s`, con 11 de
+12 chunks confirmados antes de detener la captura.
+
+`GC-AUD-001` **deja de ser un defecto vigente**. Las afirmaciones de este
+repositorio que digan que el vídeo sólo se encola después de parar describen la
+baseline `v0.3.0-rc.1`, no la rama actual.
+
+### Punto de partida actual (2026-08-20)
+
+* **Native segmented recording:** `HARDWARE_VALIDATED` en OnePlus A6000 /
+  Android 11 / API 30 / `arm64-v8a`.
+* **Subida de vídeo durante la captura:** `HARDWARE_VALIDATED`.
+* **Durable cleanup/scheduler, ruta normal:** `HARDWARE_VALIDATED`.
+* **Recovery de una sesión pendiente tras restaurar Drive:**
+  `HARDWARE_VALIDATED`.
+* **Frontera de borrado exclusiva por journal:** `HARDWARE_VALIDATED` mediante
+  prueba dirigida con directorios centinela — `authorized → eligible`,
+  `no journal → invisible`.
+* **Rutas artificiales de fallo del scheduler:** `HARDWARE_HARDENING_PENDING`.
+  No bloquean la integración de la rama; **no queda ningún gate bloqueante del
+  Escenario 17**.
+* **Validación automática actual:** 360/360 tests; typecheck con los mismos 12
+  errores TypeScript históricos y cero nuevos; Kotlin
+  `:gc-segmented-recorder:compileDebugKotlin` con `BUILD SUCCESSFUL`;
+  `git diff --check` limpio.
+
+### Por qué sigue `NO APTO PARA RELEASE`
+
+Los motivos son ahora otros, y ninguno es la captura de vídeo:
+
+1. **cifrado local no implementado** — sólo existe un `TODO` en el código;
+2. **recovery `I5c`** —autónomo tras reiniciar el dispositivo sin abrir la
+   app— no implementado;
+3. **export final `.mp4`** no implementado ni validado;
+4. **un solo dispositivo validado**: sin cobertura multi-dispositivo ni
+   Android 13+;
+5. **recovery completo de vídeo** no demostrado;
+6. sin AAB de producción, Closed Testing ni usuarios externos.
+
+La validación del 20/08 no cubre ninguno de esos seis puntos y no debe leerse
+como si lo hiciera.
+
+### Baseline técnica histórica (2026-07-30)
 
 **Baseline técnica congelada: [`v0.3.0-rc.1`](./releases/v0.3.0-rc.1.md).**
 Es el punto de retorno reproducible del proyecto y lo primero que hay que leer
-antes de tocar nada.
+antes de modificar aquella baseline.
 
 * commit construido `5ac4a03` · build EAS `e98dd3a2-…` · **198/198 tests
   verdes** *(resultado histórico de esa baseline; la condición vigente es que
@@ -26,23 +71,23 @@ antes de tocar nada.
 * **no es una release pública**: sin AAB de producción, sin Closed Testing, sin
   usuarios externos
 
-El veredicto `NO APTO` **sigue vigente**: la baseline no resuelve que el vídeo no
-saque evidencia del dispositivo durante la grabación, ni la ausencia de
-`capture_end_reason`.
+La cifra 198/198 y las limitaciones de vídeo de esa baseline son históricas; no
+describen la implementación actual de `feat/native-segmented-recording`.
 
 > **Qué está implementado y qué está validado** se decide en la tabla de tres
 > niveles de
 > [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md#capacidades-por-nivel-referencia-canónica).
 > Es la referencia canónica: cualquier afirmación de este documento que la
-> contradiga es incorrecta. En particular, **todo el vídeo segmentado, su subida
-> durante la grabación, su recuperación y el export `.mp4` son nivel 3: no
-> implementados ni validados.**
+> contradiga es incorrecta. La validación del 20/08 cubre la captura nativa, la
+> subida durante la captura y el durable cleanup en su ruta normal; **no** se
+> puede extender al recovery completo de vídeo, al export `.mp4`, a otros
+> dispositivos ni a las rutas artificiales de fallo del scheduler.
 
 Cómo se trabaja a partir de aquí:
 [`DEVELOPMENT_WORKFLOW.md`](./DEVELOPMENT_WORKFLOW.md).
 
-Las afirmaciones históricas de más abajo **se conservan sin retirar**. La
-reconciliación documental integral pertenece a la fase H.
+Las afirmaciones históricas de más abajo se conservan como contexto de producto
+y no sustituyen el estado por capacidad ni los informes de validación vigentes.
 
 ## 1. Qué es este proyecto
 

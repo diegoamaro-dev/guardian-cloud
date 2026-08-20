@@ -39,15 +39,20 @@ de entorno configurada**.
 
 ### 3.1 Bloqueos de producto — no se resuelven con trámites
 
-1. **El vídeo no saca evidencia del dispositivo durante la grabación**
-   (GC-AUD-001). Genera y encola el material *después* de detener la captura.
-   Publicar así significa vender supervivencia de evidencia que en vídeo no
-   existe. Corresponde a la **fase D**.
+1. ~~**El vídeo no saca evidencia del dispositivo durante la grabación**
+   (GC-AUD-001).~~ **RESUELTO.** La ruta nativa segmentada sube durante la
+   captura y quedó demostrado en hardware el 20/08 — primera subida confirmada a
+   `+14,619 s` frente a un PARAR en `+75,514 s`. La **fase D** está cumplida.
+   Ya **no** es un bloqueo de publicación.
 2. **No existe `capture_end_reason`.** El sistema no puede distinguir una
    captura terminada limpiamente de una truncada. Fases **E-1/E-2/E-3**.
 3. **Recovery I5c** (automático tras reinicio del dispositivo, sin abrir la app)
    no implementado.
 4. **Cifrado local** no implementado, pese a aparecer en documentación histórica.
+5. **Export final `.mp4`** no implementado ni validado: una sesión de vídeo
+   sube fragmentos, pero no existe reconstrucción utilizable para el usuario.
+6. **Un solo dispositivo validado** — OnePlus A6000 / Android 11 / API 30. Sin
+   cobertura multi-dispositivo ni Android 13+.
 
 ### 3.2 Bloqueos técnicos
 
