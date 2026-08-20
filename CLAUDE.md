@@ -79,6 +79,7 @@ En caso de conflicto:
 - No mover lógica al UI
 - No tocar cola, chunking o worker sin necesidad crítica
 - No introducir complejidad innecesaria
+- Git: cumplir obligatoriamente docs/DEVELOPMENT_WORKFLOW.md §7.1. No añadir coautoría ni atribución de IA a commits.
 
 ---
 

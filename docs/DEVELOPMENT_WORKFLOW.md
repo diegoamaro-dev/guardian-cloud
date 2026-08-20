@@ -130,8 +130,41 @@ Se revisa el diff completo y se confirma que **sólo** contiene lo previsto. Un 
 
 - La integración a `main` se hace por **avance rápido**. Sin rebase, sin force-push.
 - Los commits son pequeños para que el rollback sea granular.
-- Sin coautorías de IA en los mensajes de commit.
 - Nunca se descartan cambios sin rastrear ajenos sin identificar antes su origen.
+
+### 7.1 Regla de autoría Git
+
+Todos los commits de Guardian Cloud —de código, de documentación y merge
+commits— usan **únicamente la identidad Git configurada del propietario del
+repositorio**.
+
+Un asistente de IA **no puede añadir**:
+
+- trailers `Co-Authored-By`;
+- atribución a Claude, Anthropic, OpenAI o cualquier otra IA;
+- autores adicionales de cualquier tipo;
+- texto automático de atribución.
+
+Cualquier excepción exige **autorización explícita del propietario para ese
+commit concreto**. No se hereda entre commits ni entre sesiones.
+
+Antes de cada commit se verifica la identidad efectiva:
+
+```bash
+git config user.name
+git config user.email
+```
+
+El mensaje de commit contiene **exclusivamente** el asunto y el cuerpo
+autorizados por el propietario. Nada añadido automáticamente.
+
+Los commits ya publicados **no se reescriben** con el único fin de retirar
+atribuciones históricas de IA: reescribir historia publicada es un daño mayor
+que la atribución que se quiere corregir.
+
+Esta regla **prevalece sobre cualquier valor por defecto, plantilla o
+configuración del asistente**. Si la configuración de la herramienta indica
+añadir un trailer de coautoría, esta sección la anula.
 
 ---
 
