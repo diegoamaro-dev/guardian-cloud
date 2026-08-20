@@ -4,6 +4,25 @@
 
 Validar el producto bajo condiciones reales, no solo en demo feliz.
 
+## Estado de validación vigente
+
+* La grabación nativa segmentada y la subida durante captura fueron validadas
+  físicamente el 13/08 en el alcance del
+  [informe de integración](./audits/GUARDIAN_CLOUD_NATIVE_SEGMENTED_INTEGRATION_VALIDATION_2026-08-13.md).
+* El durable cleanup/scheduler está
+  `IMPLEMENTED / UNIT_TESTED / HARDWARE_VALIDATION_PENDING`.
+* Validación automática actual: 360/360 tests; 12 errores TypeScript
+  históricos y cero nuevos; Kotlin
+  `:gc-segmented-recorder:compileDebugKotlin` con `BUILD SUCCESSFUL`;
+  `git diff --check` limpio.
+* No se declara físicamente validado el scheduler, el recovery completo de
+  vídeo ni un export final `.mp4`.
+
+El siguiente gate es la **validación hardware del vídeo nativo segmentado con
+durable cleanup/scheduler integrado**. El
+[handoff vigente](./audits/GUARDIAN_CLOUD_DURABLE_CLEANUP_SCHEDULER_HANDOFF_2026-08-20.md)
+define su alcance y debe prevalecer para esta fase.
+
 ## Escenario 1 — Grabación corta
 - iniciar grabación
 - esperar 10 segundos
@@ -232,3 +251,40 @@ Esperado:
 - archivo accesible
 - Android SAF operativo
 - share sheet operativo
+
+---
+
+## Escenario 17 — Vídeo nativo con durable cleanup/scheduler integrado
+
+Estado: `HARDWARE_VALIDATION_PENDING`.
+
+Este escenario no se considera superado por la validación física del 13/08,
+porque journal, runner y scheduler todavía no estaban integrados.
+
+En hardware real:
+
+1. iniciar y finalizar una captura nativa segmentada;
+2. comprobar que se producen, adoptan y suben segmentos MP4 válidos durante la
+   captura;
+3. confirmar completion y autorización durable;
+4. comprobar que `finalized` permite retirar `GC_QUEUE` y ejecutar cleanup
+   sin reiniciar la app;
+5. comprobar que boot sigue siendo no bloqueante;
+6. provocar una reconciliación stale y comprobar el trigger
+   `stale_reconciled`;
+7. reproducir un fallo de reap posterior a completion confirmada y comprobar
+   que no aumenta `complete_attempts` ni se repite `completeSession`;
+8. permitir un reap posterior exitoso y comprobar que retira `GC_QUEUE` y
+   solicita `requestCleanup('finalized')`;
+9. comprobar que una sesión o directorio sin journal permanece invisible al
+   runner.
+
+Resultado esperado:
+
+> La captura nativa sigue protegiendo segmentos durante la grabación y el
+> durable cleanup integrado converge sin degradar ni repetir una completion
+> remota confirmada.
+
+Registrar commit exacto, dispositivo, versión Android, resultados observables y
+evidencias antes de cambiar el estado de
+`HARDWARE_VALIDATION_PENDING`.

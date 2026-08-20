@@ -1,21 +1,40 @@
 # Guardian Cloud — START HERE
 
-⛔ NO APTO — auditoría 2026-07-28; validación anterior retirada; vídeo no protege durante la grabación
+⛔ NO APTO — pendiente la validación hardware del vídeo nativo segmentado con durable cleanup/scheduler integrado
 
-Este documento conserva afirmaciones históricas que ya no constituyen evidencia de validación.
-Hasta completar la reconciliación documental de la fase H, prevalecen estos informes:
+Este documento contiene referencias históricas que deben leerse con la fecha y
+el alcance de su evidencia. El estado vigente se reconstruye desde:
 
-* [Auditoría integral](./audits/GUARDIAN_CLOUD_FULL_AUDIT_2026-07-28.md)
-* [Matriz de trazabilidad](./audits/GUARDIAN_CLOUD_TRACEABILITY_2026-07-28.md)
-* [Plan de remediación](./audits/GUARDIAN_CLOUD_REMEDIATION_PLAN_2026-07-28.md)
+* [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md#capacidades-por-nivel-referencia-canónica),
+  referencia canónica del estado por capacidad;
+* [handoff vigente de durable cleanup/scheduler](./audits/GUARDIAN_CLOUD_DURABLE_CLEANUP_SCHEDULER_HANDOFF_2026-08-20.md);
+* [validación física de la integración nativa segmentada del 13/08](./audits/GUARDIAN_CLOUD_NATIVE_SEGMENTED_INTEGRATION_VALIDATION_2026-08-13.md).
 
-Veredicto vigente: NO APTO. Las afirmaciones de validación contenidas más abajo no deben utilizarse como prueba de funcionamiento real.
+Veredicto vigente: `NO APTO`. La grabación nativa segmentada fue validada
+físicamente el 13/08, pero esa ejecución precede al journal, runner y scheduler
+de durable cleanup actuales y no valida el conjunto integrado.
 
-### Punto de partida actual (2026-07-30)
+### Punto de partida actual (2026-08-20)
+
+* **Native segmented recording:** implementado y validado físicamente el
+  13/08 en el alcance exacto del informe enlazado.
+* **Durable cleanup/scheduler:** `IMPLEMENTED / UNIT_TESTED /
+  HARDWARE_VALIDATION_PENDING`.
+* **Validación automática actual:** 360/360 tests; typecheck con los mismos 12
+  errores TypeScript históricos y cero nuevos; Kotlin
+  `:gc-segmented-recorder:compileDebugKotlin` con `BUILD SUCCESSFUL`;
+  `git diff --check` limpio.
+* **Siguiente gate:** validación hardware del vídeo nativo segmentado con
+  durable cleanup/scheduler integrado.
+
+No están físicamente validados por esta fase el durable cleanup/scheduler, el
+recovery completo de vídeo ni un export final `.mp4`.
+
+### Baseline técnica histórica (2026-07-30)
 
 **Baseline técnica congelada: [`v0.3.0-rc.1`](./releases/v0.3.0-rc.1.md).**
 Es el punto de retorno reproducible del proyecto y lo primero que hay que leer
-antes de tocar nada.
+antes de modificar aquella baseline.
 
 * commit construido `5ac4a03` · build EAS `e98dd3a2-…` · **198/198 tests
   verdes** *(resultado histórico de esa baseline; la condición vigente es que
@@ -26,23 +45,22 @@ antes de tocar nada.
 * **no es una release pública**: sin AAB de producción, sin Closed Testing, sin
   usuarios externos
 
-El veredicto `NO APTO` **sigue vigente**: la baseline no resuelve que el vídeo no
-saque evidencia del dispositivo durante la grabación, ni la ausencia de
-`capture_end_reason`.
+La cifra 198/198 y las limitaciones de vídeo de esa baseline son históricas; no
+describen la implementación actual de `feat/native-segmented-recording`.
 
 > **Qué está implementado y qué está validado** se decide en la tabla de tres
 > niveles de
 > [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md#capacidades-por-nivel-referencia-canónica).
 > Es la referencia canónica: cualquier afirmación de este documento que la
-> contradiga es incorrecta. En particular, **todo el vídeo segmentado, su subida
-> durante la grabación, su recuperación y el export `.mp4` son nivel 3: no
-> implementados ni validados.**
+> contradiga es incorrecta. La validación de la captura y subida nativas no se
+> puede extender al recovery completo, al export `.mp4` ni al durable
+> cleanup/scheduler integrado.
 
 Cómo se trabaja a partir de aquí:
 [`DEVELOPMENT_WORKFLOW.md`](./DEVELOPMENT_WORKFLOW.md).
 
-Las afirmaciones históricas de más abajo **se conservan sin retirar**. La
-reconciliación documental integral pertenece a la fase H.
+Las afirmaciones históricas de más abajo se conservan como contexto de producto
+y no sustituyen el estado por capacidad ni los informes de validación vigentes.
 
 ## 1. Qué es este proyecto
 

@@ -83,6 +83,7 @@ import {
   createSessionCleanupRunner,
   type CleanupOutcome,
 } from '@/video/sessionCleanupRunner';
+import { createCleanupScheduler } from '@/video/sessionCleanupScheduler';
 import {
   scanOrphans,
   formatAgeHuman,
@@ -1527,6 +1528,14 @@ export async function reconcileStaleSessionsWithBackend(): Promise<{
     reconciled += 1;
   }
 
+  // This loop can create authorizations that the boot pass — which runs before
+  // it — could not have seen. Asking here is what stops them from waiting until
+  // the next launch. Coalesced into a single extra pass by the scheduler, no
+  // matter how many sessions this reconciliation confirmed.
+  if (reconciled > 0) {
+    sessionCleanupScheduler.requestCleanup('stale_reconciled');
+  }
+
   return { reconciled, not_reconciled };
 }
 
@@ -2343,6 +2352,24 @@ const sessionCleanupRunner = createSessionCleanupRunner({
 });
 
 /**
+ * Single-flight front door to the cleanup runner.
+ *
+ * Every trigger goes through here and none of them waits: cleanup is durable
+ * maintenance, so it must never delay recovery, network reconciliation or the
+ * user's ability to start recording. A request arriving while a pass is running
+ * produces exactly one more pass, which is what keeps a session finalized
+ * mid-pass from waiting until the next launch.
+ */
+const sessionCleanupScheduler = createCleanupScheduler({
+  runner: sessionCleanupRunner,
+  logger: {
+    log: (event, fields) => {
+      console.log(event, fields);
+    },
+  },
+});
+
+/**
  * THE single place where a session's local evidence becomes deletable.
  *
  * Calls `completeSession`, classifies what actually happened, and only for a
@@ -2384,6 +2411,7 @@ type FinalizeFailureReason =
 type FinalizeOutcome =
   | { kind: 'completed' }
   | { kind: 'already_completed' }
+  | { kind: 'confirmed_reap_pending' }
   | { kind: 'failed'; reason: FinalizeFailureReason };
 
 async function finalizeAndAuthorizeCleanup(
@@ -2425,7 +2453,26 @@ async function finalizeAndAuthorizeCleanup(
   }
 
   await queueMarkSessionCompleted(sessionId);
-  await reapEntry(sessionId, uri);
+  try {
+    await reapEntry(sessionId, uri);
+  } catch {
+    // Completion and its cleanup authorization are already durable, and the
+    // queue entry is already marked completed. Reaping is local maintenance:
+    // leave the entry for the next pass without turning the confirmed remote
+    // completion into a failed attempt or calling completeSession again.
+    return { kind: 'confirmed_reap_pending' };
+  }
+
+  // Only here, once the authorization is on disk and both the mark and the reap
+  // have finished. Every earlier return path — an unconfirmed completion, a
+  // refused or thrown authorization — leaves without asking for cleanup,
+  // because there is nothing the runner would be allowed to delete yet.
+  //
+  // Non-blocking and unawaited on purpose: the backend has confirmed and
+  // GC_QUEUE is already gone, so a cleanup failure must not become a
+  // finalization failure, must not bump complete_attempts, and must not send
+  // this session back through completeSession.
+  sessionCleanupScheduler.requestCleanup('finalized');
 
   return authorization.code === 'http_200'
     ? { kind: 'completed' }
@@ -2566,6 +2613,7 @@ export async function tryFinalizeReadySessions(): Promise<boolean> {
 
     if (entry.session_completed) {
       await reapEntry(entry.session_id, entry.uri);
+      sessionCleanupScheduler.requestCleanup('finalized');
       anyFinalized = true;
       continue;
     }
@@ -2600,6 +2648,13 @@ export async function tryFinalizeReadySessions(): Promise<boolean> {
           sessionId: entry.session_id,
           attempts,
           reason: finalized.reason,
+        });
+        continue;
+      }
+      if (finalized.kind === 'confirmed_reap_pending') {
+        console.log('GC_QUEUE_SESSION_REAP_DEFERRED', {
+          sid_prefix: entry.session_id.slice(0, 8),
+          reason: 'reap_threw',
         });
         continue;
       }
@@ -4905,17 +4960,15 @@ export default function Index() {
         // Directories with no journal entry are invisible here. That is the
         // whole design: age, emptiness and absence from GC_QUEUE never
         // authorize a deletion.
-        try {
-          const report = await sessionCleanupRunner.reconcile();
-          if (report.considered > 0) {
-            console.log('GC_CLEANUP_BOOT_RECONCILED', { ...report });
-          }
-        } catch {
-          // Closed reason only: a storage or bridge failure can carry a path or
-          // an identifier in its message, and this log must not become the
-          // channel that leaks one.
-          console.log('GC_CLEANUP_BOOT_FAILED', { reason: 'reconcile_threw' });
-        }
+        //
+        // Requested, not awaited. Cleanup is durable maintenance that survives
+        // in the journal, so it must not delay the recovery steps below, the
+        // backend reconciliation that follows them, or the moment GRABAR
+        // becomes usable. A slow or retrying pass would otherwise hold all of
+        // that behind it. `reconcileStaleSessionsWithBackend` further down asks
+        // again once it has created new authorizations, and the scheduler
+        // collapses both requests into the passes actually needed.
+        sessionCleanupScheduler.requestCleanup('boot');
 
         // Backend reconciliation: for entries that locally still look
         // failed/incomplete (typically `status='failed'` chunks left

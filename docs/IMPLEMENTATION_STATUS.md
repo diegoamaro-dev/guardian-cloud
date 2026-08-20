@@ -1,42 +1,44 @@
 # IMPLEMENTATION_STATUS.md
 
-⛔ NO APTO — auditoría 2026-07-28; validación anterior retirada; vídeo no protege durante la grabación
+⛔ NO APTO — pendiente la validación hardware del vídeo nativo segmentado con durable cleanup/scheduler integrado
 
-Este documento conserva afirmaciones históricas que ya no constituyen evidencia de validación.
-Hasta completar la reconciliación documental de la fase H, prevalecen estos informes:
+Estado vigente a 2026-08-20. Fuentes de continuidad y evidencia:
 
-* [Auditoría integral](./audits/GUARDIAN_CLOUD_FULL_AUDIT_2026-07-28.md)
-* [Matriz de trazabilidad](./audits/GUARDIAN_CLOUD_TRACEABILITY_2026-07-28.md)
-* [Plan de remediación](./audits/GUARDIAN_CLOUD_REMEDIATION_PLAN_2026-07-28.md)
+* [handoff vigente de durable cleanup/scheduler](./audits/GUARDIAN_CLOUD_DURABLE_CLEANUP_SCHEDULER_HANDOFF_2026-08-20.md);
+* [validación física de la integración nativa segmentada del 13/08](./audits/GUARDIAN_CLOUD_NATIVE_SEGMENTED_INTEGRATION_VALIDATION_2026-08-13.md).
 
-Veredicto vigente: NO APTO. Las afirmaciones de validación contenidas más abajo no deben utilizarse como prueba de funcionamiento real.
+La validación física del 13/08 cubre el productor nativo segmentado existente
+entonces. No cubre el journal, runner y scheduler integrados después.
 
 ---
 
 ## Capacidades por nivel (referencia canónica)
 
 Esta tabla es la **fuente única** para saber qué está implementado y qué está
-validado. Cualquier afirmación en otro documento que la contradiga es
-incorrecta, y prevalece esta.
+validado, y con qué alcance. Cualquier afirmación en otro documento que la
+contradiga es incorrecta.
 
-### Nivel 1 — Implementado y validado
+### Nivel 1 — Implementado con validación disponible
 
 | Capacidad | Matiz |
 |---|---|
 | Grabación de audio | — |
-| Fragmentación (chunking) | En vivo cada 1,5 s, **sólo en audio** |
-| Subida durante la grabación | **Sólo audio.** En vídeo no ocurre (`GC-AUD-001`) |
+| Fragmentación de audio | En vivo cada 1,5 s |
+| Subida de audio durante la grabación | Validada en el alcance histórico del MVP |
+| Grabación nativa segmentada de vídeo | Implementada y validada físicamente el 13/08 en OnePlus 6 / Android 11; segmentos MP4 independientes H.264/AAC |
+| Adopción y subida del vídeo durante la captura | Implementada y validada físicamente el 13/08; primer upload observado durante la captura y productor Expo no activo en paralelo |
 | `GC_QUEUE` como fuente de verdad | — |
 | Cola persistente | AsyncStorage; sobrevive a cierre forzado y a reinicio |
 | Worker single-flight con reintentos | — |
 | Recovery automático | Tras kill y al abrir la app. **No** tras reinicio sin abrirla (`I5c`) |
-| Evidencia fuera del dispositivo cuanto antes | **Sólo audio**, por lo anterior |
+| Evidencia fuera del dispositivo durante la captura | Audio y vídeo nativo segmentado; la afirmación de vídeo se limita a la validación física del 13/08 |
 | Exportación utilizable en `.m4a` | — |
 
 ### Nivel 2 — Implementado, pendiente de validación completa
 
 | Capacidad | Qué falta |
 |---|---|
+| Durable cleanup journal/runner/scheduler | `IMPLEMENTED / UNIT_TESTED / HARDWARE_VALIDATION_PENDING`; falta validar en dispositivo la integración completa con vídeo nativo |
 | Reliability Card | No se observó en Home durante la instalación de validación y la causa sigue sin determinar. Cubierta por pruebas unitarias, sin validación en dispositivo |
 | Comportamiento y permisos en Android 13+ | `POST_NOTIFICATIONS` es SDK 33+ y el único dispositivo probado es API 30. Las tres ramas están cubiertas por pruebas unitarias, pero **prueba unitaria no es validación en dispositivo** |
 | Matriz completa de resiliencia | Mala red, segundo plano prolongado, cierre forzado, reinicio, recovery y export, sin reejecutar con el artefacto vigente |
@@ -45,22 +47,53 @@ incorrecta, y prevalece esta.
 
 | Capacidad | Estado |
 |---|---|
-| Vídeo segmentado | No implementado |
-| Subida del vídeo durante la grabación | **No implementado.** Es `GC-AUD-001`, causa central del veredicto `NO APTO` |
-| Recuperación del vídeo | No implementado |
+| Recuperación completa del vídeo nativo | No consta validación integrada; no se declara implementada o validada por la evidencia actual |
 | Exportación `.mp4` | No implementada ni validada |
 
 > **Criterio de incompatibilidad.** Cualquier propuesta de «vídeo post-stop»
 > —fragmentar y encolar **después** de detener la captura— es **incompatible
 > con el principio central del producto**: «si grabas unos segundos, al menos
-> una parte ya está fuera del dispositivo». No resuelve `GC-AUD-001`: lo
-> documenta. Una solución válida debe sacar evidencia del dispositivo
-> **durante** la grabación de vídeo.
+> una parte ya está fuera del dispositivo». La ruta nativa vigente sí genera,
+> adopta y sube segmentos durante la captura. Esto no demuestra recovery
+> completo, export `.mp4` ni durable cleanup en hardware.
 
 Fuera de estos tres niveles, y explícitamente **no** capacidades actuales:
 cifrado local de chunks (sólo `TODO` en el código), recovery autónomo tras
 reinicio sin abrir la app (`I5c`), `capture_end_reason`, Closed Testing,
 usuarios externos y publicación en Play Store.
+
+### Problema 8 — Durable cleanup scheduler
+
+Estado: `IMPLEMENTED / UNIT_TESTED / HARDWARE_VALIDATION_PENDING`.
+
+La implementación demuestra por pruebas automáticas:
+
+* scheduler single-flight;
+* `pending=false` antes de `reconcile`;
+* coalescencia de solicitudes del mismo tick;
+* una solicitud durante una pasada provoca exactamente otra pasada;
+* triggers cerrados `boot`, `finalized` y `stale_reconciled`;
+* boot cleanup no bloqueante;
+* errores del scheduler contenidos fuera del completion flow;
+* una sesión sin journal permanece invisible al runner;
+* un fallo local posterior a completion y autorización durable no incrementa
+  `complete_attempts`, no repite `completeSession` y no degrada la
+  finalización confirmada;
+* un reap diferido exitoso retira `GC_QUEUE` y vuelve a solicitar cleanup con
+  motivo `finalized`.
+
+### Validación automática actual
+
+| Comprobación | Resultado |
+|---|---|
+| Suite completa | **360/360** |
+| Typecheck | **12 errores TypeScript históricos, cero nuevos** |
+| `:gc-segmented-recorder:compileDebugKotlin` | **BUILD SUCCESSFUL** |
+| `git diff --check` | Limpio |
+
+El siguiente gate es la **validación hardware del vídeo nativo segmentado con
+durable cleanup/scheduler integrado**. El trabajo no está cerrado hasta
+superarlo.
 
 ---
 
@@ -186,6 +219,8 @@ The MVP currently supports:
 - Backend callback to mobile deep link
 - Session creation
 - Audio recording
+- Native segmented video recording
+- Native MP4 segment adoption and upload during capture
 - Chunk generation
 - Real chunk upload to Google Drive
 - Chunk metadata registration
@@ -193,18 +228,29 @@ The MVP currently supports:
 - Recovery after app kill
 - Recovery after device reboot
 - Session completion
-- Local cleanup after success
-- Evidence export from a given session (download chunks via backend proxy, verify sha256, concatenate in order, write .m4a to documentDirectory, produce partial result when some chunks are missing/corrupt)
+- Durable cleanup journal, runner and single-flight scheduler, implemented and
+  unit tested with hardware validation pending
+- Audio evidence export from a given session (download chunks via backend
+  proxy, verify sha256, concatenate in order, write `.m4a` to
+  `documentDirectory`, produce a partial result when chunks are
+  missing/corrupt)
 
 ## Current validated criterion
 
-The system can record, generate chunks, upload them to Drive, recover pending chunks after failure, complete the session, clean local state, and export the session's evidence back as a single .m4a file from the recorded chunks.
+The validated audio path can record, generate chunks, upload them to Drive,
+recover pending chunks after failure, complete the session, clean local state,
+and export evidence as a single `.m4a`.
+
+Separately, native segmented video generation, adoption and upload during
+capture were physically validated on 2026-08-13. That execution did not include
+the current durable cleanup scheduler. Complete native-video recovery and final
+`.mp4` export are not declared physically validated.
 
 ## Product status
 
 The system is no longer a prototype.
 
-It has been validated under:
+The historical audio/legacy MVP path has been validated under:
 
 * app kill
 * network loss
@@ -351,9 +397,13 @@ Now:
 Audio:
 - partial `.aac` recovery is usable because AAC ADTS frames are self-framing.
 
-Video:
+Video, para la ruta histórica que trocea un único archivo después de detener:
 - partial `.mp4` recovery may not be directly playable if the MP4 metadata/moov atom was not written yet.
 - It is still preserved as forensic partial evidence.
+
+Los segmentos producidos por la ruta nativa actual son MP4 independientes y
+fueron reproducibles en la validación del 13/08. Esa evidencia no demuestra el
+recovery completo de una sesión nativa ni un export final `.mp4`.
 
 ### Validated scenario
 
@@ -370,7 +420,7 @@ Real-device test passed:
 
 This closes the gap where evidence chunks survived remotely but were not discoverable after local state loss.
 
-### Video upload pipeline optimization (validated)
+### Legacy post-stop video upload pipeline optimization (validated)
 
 Status: ✅ validated on real device
 
@@ -405,5 +455,9 @@ Real-device validation completed:
 
 Important:
 This optimization only affects the post-stop video chunking pipeline.
+It is a historical validation of that legacy path, not evidence for complete
+native-video recovery, final `.mp4` export or the integrated durable cleanup
+scheduler.
+
 Audio live-stream chunking remains independent and optimized separately
 (32 KB disk-backed audio chunks).
