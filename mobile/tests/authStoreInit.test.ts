@@ -14,6 +14,11 @@
  */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import {
+  AuthApiError,
+  AuthRetryableFetchError,
+  AuthSessionMissingError,
+} from '@supabase/supabase-js';
 
 // The global setup mocks `@/auth/store`; this suite needs the real one.
 vi.unmock('@/auth/store');
@@ -54,7 +59,7 @@ vi.mock('@/auth/supabase', () => ({
   },
 }));
 
-import { useAuthStore } from '../src/auth/store';
+import { useAuthStore, getAccessToken, getFreshAccessToken } from '../src/auth/store';
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -188,5 +193,106 @@ describe('the subscription still notifies on later transitions', () => {
     notifyClientAuth.mockClear();
     handler('SIGNED_OUT', null);
     expect(notifyClientAuth).toHaveBeenCalledWith(false);
+  });
+});
+
+/**
+ * GC-AUTH-001 — the four ways a token request can fail must stay
+ * distinguishable.
+ *
+ * The original diagnosis cost a full log replay because every failure
+ * produced the same opaque `AUTH MISSING` line: a device that had simply
+ * never signed in, one whose refresh could not reach the network, and one
+ * whose refresh the server had rejected outright were indistinguishable
+ * after the fact. Only the last of those destroys the stored session, and
+ * only the middle one is worth retrying — so collapsing them hid exactly
+ * the distinction that mattered.
+ */
+describe('TEST_TOKEN_FAILURE_REASONS_ARE_DISTINGUISHABLE', () => {
+  it('a clean absence of session reports no_session', async () => {
+    getSession.mockResolvedValue({ data: { session: null }, error: null });
+    expect(await getAccessToken()).toEqual({
+      ok: false,
+      reason: 'no_session',
+      name: null,
+    });
+  });
+
+  it('a session carrying no access token also reports no_session', async () => {
+    getSession.mockResolvedValue({
+      data: { session: { user: { id: 'u1' } } },
+      error: null,
+    });
+    const result = await getAccessToken();
+    expect(result).toEqual({ ok: false, reason: 'no_session', name: null });
+  });
+
+  it('an unreachable network reports network, which is retryable', async () => {
+    getSession.mockResolvedValue({
+      data: { session: null },
+      error: new AuthRetryableFetchError('Network request failed', 0),
+    });
+    const result = await getAccessToken();
+    expect(result).toEqual({
+      ok: false,
+      reason: 'network',
+      name: 'AuthRetryableFetchError',
+    });
+  });
+
+  it('a server-rejected refresh reports auth_non_retryable', async () => {
+    getSession.mockResolvedValue({
+      data: { session: null },
+      error: new AuthApiError('Invalid Refresh Token', 400, 'invalid_grant'),
+    });
+    const result = await getAccessToken();
+    expect(result).toEqual({
+      ok: false,
+      reason: 'auth_non_retryable',
+      name: 'AuthApiError',
+    });
+  });
+
+  it('any other auth error falls back to refresh_failed', async () => {
+    getSession.mockResolvedValue({
+      data: { session: null },
+      error: new AuthSessionMissingError(),
+    });
+    const result = await getAccessToken();
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error('unreachable');
+    expect(result.reason).toBe('refresh_failed');
+  });
+
+  it('a usable session reports the token', async () => {
+    getSession.mockResolvedValue({
+      data: { session: { access_token: 'tok', user: { id: 'u1' } } },
+      error: null,
+    });
+    expect(await getAccessToken()).toEqual({ ok: true, token: 'tok' });
+  });
+
+  it('no failure path ever leaks a message — only a class name', async () => {
+    getSession.mockResolvedValue({
+      data: { session: null },
+      error: new AuthApiError('token eyJsecret.payload.sig', 400, 'invalid_grant'),
+    });
+    const result = await getAccessToken();
+    expect(JSON.stringify(result)).not.toMatch(/eyJ/);
+    expect(JSON.stringify(result)).not.toContain('secret');
+  });
+
+  it('getFreshAccessToken keeps its old contract for existing callers', async () => {
+    getSession.mockResolvedValue({
+      data: { session: { access_token: 'tok' } },
+      error: null,
+    });
+    expect(await getFreshAccessToken()).toBe('tok');
+
+    getSession.mockResolvedValue({
+      data: { session: null },
+      error: new AuthRetryableFetchError('down', 0),
+    });
+    expect(await getFreshAccessToken()).toBeNull();
   });
 });

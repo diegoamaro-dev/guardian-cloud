@@ -14,7 +14,12 @@
  */
 
 import { create } from 'zustand';
-import type { Session, User } from '@supabase/supabase-js';
+import {
+  isAuthApiError,
+  isAuthRetryableFetchError,
+  type Session,
+  type User,
+} from '@supabase/supabase-js';
 import { supabase } from './supabase';
 // PHASE 1A: the upload queue pauses globally on `401 NO_TOKEN`. Only a
 // usable Supabase session may lift that pause, so auth transitions have
@@ -149,8 +154,50 @@ export const useAuthStore = create<AuthState>((set) => ({
  * sync. On failure (no refresh_token, network error, revoked refresh
  * token) it returns `{ session: null }` and we propagate that as a
  * null token — callers then surface the 401 path.
+ *
+ * GC-AUTH-001: the failure REASON used to be thrown away here, and the
+ * only trace left in the logs was `AUTH MISSING`. That made four very
+ * different situations indistinguishable after the fact — no session at
+ * all, a refresh that could not reach the network, a refresh the server
+ * rejected outright, and an unexpected auth error — which is why the
+ * original diagnosis took a full log replay to pin down. `getAccessToken`
+ * now reports which one it was; `getFreshAccessToken` is the unchanged
+ * convenience wrapper for callers that only need the token.
  */
-export async function getFreshAccessToken(): Promise<string | null> {
+export type TokenFailureReason =
+  /** No session in storage, and no error either. Genuinely signed out. */
+  | 'no_session'
+  /** The inline refresh could not reach Supabase. Retryable. */
+  | 'network'
+  /** Supabase answered and rejected the refresh (e.g. a revoked token). */
+  | 'auth_non_retryable'
+  /** An auth error we could not classify further. */
+  | 'refresh_failed';
+
+export type TokenResult =
+  | { ok: true; token: string }
+  | { ok: false; reason: TokenFailureReason; name: string | null };
+
+export async function getAccessToken(): Promise<TokenResult> {
   const { data, error } = await supabase.auth.getSession();
-  return error ? null : data.session?.access_token ?? null;
+
+  if (error) {
+    const reason: TokenFailureReason = isAuthRetryableFetchError(error)
+      ? 'network'
+      : isAuthApiError(error)
+        ? 'auth_non_retryable'
+        : 'refresh_failed';
+    // `name` is a class name (AuthApiError, AuthRetryableFetchError…),
+    // never a message and never a token.
+    return { ok: false, reason, name: error.name ?? null };
+  }
+
+  const token = data.session?.access_token ?? null;
+  if (!token) return { ok: false, reason: 'no_session', name: null };
+  return { ok: true, token };
+}
+
+export async function getFreshAccessToken(): Promise<string | null> {
+  const result = await getAccessToken();
+  return result.ok ? result.token : null;
 }

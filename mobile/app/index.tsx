@@ -4485,6 +4485,24 @@ export default function Index() {
         await new Promise(r => setTimeout(r, 500));
         setTestStatus(`API URL: ${env.apiUrl}`);
         await new Promise(r => setTimeout(r, 50));
+        // GC-AUTH-001 — bring the auth store to life, exactly once.
+        //
+        // `init()` had no callers at all. Two things were dead as a
+        // result: `onAuthStateChange` was never subscribed, so
+        // TOKEN_REFRESHED and SIGNED_OUT went unobserved; and
+        // `notifyClientAuth` — the only thing that lifts the Phase 1A
+        // `client_auth` queue pause — could never fire. The queue could
+        // enter that pause and never leave it.
+        //
+        // Called here, at the top of the mount-once bootstrap effect and
+        // BEFORE the identity state machine, so the subscription is
+        // already live when a first-boot `signInAnonymously()` emits
+        // SIGNED_IN. `store.ts` guards the subscription with a
+        // module-level latch, so a second invocation (React StrictMode
+        // double-invokes effects in dev) cannot register a second
+        // listener.
+        await useAuthStore.getState().init();
+
         // Auth bootstrap — anonymous Supabase user per device. Each
         // install gets its own distinct auth.users.id, so the existing
         // server-side `user_id` filters on destinations / sessions /
@@ -6409,6 +6427,47 @@ export default function Index() {
           mode: recordingModeRef.current,
           session_id: sessionIdRef.current,
         });
+      }
+
+      // GC-AUTH-001 — auth-js expects React Native hosts to drive the
+      // refresh ticker from AppState; on this platform it starts it
+      // itself only via `document.visibilityState`, which does not
+      // exist here. `autoRefreshToken: true` alone therefore never
+      // started a ticker at all, leaving every refresh to happen lazily
+      // inside whichever `getSession()` happened to notice the token had
+      // aged past the 90s expiry margin.
+      //
+      // Reusing this listener rather than adding one: it is already
+      // mount-once (`[]` deps) with `sub.remove()` on unmount, so no
+      // duplicate registration is possible. `_startAutoRefresh()` also
+      // stops any existing ticker before creating one, so repeated
+      // 'active' transitions cannot leave two timers running.
+      void (nextState === 'active'
+        ? supabase.auth.startAutoRefresh()
+        : supabase.auth.stopAutoRefresh()
+      ).catch(() => {
+        /* refresh scheduling is best-effort; never break the handler */
+      });
+
+      // A device that booted into IDENTITY_DEGRADED has no session and
+      // will not mint one. Coming back to the foreground is the natural
+      // moment to ask again — a `getSession()` that failed on a dead
+      // network may well succeed now. No minting happens here either:
+      // this only observes, and `onAuthStateChange` does the rest.
+      if (nextState === 'active') {
+        void supabase.auth
+          .getSession()
+          .then(({ data, error }) => {
+            if (!data.session) {
+              console.log('GC_IDENTITY_RESUME_PROBE', {
+                recovered: false,
+                error_name: error?.name ?? null,
+              });
+            }
+          })
+          .catch(() => {
+            /* diagnostics must never break the AppState handler */
+          });
       }
       // Video is foreground-only (honest mode). If the app went to
       // background during a video session, run a clean shutdown so the

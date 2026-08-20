@@ -16,7 +16,7 @@
  */
 
 import { env } from '@/config/env';
-import { getFreshAccessToken } from '@/auth/store';
+import { getAccessToken } from '@/auth/store';
 
 export interface ApiErrorBody {
   error?: { code?: string; message?: string };
@@ -67,12 +67,20 @@ export async function apiFetch<T = unknown>(
     // when the persisted token has expired (the store snapshot can
     // be stale after a background window where the auto-refresh
     // timer didn't fire on time).
-    const token = await getFreshAccessToken();
-    if (!token) {
-      console.log('AUTH MISSING', { path });
+    const result = await getAccessToken();
+    if (!result.ok) {
+      // GC-AUTH-001: `reason` is the whole point of this line. Without it
+      // a lost network packet and a server-revoked session produce the
+      // same log, and a device flooding thousands of these tells you
+      // nothing about which. `name` is a class name, never a message.
+      console.log('AUTH MISSING', {
+        path,
+        reason: result.reason,
+        name: result.name,
+      });
       throw new ApiError(401, 'NO_TOKEN', 'No access token in store', null);
     }
-    headers.Authorization = `Bearer ${token}`;
+    headers.Authorization = `Bearer ${result.token}`;
   }
 
   // Compose the abort signal: our own timeout + any caller signal.
