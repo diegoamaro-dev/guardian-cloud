@@ -122,6 +122,56 @@ describe('TEST_INIT_WITH_NULL_SESSION_DOES_NOT_CLEAR_PAUSE', () => {
   });
 });
 
+/**
+ * GC-AUTH-001 regression guard.
+ *
+ * Identity in this app is an anonymous Supabase user, so the persisted
+ * session is the ONLY handle on every session the device has already
+ * uploaded — there is no login to fall back on. `signOut()` clears that
+ * storage unconditionally, which is why `init()` must never reach for it
+ * on its own: a transient network blip during the inline refresh raises
+ * an error here too, and answering that by wiping storage costs the user
+ * access to their evidence.
+ *
+ * supabase-js already removes a session whose refresh fails with a
+ * genuinely non-retryable auth error. Deciding that is its job, not ours.
+ */
+describe('TEST_INIT_NEVER_DESTROYS_THE_PERSISTED_SESSION', () => {
+  it('an error from getSession() does not trigger signOut', async () => {
+    getSession.mockResolvedValue({
+      data: { session: null },
+      error: { name: 'AuthApiError', message: 'Invalid Refresh Token' },
+    });
+
+    await useAuthStore.getState().init();
+
+    expect(signOut).not.toHaveBeenCalled();
+  });
+
+  it('a transient network failure does not trigger signOut either', async () => {
+    getSession.mockResolvedValue({
+      data: { session: null },
+      error: { name: 'AuthRetryableFetchError', message: 'Network request failed' },
+    });
+
+    await useAuthStore.getState().init();
+
+    expect(signOut).not.toHaveBeenCalled();
+    // The store still reports signed-out for this process — reporting the
+    // state and destroying it are different things.
+    expect(useAuthStore.getState().status).toBe('signed-out');
+    expect(useAuthStore.getState().accessToken).toBeNull();
+  });
+
+  it('a clean "no session" result does not trigger signOut', async () => {
+    getSession.mockResolvedValue({ data: { session: null }, error: null });
+
+    await useAuthStore.getState().init();
+
+    expect(signOut).not.toHaveBeenCalled();
+  });
+});
+
 describe('the subscription still notifies on later transitions', () => {
   it('onAuthStateChange forwards a usable session', async () => {
     getSession.mockResolvedValue({ data: { session: null }, error: null });

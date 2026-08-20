@@ -58,19 +58,27 @@ export const useAuthStore = create<AuthState>((set) => ({
 
     // getSession() pulls whatever supabase-js has already hydrated from
     // AsyncStorage (or null if this is a fresh install / signed-out user).
-    // Also read `error`: an AuthApiError here means the persisted refresh
-    // token is invalid (revoked, expired, or corrupted). In that case we
-    // must explicitly sign out so supabase-js wipes AsyncStorage — without
-    // this, every cold start retries the same bad token indefinitely.
+    //
+    // GC-AUTH-001: `error` here is NOT proof that the persisted session is
+    // unusable. `getSession()` also surfaces a transient network failure
+    // raised by the inline refresh it performs, and supabase-js already
+    // wipes the stored session by itself (`_removeSession`) whenever the
+    // refresh fails with a genuinely non-retryable auth error.
+    //
+    // The previous implementation answered any error with `signOut()`,
+    // which clears AsyncStorage unconditionally. Since this app has no
+    // login — identity is an anonymous Supabase user — destroying the
+    // stored session destroys the only handle on every session the device
+    // has already uploaded. A dropped Wi-Fi packet must never cost the
+    // user their evidence.
+    //
+    // So: report the error, leave the store signed-out for this process,
+    // and leave storage strictly alone. Recovering (or not) is
+    // supabase-js's decision to make, not ours.
     const { data, error } = await supabase.auth.getSession();
 
     if (error) {
-      console.log('SESSION_INVALID → forcing logout', error.message);
-      try {
-        await supabase.auth.signOut();
-      } catch {
-        // Ignore server-side error — we clear local state regardless.
-      }
+      console.log('SESSION_LOAD_ERROR', { name: error.name });
       set({ status: 'signed-out', user: null, accessToken: null });
     } else {
       console.log('SESSION_LOAD_RESULT', data.session ? 'signed-in' : 'no session');
