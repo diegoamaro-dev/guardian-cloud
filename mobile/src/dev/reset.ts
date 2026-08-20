@@ -13,6 +13,14 @@ import * as FileSystem from 'expo-file-system/legacy';
 //   mobile/src/api/history.ts  HISTORY_KEY            'history.sessions'
 // Anything else in AsyncStorage (notably the Supabase `sb-*-auth-token`
 // entries) is left untouched.
+//
+// DELIBERATELY ABSENT: `gc.identity.v1` (see src/auth/identityMarker.ts).
+// This reset preserves the Supabase session on purpose, so it is not an
+// identity reset — and the marker records a historical fact ("an identity
+// has existed on this device") that wiping volatile state does not undo.
+// Adding it here would mean a reset followed by a lost session mints a
+// fresh anonymous user and silently orphans everything already uploaded,
+// which is exactly the GC-AUTH-001 failure. Leave it out.
 const VOLATILE_KEYS = [
   'test.pending_retry',
   'export.last_session_id',

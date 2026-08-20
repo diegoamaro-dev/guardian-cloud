@@ -56,6 +56,11 @@ import {
 } from '@/upload/pauseStore';
 import { listSessionChunks } from '@/api/export';
 import { useAuthStore, getFreshAccessToken } from '@/auth/store';
+import {
+  decideIdentityState,
+  markIdentityInitialized,
+  resolveIdentityInitialized,
+} from '@/auth/identityMarker';
 import { appendHistoryEntry, type SessionMode } from '@/api/history';
 import { hardResetAppState } from '@/dev/reset';
 import type { ChunkPayload } from '@/recording/chunkProducer';
@@ -4495,49 +4500,80 @@ export default function Index() {
         // it is the only reliable signal we can pivot off to detect
         // and purge those legacy sessions on app update.
         const HARDCODED_LEGACY_EMAIL = 'diego@hotmail.com';
-        const existingSession = (await supabase.auth.getSession()).data
-          .session;
+        const existingProbe = await supabase.auth.getSession();
+        const existingSession = existingProbe.data.session;
         if (existingSession?.user?.email === HARDCODED_LEGACY_EMAIL) {
           console.log('AUTH PURGE legacy hardcoded session');
           await supabase.auth.signOut();
         }
 
-        let bootstrapSession = (await supabase.auth.getSession()).data
-          .session;
-        if (!bootstrapSession) {
-          // Capture the pre-signin user id (if any survived the legacy
-          // purge above). For the common cold-boot case `existingSession`
-          // was already null and `prev_sub` will be null too. The
-          // meaningful diagnostic case is when `prev_sub` is a real UUID
-          // that differs from `new_sub` — that combination means the
-          // device's persisted auth was lost between runs, which lines
-          // up 1:1 with the "GC_QUEUE entries=0 after restart" symptom
-          // (Clear Data / OS data-pressure wipe / uninstall+reinstall
-          // would clear both Supabase tokens AND the queue key).
-          const prevSub = existingSession?.user?.id ?? null;
-          const legacyPurged =
-            existingSession?.user?.email === HARDCODED_LEGACY_EMAIL;
+        // GC-AUTH-001 — identity state machine.
+        //
+        // This used to read `!session` as "no identity has ever existed
+        // here" and answer it by minting a new anonymous user. Because a
+        // new sign-in overwrites the persisted session and this app has
+        // no login, that made every transient failure — a dropped
+        // packet, a refresh that could not complete — permanently orphan
+        // the identity that owned everything already uploaded.
+        //
+        // Now the decision needs two inputs: whether a session came back,
+        // AND durable proof about whether an identity ever existed.
+        // `error` is read too, and it never opens the minting gate: a
+        // `getSession()` that failed cannot prove absence, it only proves
+        // we could not find out.
+        const bootstrapProbe = await supabase.auth.getSession();
+        let bootstrapSession = bootstrapProbe.data.session;
+        const { initialized, fromLegacyProbe } =
+          await resolveIdentityInitialized();
+        const decision = decideIdentityState({
+          hasSession: !!bootstrapSession,
+          hasError: !!bootstrapProbe.error,
+          initialized,
+        });
+        console.log('GC_IDENTITY_STATE', {
+          state: decision.state,
+          reason: decision.reason,
+          initialized,
+          from_legacy_probe: fromLegacyProbe,
+          had_error: !!bootstrapProbe.error,
+          error_name: bootstrapProbe.error?.name ?? null,
+        });
+
+        if (decision.state === 'IDENTITY_DEGRADED') {
+          // Deliberately NOT minting. The device keeps whatever identity
+          // it has (or had); recovery is retried on foreground resume by
+          // the AppState handler. Capture and the queue are unaffected —
+          // evidence is never held hostage to the backend.
+          setTestStatus('Sin sesión — reintentando');
+          return;
+        }
+
+        if (decision.state === 'FIRST_IDENTITY') {
           const { data: anonData, error: anonError } =
             await supabase.auth.signInAnonymously();
-          // Diagnostic-only — fires regardless of success/failure so a
-          // failed sign-in (with prev_sub captured) is also visible.
           console.log('GC_ANON_SIGNIN', {
-            prev_sub: prevSub,
-            new_sub: anonData?.user?.id ?? null,
-            legacy_purged: legacyPurged,
-            error: anonError ? anonError.message : null,
+            new_sub_prefix: anonData?.user?.id?.slice(0, 8) ?? null,
+            error: anonError ? anonError.name : null,
           });
           if (anonError || !anonData.session) {
+            // No marker is written: a sign-in that failed did not create
+            // an identity, and pretending otherwise would wall the device
+            // off permanently on its very first boot.
             setTestStatus('No se pudo iniciar sesión anónima');
             console.log('AUTH ANON_SIGNIN_FAIL', {
-              message: anonError?.message ?? 'no session returned',
+              message: anonError?.name ?? 'no session returned',
             });
             return;
           }
           bootstrapSession = anonData.session;
+          await markIdentityInitialized(anonData.user?.id ?? null);
           console.log('AUTH ANON_SIGNIN_OK', {
-            sub: anonData.user?.id ?? null,
+            sub_prefix: anonData.user?.id?.slice(0, 8) ?? null,
           });
+        } else {
+          // IDENTITY_OK. Back-fill the marker for devices that already
+          // had a live identity before this shipped. Idempotent.
+          await markIdentityInitialized(bootstrapSession?.user?.id ?? null);
         }
 
         const {
