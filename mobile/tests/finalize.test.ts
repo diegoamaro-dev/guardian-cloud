@@ -429,3 +429,102 @@ describe('persistence sanity', () => {
     expect(Array.isArray(JSON.parse(raw as string))).toBe(true);
   });
 });
+
+/**
+ * GC-AUTH-001 — the vacuous-gate guard.
+ *
+ * The gate asks "is every index in 0..expectedChunks-1 uploaded?". For
+ * an entry whose chunker never ran, that range is EMPTY, so the answer
+ * is trivially yes and the entry sails straight through to
+ * `completeSession` + `reapEntry` — and `reapEntry` deletes the file the
+ * entry points at.
+ *
+ * "The empty set is fully uploaded" is true arithmetic and a
+ * catastrophic operational rule. Such an entry arises whenever a
+ * recorder went live and the chunker did not: a hard 4xx on POST
+ * /sessions, a crash during start-up, a boot that flipped
+ * `recording_closed` on a session that never emitted. The file on disk
+ * may be a real capture.
+ *
+ * Nothing here decides how those entries are eventually cleaned up.
+ * Holding a useless entry costs bytes; reaping a potential capture costs
+ * the evidence.
+ */
+describe('TEST_ZERO_CHUNK_ENTRY_IS_NEVER_COMPLETED_OR_REAPED', () => {
+  it('never calls /complete for an entry with expectedChunks === 0', async () => {
+    vi.stubGlobal('fetch', vi.fn());
+
+    await queueAppendNewSession(
+      entry({ recording_closed: true, next_chunk_index: 0, chunks: [] }),
+    );
+
+    const finalized = await tryFinalizeReadySessions();
+
+    expect(finalized).toBe(false);
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  it('never reaps an entry with expectedChunks === 0', async () => {
+    vi.stubGlobal('fetch', vi.fn());
+
+    await queueAppendNewSession(
+      entry({ recording_closed: true, next_chunk_index: 0, chunks: [] }),
+    );
+
+    await tryFinalizeReadySessions();
+
+    const queue = await queueRead();
+    expect(queue).toHaveLength(1);
+    expect(queue[0]?.session_id).toBe(SID);
+    // The uri is the whole point: it is the only durable pointer to a
+    // capture that may still be on disk.
+    expect(queue[0]?.uri).toBe('file:///doc/rec.m4a');
+  });
+
+  it('holds the entry across repeated drain passes', async () => {
+    vi.stubGlobal('fetch', vi.fn());
+
+    await queueAppendNewSession(
+      entry({ recording_closed: true, next_chunk_index: 0, chunks: [] }),
+    );
+
+    await tryFinalizeReadySessions();
+    await tryFinalizeReadySessions();
+    await tryFinalizeReadySessions();
+
+    expect(global.fetch).not.toHaveBeenCalled();
+    expect(await queueRead()).toHaveLength(1);
+  });
+
+  it('does not bump complete_attempts — it is held, not failing', async () => {
+    vi.stubGlobal('fetch', vi.fn());
+
+    await queueAppendNewSession(
+      entry({ recording_closed: true, next_chunk_index: 0, chunks: [] }),
+    );
+
+    await tryFinalizeReadySessions();
+    await tryFinalizeReadySessions();
+
+    expect((await queueRead())[0]?.complete_attempts).toBe(0);
+  });
+
+  it('a normal session with chunks still completes — the guard is narrow', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ session_id: SID, status: 'completed' }),
+      })),
+    );
+
+    await queueAppendNewSession(
+      entry({ next_chunk_index: 1, chunks: [uploadedChunk(0)] }),
+    );
+
+    expect(await tryFinalizeReadySessions()).toBe(true);
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+    expect(await queueRead()).toEqual([]);
+  });
+});

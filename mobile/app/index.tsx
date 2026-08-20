@@ -2708,6 +2708,32 @@ export async function tryFinalizeReadySessions(): Promise<boolean> {
       });
     }
 
+    // GC-AUTH-001 — the vacuous-gate guard.
+    //
+    // The gate asks "is every index in 0..expectedChunks-1 uploaded?".
+    // For an entry whose chunker never ran, that range is EMPTY, so the
+    // answer is trivially yes and the entry sails through: `/complete`
+    // fires against a session that may not even exist server-side, and
+    // `reapEntry` then deletes the recording the entry points at.
+    //
+    // "The empty set is fully uploaded" is true arithmetic and a
+    // catastrophic operational rule. A zero-chunk entry is not proof of
+    // complete remote evidence — it is proof of nothing at all, and the
+    // file on disk may be a real capture the chunker had not reached yet.
+    //
+    // So: never complete, never reap. Deciding how these entries are
+    // eventually cleaned up is deliberately left open; keeping a useless
+    // entry costs a few bytes, and deleting a potential capture costs
+    // the evidence.
+    if (expectedChunks === 0) {
+      console.log('GC_QUEUE completion gate — zero-chunk entry held', {
+        sessionId: entry.session_id,
+        recording_closed: entry.recording_closed,
+        uri: entry.uri,
+      });
+      continue;
+    }
+
     if (missingUploadedIndexes.length > 0) {
       // Observability-only diagnostic — does NOT change behaviour.
       // Detect the "stuck forever" shape: the missing indexes are NOT
@@ -2823,6 +2849,150 @@ export async function reapEntry(sessionId: string, uri: string): Promise<void> {
       console.log('GC_QUEUE chunks dir cleanup failed', { sessionId, err });
     }
   }
+}
+
+/**
+ * Closes a live recorder so its bytes are flushed and its FINAL uri is
+ * known, for the abandon path (GC-AUTH-001, 4A).
+ *
+ * Mirrors the closing half of `stopRecording`, and must keep mirroring
+ * it: the uri a recorder ends up with is NOT the one the caller started
+ * with. For audio the engine reports the uri it captured before `stop()`
+ * flushed; for video `recordAsync` resolves with the camera's own
+ * authoritative uri, which is the only one guaranteed to point at the
+ * finished file. Promoting a stale `cacheUri` instead can move a
+ * placeholder, or nothing at all, and call it preserved evidence.
+ *
+ * Precedence for video matches `stopRecording`: camera uri first, then
+ * the uri the chunker has been reading (still real bytes on disk, just
+ * partial) when `recordAsync` rejected.
+ *
+ * Dependencies are injected rather than read from component refs so the
+ * ordering guarantee this function exists to provide is testable.
+ * Returns null when nothing usable could be closed.
+ */
+export async function closeRecorderForAbandon(deps: {
+  hadAudio: boolean;
+  stopAudio: () => Promise<string | null>;
+  stopCamera: () => void;
+  videoPromise: Promise<{ uri?: string } | null | undefined> | null;
+  chunkedUri: string | null;
+}): Promise<string | null> {
+  if (deps.hadAudio) {
+    try {
+      return await deps.stopAudio();
+    } catch (err) {
+      console.log('GC_LOCAL_FIRST abandon audio stop failed', {
+        err: err instanceof Error ? err.message : String(err),
+      });
+      return null;
+    }
+  }
+
+  try {
+    deps.stopCamera();
+  } catch (err) {
+    console.log('GC_LOCAL_FIRST abandon camera stop threw', {
+      err: err instanceof Error ? err.message : String(err),
+    });
+  }
+
+  let cameraUri: string | null = null;
+  if (deps.videoPromise) {
+    try {
+      const result = await deps.videoPromise;
+      cameraUri = result?.uri ?? null;
+    } catch (err) {
+      console.log('GC_LOCAL_FIRST abandon recordAsync rejected', {
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  return cameraUri ?? deps.chunkedUri;
+}
+
+/**
+ * Terminal path for a capture that became durable in GC_QUEUE but whose
+ * backend registration failed non-retryably (GC-AUTH-001, 4A).
+ *
+ * MUST be called with a recorder that is already closed and with the
+ * uri that closing actually produced — see `closeRecorderForAbandon`.
+ * Moving a file out from under a live recorder is not preservation.
+ *
+ * Why the entry cannot simply be left in place: with the chunker never
+ * started, `next_chunk_index` is 0, and the completion gate iterates an
+ * empty range. That vacuous pass is now blocked by an explicit guard in
+ * `tryFinalizeReadySessions`, but the entry is still useless as it
+ * stands, so a confirmed promotion supersedes it.
+ *
+ * Why the file cannot simply be abandoned either: it lives in
+ * `cacheDirectory` under the recorder's own name. `orphanScan` only
+ * sweeps `documentDirectory` for `guardian_recording_*`, and the move
+ * that produces that name happens in `stopRecording`, which never runs
+ * on this path. The bytes would be invisible to every recovery route
+ * and would disappear with the next cache reclaim.
+ *
+ * THE RULE, and it is one-directional:
+ *
+ *   promotion confirmed      → the entry may be dropped
+ *   promotion NOT confirmed  → GC_QUEUE MUST survive
+ *
+ * A dropped entry after a failed move would leave the bytes referenced
+ * by nothing durable at all — the precise loss 4A exists to close. So
+ * the entry is only ever retired once something else is holding the
+ * evidence, and the move happens first so that a process death between
+ * the two steps errs towards a redundant reference rather than none.
+ */
+export async function abandonUnregisteredSession(
+  sessionId: string,
+  finalUri: string | null,
+): Promise<{ moved_to: string | null; entry_dropped: boolean }> {
+  let movedTo: string | null = null;
+
+  const docDir = FileSystem.documentDirectory;
+  if (docDir && finalUri) {
+    const extMatch = finalUri.match(/\.[A-Za-z0-9]{1,8}$/);
+    const ext = extMatch ? extMatch[0] : '.m4a';
+    const target = `${docDir}guardian_recording_${Date.now()}${ext}`;
+    try {
+      await FileSystem.moveAsync({ from: finalUri, to: target });
+      movedTo = target;
+    } catch (err) {
+      console.log('GC_LOCAL_FIRST abandon move failed', {
+        sessionId,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  if (movedTo === null) {
+    // Nothing else is holding these bytes. The entry stays, whatever it
+    // costs in tidiness — it is the only durable reference left.
+    console.log('GC_LOCAL_FIRST session abandoned — entry RETAINED', {
+      sessionId,
+      promoted_to_orphan: false,
+      reason: finalUri ? 'move_failed' : 'no_final_uri',
+    });
+    return { moved_to: null, entry_dropped: false };
+  }
+
+  let dropped = false;
+  try {
+    await queueDropEntry(sessionId);
+    dropped = true;
+  } catch (err) {
+    console.log('GC_LOCAL_FIRST abandon drop failed', {
+      sessionId,
+      err: err instanceof Error ? err.message : String(err),
+    });
+  }
+
+  console.log('GC_LOCAL_FIRST session abandoned', {
+    sessionId,
+    promoted_to_orphan: true,
+    entry_dropped: dropped,
+  });
+  return { moved_to: movedTo, entry_dropped: dropped };
 }
 
 // ----- chunker (incremental slicer driven by setTimeout) -----
@@ -5426,51 +5596,37 @@ export default function Index() {
       // entry), so the user-visible cost is dominated by the AsyncStorage
       // write of `queueAppendNewSession` (~10–30ms).
 
-      // Resolve the session id. Parallel kick from the top of the function
-      // means in the common case this await is ~0ms. On non-retryable POST
-      // /sessions failure (4xx) it throws — caught by the outer try/catch,
-      // where the recorder is stopped cleanly BEFORE the user ever sees
-      // "Grabando", restoring the pre-Phase-1 semantics. Retryable errors
-      // were already converted to a deferred registration inside the
-      // promise body, so they resolve with `localSessionId` and never
-      // throw here. `sessionId === localSessionId` in both branches.
-      let sessionId: string;
-      try {
-        sessionId = await sessionCreatePromise;
-      } catch (err) {
-        console.log('SESSION_CREATE_NON_RETRYABLE_ABORT', {
-          err: err instanceof Error ? err.message : String(err),
-        });
-        throw err;
-      }
-
-      sessionIdRef.current = sessionId;
-      AsyncStorage.setItem(LAST_SESSION_ID_KEY, sessionId).catch(() => {});
-      // Append to local history index (best-effort, never blocks the
-      // recording flow). The index is the only source the History
-      // screen has to enumerate past sessions; per-row real status is
-      // still fetched live from GET /sessions/:id/chunks.
-      appendHistoryEntry({
-        session_id: sessionId,
-        created_at: new Date().toISOString(),
-        mode: recordingMode,
-      });
-      console.log('GC_VALIDATION: SESSION_CREATED', {
-        session_id: sessionId,
-        phase: 1,
-        mode: recordingMode,
-      });
-
+      // ----- DURABILITY BEFORE THE BACKEND (GC-AUTH-001, 4A) -----
+      //
+      // The queue entry used to be written only AFTER
+      // `await sessionCreatePromise`. That left a window in which the
+      // recorder was live, bytes were accumulating in the cache file,
+      // and NOTHING durable referenced them. A non-retryable POST
+      // /sessions failure aborted the start, and the capture became
+      // unreachable: no queue entry, so neither the worker nor the
+      // export nor `findLocalRecordingUri` could see it; and the move
+      // to `documentDirectory/guardian_recording_*` — the only thing
+      // `orphanScan` looks for — happens in `stopRecording`, which
+      // never ran. The bytes sat in `cacheDirectory` under the
+      // recorder's own name until the OS reclaimed them.
+      //
+      // Now the local session becomes durable the moment the recorder
+      // is live. `sessionId` is `localSessionId` on every success path
+      // (the deferred branch returns it verbatim, the online branch
+      // echoes it back), so writing the entry with `localSessionId`
+      // before the await is equivalent on the happy path — it only
+      // changes what survives on the failure paths.
+      sessionIdRef.current = localSessionId;
       // Pinning log — `pinnedDestinationType` was captured ONCE earlier
       // in this function so the backend `sessions.destination_type`
       // and the queue entry's `destination_type` cannot diverge under
       // a Settings race.
       console.log('GC_QUEUE session destination pinned', {
-        sessionId,
+        sessionId: localSessionId,
         destinationType: pinnedDestinationType,
       });
       await queueAppendNewSession({
-        session_id: sessionId,
+        session_id: localSessionId,
         uri: cacheUri,
         recording_closed: false,
         session_completed: false,
@@ -5479,6 +5635,56 @@ export default function Index() {
         next_chunk_index: 0,
         chunks: [],
         destination_type: pinnedDestinationType,
+      });
+      AsyncStorage.setItem(LAST_SESSION_ID_KEY, localSessionId).catch(() => {});
+      // Append to local history index (best-effort, never blocks the
+      // recording flow). The index is the only source the History
+      // screen has to enumerate past sessions; per-row real status is
+      // still fetched live from GET /sessions/:id/chunks.
+      appendHistoryEntry({
+        session_id: localSessionId,
+        created_at: new Date().toISOString(),
+        mode: recordingMode,
+      });
+
+      // Now — and only now — resolve the backend registration.
+      // Retryable failures were already converted to a deferred
+      // registration inside the promise body and resolve with
+      // `localSessionId`. A non-retryable 4xx still aborts the capture
+      // (4A does not change that policy), but the abort has to hand the
+      // bytes to the orphan route rather than walk away from them.
+      //
+      // Order is not negotiable here: CLOSE the recorder, THEN read the
+      // uri closing produced, THEN promote, and only retire the queue
+      // entry if that promotion is confirmed. Promoting while the
+      // recorder is still writing would move a file out from under it.
+      let sessionId: string;
+      try {
+        sessionId = await sessionCreatePromise;
+      } catch (err) {
+        console.log('SESSION_CREATE_NON_RETRYABLE_ABORT', {
+          err: err instanceof Error ? err.message : String(err),
+        });
+        const finalUri = await closeRecorderForAbandon({
+          hadAudio: recordingMode === 'audio',
+          stopAudio: stopAudioRecording,
+          stopCamera: () => cameraRef.current?.stopRecording(),
+          videoPromise: videoRecordPromiseRef.current,
+          chunkedUri: videoRecordingUriRef.current ?? cacheUri,
+        });
+        // The outer catch also tears the recorder down; both paths are
+        // idempotent (the audio engine nulls its handle, and the video
+        // branch is guarded on a ref we clear here), so the duplicate
+        // teardown is a no-op rather than a double-stop.
+        videoRecordPromiseRef.current = null;
+        videoRecordingUriRef.current = null;
+        await abandonUnregisteredSession(localSessionId, finalUri);
+        throw err;
+      }
+      console.log('GC_VALIDATION: SESSION_CREATED', {
+        session_id: sessionId,
+        phase: 1,
+        mode: recordingMode,
       });
 
       // Capture the mode for stopRecording's dispatch. Stays in a ref
