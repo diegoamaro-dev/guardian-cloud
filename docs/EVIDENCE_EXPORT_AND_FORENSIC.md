@@ -56,9 +56,15 @@ Mientras este documento siga pendiente, las fuentes reales son:
 **Baseline vigente:** [`v0.3.0-rc.1`](./releases/v0.3.0-rc.1.md) — técnica y
 reproducible, pero **`NO APTO`** para publicación.
 
-Dos límites que condicionan cualquier afirmación forense futura:
+Límites que condicionan cualquier afirmación forense futura:
 
-- **el vídeo no sube evidencia durante la captura** (`GC-AUD-001`): se fragmenta
-  y encola después de detenerse;
 - **el recovery autónomo tras reiniciar el dispositivo (`I5c`) no está
-  implementado**.
+  implementado**;
+- **no existe export final `.mp4`**: una sesión de vídeo sube fragmentos
+  verificables, pero no hay reconstrucción utilizable como pieza única;
+- **el cifrado local no está implementado**.
+
+`GC-AUD-001` —el vídeo no subía durante la captura— **ya no es un límite
+vigente**: la ruta nativa segmentada sube durante la grabación y quedó
+demostrado en hardware el 20/08. Ver la
+[validación del 20/08](./audits/GUARDIAN_CLOUD_NATIVE_SEGMENTED_DURABLE_CLEANUP_VALIDATION_2026-08-20.md).

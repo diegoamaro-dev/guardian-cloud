@@ -9,16 +9,18 @@
 > reproducible, pero **`NO APTO` para publicación**.
 >
 > Dos entradas de la lista de abajo necesitan matiz:
-> - **«subida resiliente»** funciona durante la grabación **sólo en audio**. El
->   vídeo se fragmenta y encola tras detenerse (`GC-AUD-001`), así que todavía no
->   cumple el principio central de supervivencia;
+> - **«subida resiliente»** funcionaba durante la grabación sólo en audio **en
+>   la baseline `v0.3.0-rc.1`**. En `feat/native-segmented-recording` el vídeo
+>   nativo segmentado sube durante la captura, demostrado en hardware el 20/08:
+>   `GC-AUD-001` **ya no es un defecto vigente**;
 > - **«recovery tras kill»** es correcto, pero el recovery autónomo tras
 >   reiniciar el dispositivo (`I5c`) **no está implementado**: la cola drena al
 >   reabrir la app (`I5a`).
 >
 > El orden real de trabajo pendiente está en el plan de remediación de la
-> auditoría (fases A–H); la siguiente prioridad funcional es la **fase D**
-> (`GC-AUD-001`).
+> auditoría (fases A–H). La **fase D** (`GC-AUD-001`) queda cumplida; la
+> siguiente prioridad funcional pasa a ser el recovery completo de vídeo y el
+> export `.mp4`.
 >
 > Fuentes vigentes: [`releases/v0.3.0-rc.1.md`](./releases/v0.3.0-rc.1.md) ·
 > [`audits/GUARDIAN_CLOUD_REMEDIATION_PLAN_2026-07-28.md`](./audits/GUARDIAN_CLOUD_REMEDIATION_PLAN_2026-07-28.md) ·

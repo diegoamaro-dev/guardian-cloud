@@ -18,6 +18,11 @@
 | 12 — Chunk inicial corrupto | PASS (limitación) | .bin, no reproducible |
 | 13 — Sin chunks válidos | ? | |
 | 14 — UI bajo fallo | PASS | UI clara |
+| 17 — Vídeo nativo con durable cleanup/scheduler | **PASS** | Puntos 1–4 y 9 `HARDWARE_VALIDATED` el 20/08; puntos 5–8 `HARDWARE_HARDENING_PENDING`, sin bloquear la integración. Ningún gate bloqueante pendiente |
+
+Los escenarios marcados con «?» no han sido reejecutados con el artefacto
+vigente. El 17 es el único con evidencia física fechada y trazable: ver la
+[validación del 20/08](./audits/GUARDIAN_CLOUD_NATIVE_SEGMENTED_DURABLE_CLEANUP_VALIDATION_2026-08-20.md).
 
 ---
 

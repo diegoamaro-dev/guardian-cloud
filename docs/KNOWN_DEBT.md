@@ -59,6 +59,40 @@ Detalle completo en [`releases/v0.3.0-rc.1.md`](./releases/v0.3.0-rc.1.md) §7.
 
 ---
 
+## Deuda descubierta durante hardware validation (2026-08-20)
+
+### `DRIVE_REFRESH_FAILED` se clasifica como transitorio sin avisar al usuario
+
+**Qué ocurre.** El cliente móvil clasifica **cualquier** `401` como transitorio
+antes de mirar el código de error específico. El backend emite `401` con código
+`DRIVE_REFRESH_FAILED` precisamente para que la interfaz pida reconectar Drive,
+pero el cliente decide por status antes que por código, así que ese propósito
+nunca se cumple.
+
+**Consecuencia observada** durante la validación del 20/08:
+
+- la evidencia queda **preservada** — transitorio es la clasificación segura,
+  ya que permanente habría marcado los chunks como `failed` y podado sus
+  payloads;
+- los reintentos continúan indefinidamente, con backoff acotado a 30 s;
+- **el usuario no recibe ninguna señal** de que debe reconectar Drive.
+
+Se registraron 12 reintentos consecutivos con cero progreso y ningún aviso.
+
+**Naturaleza.** Es un defecto de observabilidad, **no de integridad**: no se
+pierde evidencia. Por eso es deuda y no un bloqueo.
+
+**Corrección mínima prevista, no implementada:** comprobar
+`code === 'DRIVE_REFRESH_FAILED'` antes que el status y exponer un estado de
+reconexión, conservando la reintentabilidad para no poner en riesgo la
+evidencia ya encolada.
+
+Deuda **separada** del durable cleanup scheduler. Diagnóstico completo en
+[`audits/GUARDIAN_CLOUD_NATIVE_SEGMENTED_DURABLE_CLEANUP_VALIDATION_2026-08-20.md`](./audits/GUARDIAN_CLOUD_NATIVE_SEGMENTED_DURABLE_CLEANUP_VALIDATION_2026-08-20.md);
+configuración implicada en [`OAUTH_DRIVE_CONFIGURATION.md`](./OAUTH_DRIVE_CONFIGURATION.md).
+
+---
+
 ## Known technical debt
 
 - ngrok is temporary and not valid for production.

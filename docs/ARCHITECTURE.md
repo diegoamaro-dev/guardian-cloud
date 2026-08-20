@@ -6,12 +6,13 @@
 > [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md#capacidades-por-nivel-referencia-canónica),
 > que es la referencia canónica y prevalece sobre este texto.
 >
-> El cifrado local **no** está implementado. La grabación nativa segmentada y
-> la subida durante la captura están implementadas y fueron validadas
-> físicamente el 13/08. El durable cleanup/scheduler está
-> `IMPLEMENTED / UNIT_TESTED / HARDWARE_VALIDATION_PENDING`. Esa evidencia no
-> valida el recovery completo de vídeo ni un export final `.mp4`. Véase el
-> [handoff vigente](./audits/GUARDIAN_CLOUD_DURABLE_CLEANUP_SCHEDULER_HANDOFF_2026-08-20.md).
+> El cifrado local **no** está implementado. La grabación nativa segmentada, la
+> subida durante la captura y el durable cleanup/scheduler en su ruta normal
+> están `HARDWARE_VALIDATED` desde el 20/08 en un OnePlus A6000 con Android 11.
+> Esa evidencia **no** valida el recovery completo de vídeo, un export final
+> `.mp4`, otros dispositivos ni las rutas artificiales de fallo del scheduler.
+> Véase la
+> [validación física del 20/08](./audits/GUARDIAN_CLOUD_NATIVE_SEGMENTED_DURABLE_CLEANUP_VALIDATION_2026-08-20.md).
 
 ## Visión general
 
@@ -148,9 +149,20 @@ no incrementa `complete_attempts`, no repite `completeSession` y no degrada
 la finalización confirmada. Un reap diferido exitoso retira `GC_QUEUE` y
 vuelve a solicitar cleanup con motivo `finalized`.
 
-Esta arquitectura está implementada y cubierta por pruebas unitarias. Su
-integración con el vídeo nativo sigue en
-`HARDWARE_VALIDATION_PENDING`.
+Esta arquitectura está implementada, cubierta por pruebas unitarias y
+`HARDWARE_VALIDATED` en su ruta normal desde el 20/08: autorización tras
+completion confirmada, trigger `finalized`, una única pasada de reconcile y
+borrado de ambos recursos sin reiniciar la aplicación.
+
+La **frontera de borrado exclusiva por journal** también está
+`HARDWARE_VALIDATED`: en una pasada real con `considered: 1`, el runner eliminó
+la sesión autorizada y dejó byte-identical dos directorios centinela de UUID
+canónico sin entrada en el journal. `authorized → eligible for cleanup`,
+`no journal → invisible`, demostrado por discriminación y no por inacción.
+
+Las rutas artificiales de fallo —boot con trabajo durable real, caso positivo de
+`stale_reconciled`, fallo de reap posterior a completion y reap diferido— siguen
+en `HARDWARE_HARDENING_PENDING` y **no bloquean la integración de la rama**.
 
 ## Principios de arquitectura
 

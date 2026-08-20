@@ -1,14 +1,20 @@
 # IMPLEMENTATION_STATUS.md
 
-⛔ NO APTO — pendiente la validación hardware del vídeo nativo segmentado con durable cleanup/scheduler integrado
+⛔ NO APTO PARA RELEASE — por cifrado local, recovery `I5c`, export `.mp4` y cobertura de dispositivos. **Ya no por `GC-AUD-001`.**
 
 Estado vigente a 2026-08-20. Fuentes de continuidad y evidencia:
 
-* [handoff vigente de durable cleanup/scheduler](./audits/GUARDIAN_CLOUD_DURABLE_CLEANUP_SCHEDULER_HANDOFF_2026-08-20.md);
-* [validación física de la integración nativa segmentada del 13/08](./audits/GUARDIAN_CLOUD_NATIVE_SEGMENTED_INTEGRATION_VALIDATION_2026-08-13.md).
+* [validación física del vídeo nativo con durable cleanup del 20/08](./audits/GUARDIAN_CLOUD_NATIVE_SEGMENTED_DURABLE_CLEANUP_VALIDATION_2026-08-20.md);
+* [validación física de la integración nativa segmentada del 13/08](./audits/GUARDIAN_CLOUD_NATIVE_SEGMENTED_INTEGRATION_VALIDATION_2026-08-13.md);
+* [configuración OAuth de Drive](./OAUTH_DRIVE_CONFIGURATION.md).
 
-La validación física del 13/08 cubre el productor nativo segmentado existente
-entonces. No cubre el journal, runner y scheduler integrados después.
+La validación del 20/08 cubre el conjunto integrado —vídeo nativo segmentado
+más journal, runner y scheduler— en **un solo dispositivo**: OnePlus A6000 /
+Android 11 / API 30 / `arm64-v8a`. La del 13/08 cubre el productor nativo
+existente entonces y se conserva como registro fechado.
+
+Todo `HARDWARE_VALIDATED` de este documento significa **validado en ese
+dispositivo**. No implica cobertura multi-dispositivo ni Android 13+.
 
 ---
 
@@ -25,20 +31,25 @@ contradiga es incorrecta.
 | Grabación de audio | — |
 | Fragmentación de audio | En vivo cada 1,5 s |
 | Subida de audio durante la grabación | Validada en el alcance histórico del MVP |
-| Grabación nativa segmentada de vídeo | Implementada y validada físicamente el 13/08 en OnePlus 6 / Android 11; segmentos MP4 independientes H.264/AAC |
-| Adopción y subida del vídeo durante la captura | Implementada y validada físicamente el 13/08; primer upload observado durante la captura y productor Expo no activo en paralelo |
+| Grabación nativa segmentada de vídeo | `HARDWARE_VALIDATED` 20/08; segmentos MP4 independientes H.264/AAC verificados con `ffprobe` |
+| Adopción del vídeo durante la captura | `HARDWARE_VALIDATED` 20/08; 12/12 adopciones, latencia cierre → cola 189–262 ms |
+| **Subida de vídeo durante la captura** | `HARDWARE_VALIDATED` 20/08; primera subida confirmada a `+14,619 s`, PARAR a `+75,514 s`, **11 de 12 chunks confirmados antes de parar** |
+| Durable cleanup journal/runner/scheduler, **ruta normal** | `HARDWARE_VALIDATED` 20/08; `finalized` con reconcile y borrado de ambos recursos sin reiniciar la app |
+| Completion sin repetición | `HARDWARE_VALIDATED` 20/08; exactamente un `/complete` en los dos escenarios observados |
+| Recovery de una sesión pendiente tras restaurar Drive | `HARDWARE_VALIDATED` 20/08; 12 chunks preservados durante una caída de credencial y drenados al restaurarla |
+| **Frontera de borrado exclusiva por journal** | `HARDWARE_VALIDATED` 20/08 por prueba dirigida: durante una pasada real con `considered: 1`, la sesión autorizada se borró y dos directorios centinela de UUID canónico **sin** entrada en el journal quedaron byte-identical |
 | `GC_QUEUE` como fuente de verdad | — |
 | Cola persistente | AsyncStorage; sobrevive a cierre forzado y a reinicio |
 | Worker single-flight con reintentos | — |
 | Recovery automático | Tras kill y al abrir la app. **No** tras reinicio sin abrirla (`I5c`) |
-| Evidencia fuera del dispositivo durante la captura | Audio y vídeo nativo segmentado; la afirmación de vídeo se limita a la validación física del 13/08 |
+| Evidencia fuera del dispositivo durante la captura | Audio y vídeo nativo segmentado, ambos con evidencia física |
 | Exportación utilizable en `.m4a` | — |
 
 ### Nivel 2 — Implementado, pendiente de validación completa
 
 | Capacidad | Qué falta |
 |---|---|
-| Durable cleanup journal/runner/scheduler | `IMPLEMENTED / UNIT_TESTED / HARDWARE_VALIDATION_PENDING`; falta validar en dispositivo la integración completa con vídeo nativo |
+| Durable cleanup/scheduler, **rutas artificiales de fallo** | `HARDWARE_HARDENING_PENDING`. Cubiertas por pruebas unitarias; falta ejercitarlas en dispositivo con failpoints: boot con trabajo durable real, caso positivo de `stale_reconciled`, fallo de reap posterior a completion y reap diferido exitoso. **No bloquean la integración de la rama** |
 | Reliability Card | No se observó en Home durante la instalación de validación y la causa sigue sin determinar. Cubierta por pruebas unitarias, sin validación en dispositivo |
 | Comportamiento y permisos en Android 13+ | `POST_NOTIFICATIONS` es SDK 33+ y el único dispositivo probado es API 30. Las tres ramas están cubiertas por pruebas unitarias, pero **prueba unitaria no es validación en dispositivo** |
 | Matriz completa de resiliencia | Mala red, segundo plano prolongado, cierre forzado, reinicio, recovery y export, sin reejecutar con el artefacto vigente |
@@ -53,9 +64,10 @@ contradiga es incorrecta.
 > **Criterio de incompatibilidad.** Cualquier propuesta de «vídeo post-stop»
 > —fragmentar y encolar **después** de detener la captura— es **incompatible
 > con el principio central del producto**: «si grabas unos segundos, al menos
-> una parte ya está fuera del dispositivo». La ruta nativa vigente sí genera,
-> adopta y sube segmentos durante la captura. Esto no demuestra recovery
-> completo, export `.mp4` ni durable cleanup en hardware.
+> una parte ya está fuera del dispositivo». La ruta nativa vigente genera,
+> adopta y sube segmentos durante la captura, y eso quedó **demostrado en
+> hardware el 20/08**. Sigue sin demostrar recovery completo de vídeo, export
+> `.mp4` ni cobertura de otros dispositivos.
 
 Fuera de estos tres niveles, y explícitamente **no** capacidades actuales:
 cifrado local de chunks (sólo `TODO` en el código), recovery autónomo tras
@@ -64,9 +76,25 @@ usuarios externos y publicación en Play Store.
 
 ### Problema 8 — Durable cleanup scheduler
 
-Estado: `IMPLEMENTED / UNIT_TESTED / HARDWARE_VALIDATION_PENDING`.
+Estado: `IMPLEMENTED / UNIT_TESTED / HARDWARE_VALIDATED` **en la ruta normal**;
+`HARDWARE_HARDENING_PENDING` en las rutas artificiales de fallo.
 
-La implementación demuestra por pruebas automáticas:
+Demostrado **en dispositivo** el 20/08, en dos escenarios independientes
+—recovery de una sesión pendiente y captura limpia—:
+
+* `GC_CLEANUP_AUTHORIZED` posterior a una completion confirmada `http_200`;
+* trigger `finalized` tras mark y reap correctos;
+* `RECONCILE_START` / `RECONCILE_DONE` 1 / 1, sin pasadas concurrentes;
+* borrado de `native_cache` y `stable_segments` con `remaining: 0`;
+* `GC_CLEANUP_DROPPED` y journal convergido sin entradas activas;
+* cleanup completado **sin reiniciar la aplicación**;
+* exactamente un `/complete`, sin incremento de `complete_attempts`;
+* cero `GC_CLEANUP_SCHEDULER_FAILED` y cero `AUTHORIZE_REJECTED`;
+* **discriminación activa de la frontera de borrado**: en una pasada con
+  `considered: 1`, la sesión autorizada se eliminó y dos directorios centinela
+  de UUID canónico sin entrada en el journal quedaron byte-identical.
+
+Demostrado **sólo por pruebas automáticas**, pendiente de hardware:
 
 * scheduler single-flight;
 * `pending=false` antes de `reconcile`;
@@ -91,9 +119,22 @@ La implementación demuestra por pruebas automáticas:
 | `:gc-segmented-recorder:compileDebugKotlin` | **BUILD SUCCESSFUL** |
 | `git diff --check` | Limpio |
 
-El siguiente gate es la **validación hardware del vídeo nativo segmentado con
-durable cleanup/scheduler integrado**. El trabajo no está cerrado hasta
-superarlo.
+### Estado del gate
+
+El gate de **validación hardware del vídeo nativo segmentado con durable
+cleanup/scheduler integrado** quedó superado el 20/08 en su ruta normal, y la
+**prueba dirigida de la frontera de borrado exclusiva por journal** (Escenario
+17, punto 9) se superó ese mismo día con directorios centinela.
+
+**No queda ningún gate bloqueante del Escenario 17 antes de integrar la rama.**
+
+Los puntos 5 a 8 del Escenario 17 quedan como `HARDWARE_HARDENING_PENDING`: su
+peor caso es limpieza diferida, no pérdida de evidencia, porque el journal es
+durable y el siguiente arranque recoge el trabajo. No bloquean la integración.
+
+Los bloqueos que siguen abiertos son de release y ajenos al Escenario 17:
+cifrado local, recovery `I5c`, export `.mp4`, cobertura multi-dispositivo y
+Android 13+.
 
 ---
 
@@ -127,14 +168,18 @@ AAB de producción, ni Closed Testing, ni usuarios externos. Ver
 
 ### El veredicto `NO APTO` sigue vigente
 
-La baseline **no levanta** el veredicto de la auditoría. Siguen abiertas:
+La baseline **no levanta** el veredicto de la auditoría. Quedaban abiertas **en
+esa baseline**:
 
 - el **vídeo no saca evidencia del dispositivo durante la grabación**
-  (GC-AUD-001);
+  (GC-AUD-001) — **resuelto después** en `feat/native-segmented-recording` y
+  demostrado en hardware el 20/08; no describe la rama actual;
 - no existe `capture_end_reason`: no se puede probar finalización limpia;
 - recovery **I5c** (tras reinicio del dispositivo, sin abrir la app) no
   implementado;
 - cifrado local no implementado.
+
+Las tres últimas siguen abiertas hoy.
 
 A-1 y A-2 fueron **contención semántica**: cambiaron lo que el sistema afirma,
 no lo que hace.
@@ -147,21 +192,23 @@ no lo que hace.
 | **Atestiguado manualmente** | grabación **de audio** y grabación **de vídeo** (ambas ejecutadas a mano); **subida de audio durante la grabación**; segundo plano y bloqueo; mala red; cierre forzado; reinicio con cola pendiente; recovery; exportación |
 | **No ejecutado** | rama Android 13+ de `POST_NOTIFICATIONS`, T1/T3/T4/T6/T7/T8/T10, Closed Testing, usuarios externos |
 
-> **Sólo el audio saca fragmentos del dispositivo durante la grabación.** El
-> chunker en vivo corre cada 1,5 s únicamente en modo audio. **El vídeo se
-> fragmenta y se encola DESPUÉS de detener la captura** (`chunkVideoFile` se
-> ejecuta post-`stop()`), así que durante una grabación de vídeo **no sale nada
-> del dispositivo**.
+> **En esta baseline, sólo el audio sacaba fragmentos del dispositivo durante la
+> grabación.** El chunker en vivo corría cada 1,5 s únicamente en modo audio, y
+> **el vídeo se fragmentaba y encolaba DESPUÉS de detener la captura**
+> (`chunkVideoFile` post-`stop()`), así que durante una grabación de vídeo no
+> salía nada del dispositivo.
 >
-> Esta limitación es **`GC-AUD-001`**. Su consecuencia directa: **el vídeo
-> todavía no cumple el principio central de supervivencia** del producto —«si
-> grabas unos segundos, al menos una parte ya está fuera del dispositivo»—.
-> Ante kill, crash o pérdida del dispositivo mientras se graba vídeo puede
-> perderse toda la evidencia.
+> Esa limitación era **`GC-AUD-001`**, y su consecuencia era que el vídeo no
+> cumplía el principio central de supervivencia del producto —«si grabas unos
+> segundos, al menos una parte ya está fuera del dispositivo»—.
 >
-> «Grabación de vídeo atestiguada» significa que la captura, el chunking
-> post-stop, la subida posterior y la exportación funcionaron. **No** significa
-> que hubiera subida durante la captura. Resolverlo corresponde a la **fase D**.
+> «Grabación de vídeo atestiguada» significa, **para esta baseline**, que la
+> captura, el chunking post-stop, la subida posterior y la exportación
+> funcionaron. **No** significa que hubiera subida durante la captura.
+>
+> **`GC-AUD-001` quedó resuelto en `feat/native-segmented-recording`** mediante
+> el productor nativo segmentado, y se demostró en hardware el 20/08. Este
+> párrafo describe la baseline `v0.3.0-rc.1`, no el estado actual.
 
 **Discrepancia de versión conocida:** la etiqueta se llama `v0.3.0-rc.1` pero la
 aplicación declara `0.1.0` / `versionCode 1`. La etiqueta marca un punto de git,
@@ -207,7 +254,8 @@ Store; y el motivo por el que la Reliability Card no apareció en Home
 —cuestión abierta que impide considerarla validada en dispositivo—.
 
 Esta baseline **no levanta** el veredicto `NO APTO` de la auditoría 2026-07-28.
-`GC-AUD-001` sigue abierto.
+En su momento `GC-AUD-001` seguía abierto; se resolvió después en
+`feat/native-segmented-recording`.
 
 ---
 
@@ -228,8 +276,9 @@ The MVP currently supports:
 - Recovery after app kill
 - Recovery after device reboot
 - Session completion
-- Durable cleanup journal, runner and single-flight scheduler, implemented and
-  unit tested with hardware validation pending
+- Durable cleanup journal, runner and single-flight scheduler — hardware
+  validated on 2026-08-20 for the normal path; artificial failure paths still
+  pending
 - Audio evidence export from a given session (download chunks via backend
   proxy, verify sha256, concatenate in order, write `.m4a` to
   `documentDirectory`, produce a partial result when chunks are
@@ -241,10 +290,17 @@ The validated audio path can record, generate chunks, upload them to Drive,
 recover pending chunks after failure, complete the session, clean local state,
 and export evidence as a single `.m4a`.
 
-Separately, native segmented video generation, adoption and upload during
-capture were physically validated on 2026-08-13. That execution did not include
-the current durable cleanup scheduler. Complete native-video recovery and final
-`.mp4` export are not declared physically validated.
+Separately, native segmented video generation, adoption and **upload during
+capture** were physically validated on 2026-08-20, together with the durable
+cleanup scheduler on its normal path and with recovery of a pending session
+after a Drive credential outage. First confirmed upload at `+14.619 s` against a
+stop at `+75.514 s`, with 11 of 12 chunks confirmed before the user stopped
+recording.
+
+That validation covers a single device — OnePlus A6000 / Android 11 / API 30 /
+`arm64-v8a`. Complete native-video recovery, final `.mp4` export,
+multi-device coverage and the scheduler's artificial failure paths are **not**
+declared physically validated.
 
 ## Product status
 
