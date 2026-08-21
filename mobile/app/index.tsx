@@ -2721,6 +2721,96 @@ registerAuthRestoreHandler((usable: boolean) => {
 });
 
 /**
+ * GC-DEST-PAUSE-001 — retire a destination pause whose cause is provably
+ * gone.
+ *
+ * The defect: `destinations[type]` could be written and never removed.
+ * `client_auth` got a recovery signal (`notifyClientAuth` from the
+ * Supabase lifecycle) and a handler to act on it; `destinations` got
+ * neither. So a Drive pause survived reconnecting Drive, survived a cold
+ * start, and blocked the drain forever. Evidence stayed durable and
+ * local — nothing was ever lost — but it could not leave the device.
+ * Observed on hardware: 54 chunks pending, 0 uploading, indefinitely.
+ *
+ * ## What counts as proof, and what does NOT
+ *
+ * The ONLY accepted signal is the backend confirming this specific
+ * destination: `listDestinations()` returning a row with
+ * `type === T && status === 'connected'`. That is the direct negation of
+ * the 409 `DRIVE_NOT_CONNECTED` ("No connected Google Drive destination
+ * for this user") that created the pause.
+ *
+ * `destinationResolved` is NOT proof and must never be used here. It is
+ * a race guard meaning "routing is known", and `refreshDestination` sets
+ * it to `true` even when NOTHING is connected — the routing line falls
+ * back to `'drive'` with zero destinations. On hardware we observed
+ * `destinationResolved: true` coexisting with an active Drive pause and
+ * a disconnected Drive. Clearing on it would unblock a broken
+ * destination.
+ *
+ * Elapsed time is NOT proof either. `at` is never read.
+ *
+ * ## Scope discipline
+ *
+ * Clears `destinations[T]` for the confirmed T and nothing else. A Drive
+ * reconnection must not lift a NAS pause, a `client_auth` pause, a
+ * `systemic` pause, or any entry pause. Touches no queue entry and no
+ * chunk: it only grants permission, never discards evidence.
+ *
+ * ## Atomicity
+ *
+ * The decision to report a transition depends on THIS invocation having
+ * performed `paused → unpaused` inside the `queueMutate` chain. Two
+ * concurrent `refreshDestination` calls can both observe `connected`;
+ * only the one that still finds the pause present may claim it and ask
+ * for a drain. Same rule the `client_auth` restore handler already uses,
+ * and for the same reason.
+ *
+ * Returns the destination types this invocation actually unblocked.
+ */
+export async function clearRecoveredDestinationPauses(
+  connected: Partial<Record<DestinationType, boolean>>,
+): Promise<DestinationType[]> {
+  const confirmed = (Object.keys(connected) as DestinationType[]).filter(
+    (type) => connected[type] === true,
+  );
+  if (confirmed.length === 0) return [];
+
+  // Cheap fast path: skip the write chain when nothing is paused. An
+  // optimisation, NOT the decision point — the decision is made below,
+  // under the chain, against a fresh read.
+  const snapshot = await ensurePauseReady();
+  const candidates = confirmed.filter(
+    (type) => snapshot.destinations[type] !== undefined,
+  );
+  if (candidates.length === 0) return [];
+
+  const cleared: DestinationType[] = [];
+  await queueMutate(async () => {
+    const current = await readPauseState();
+    const next: GlobalPauseState = {
+      ...current,
+      destinations: { ...current.destinations },
+    };
+    let changed = false;
+    for (const type of candidates) {
+      // Re-checked inside the chain: a concurrent invocation may have
+      // won this transition already. Only the winner reports it.
+      if (next.destinations[type] === undefined) continue;
+      delete next.destinations[type];
+      cleared.push(type);
+      changed = true;
+    }
+    if (changed) await writePauseState(next);
+  });
+
+  if (cleared.length > 0) {
+    console.log('GC_QUEUE destination pause cleared', { destinations: cleared });
+  }
+  return cleared;
+}
+
+/**
  * For each entry whose recording is closed and whose chunks are all
  * resolved (uploaded or failed), call POST /sessions/:id/complete and
  * then drop the entry. Returns true if any entry was finalized in this
@@ -5014,11 +5104,30 @@ export default function Index() {
       const wasBlocked = !destinationResolved;
       destinationResolved = true;
       console.log('DEST_TYPE', { activeDestinationType, destinationResolved });
+
+      // GC-DEST-PAUSE-001 — the backend has just told us which
+      // destinations are connected. That is the one signal that can
+      // retire a destination pause, and this is the only place in the
+      // app that holds it.
+      //
+      // NOTE THE INPUT: `drive` / `nas` are the rows filtered on
+      // `status === 'connected'` above — NOT `destinationResolved`,
+      // which is true even with nothing connected and would unblock a
+      // broken destination.
+      //
+      // This function does not own uploading. It removes a block that is
+      // provably stale and then asks the EXISTING drain to run.
+      const unblocked = await clearRecoveredDestinationPauses({
+        drive: Boolean(drive),
+        nas: Boolean(nas),
+      });
+
       // Re-kick the drain: any tick that early-returned while we were
-      // resolving needs a fresh entry point now that routing is known.
-      // uploadDrainLoop is single-flight (`isDraining`), so a redundant
-      // kick while already draining is a harmless no-op.
-      if (wasBlocked) {
+      // resolving needs a fresh entry point now that routing is known,
+      // and a pause we just retired leaves chunks that were parked on
+      // it. uploadDrainLoop is single-flight (`isDraining`), so a
+      // redundant kick while already draining is a harmless no-op.
+      if (wasBlocked || unblocked.length > 0) {
         uploadDrainLoop().catch((err) => {
           if (DEBUG_QUEUE) {
             console.log('GC_DEBUG drain rejected (from refreshDestination)', {

@@ -456,3 +456,93 @@ recuperación explícita y consentida pertenece a otra fase.
 marker, seal y sesión de Supabase a propósito. Ni siquiera un borrado total de
 AsyncStorage es del todo «fresh»: el usuario anónimo sigue existiendo en el
 servidor.
+
+---
+
+# 3. GC-DEST-PAUSE-001 — una pausa de destino sobrevivía a la recuperación del destino
+
+## Estado
+
+**FIXED IN CODE / HARDWARE REVALIDATION REQUIRED.**
+
+Observado en hardware el 2026-08-21 (OnePlus A6000) durante la Vía 2 desde
+instalación limpia. **No cerrado en hardware:** la corrección está probada en
+código y pendiente de revalidación en dispositivo.
+
+---
+
+## Causa original
+
+El store de pausas tiene tres ámbitos. Solo uno tenía ruta de limpieza.
+
+| Ámbito | Códigos que la crean | Limpieza |
+|---|---|---|
+| `client_auth` | `CLIENT_SESSION_EXPIRED` (401 / NO_TOKEN) | sí — `notifyClientAuth` desde el ciclo de vida de Supabase, con handler propio |
+| `systemic` | `BODY_TOO_LARGE` (413) | no, **deliberado**: es un defecto de configuración en tiempo de compilación |
+| `destinations[type]` | `DRIVE_NOT_CONNECTED`, `DRIVE_REFRESH_FAILED` | **no, y NO era deliberado** |
+
+`client_auth` recibió una señal positiva de recuperación y algo que actuara sobre
+ella. `destinations` nunca recibió la suya, **aunque esa señal ya se calculaba**.
+
+Consecuencia medida: `pending: 54, uploading: 0` indefinidamente. Conectar Drive
+no la levantaba. Un arranque en frío tampoco: la clave se rehidrata intacta.
+**La evidencia nunca se perdió** —permanece durable y local— pero no podía salir
+del dispositivo.
+
+---
+
+## Corrección
+
+`clearRecoveredDestinationPauses(connected)`: retira `destinations[T]` para cada
+T confirmado, dentro del `queueMutate` existente, releyendo el estado y
+considerando realizada la transición **solo si la pausa concreta seguía
+presente**. Dos invocaciones concurrentes pueden observar `connected`; solo una
+gana `paused → unpaused` y pide el re-kick. Es la misma disciplina del handler de
+`client_auth`.
+
+Invocada desde `refreshDestination`, que ya corre en el bootstrap y en el focus
+de Home — **sin polling nuevo**. Volver del navegador tras el OAuth es un focus.
+No convierte a `refreshDestination` en propietario del upload: retira un bloqueo
+provablemente obsoleto y pide el drenaje que ya existe (`uploadDrainLoop` es
+single-flight).
+
+---
+
+## Qué autoriza el clear
+
+**Solo esto:** `listDestinations()` devuelve una fila con
+`type === T && status === 'connected'`. Es la negación directa del 409
+`DRIVE_NOT_CONNECTED` («No connected Google Drive destination for this user»)
+que creó la pausa.
+
+## Qué NO lo autoriza
+
+**`destinationResolved`.** Es un *race guard* que significa «el enrutado ya se
+conoce», no «hay un destino conectado». `refreshDestination` lo pone a `true`
+incluso con **cero** destinos conectados: la línea de enrutado cae al valor por
+defecto `'drive'`. En hardware se observó `destinationResolved: true`
+coexistiendo con una pausa de Drive activa y Drive desconectado. Limpiar con esa
+señal desbloquearía un destino roto.
+
+**El tiempo transcurrido.** El campo `at` no se lee nunca.
+
+**Cualquier otro ámbito.** Una reconexión de Drive no toca `client_auth`, ni
+`systemic`, ni una pausa de NAS, ni ninguna pausa de entrada.
+
+---
+
+## Residuales
+
+- `listDestinations()` es una lectura autenticada: si el backend no responde, la
+  pausa permanece. Correcto, pero la recuperación depende de una llamada de red.
+  Nunca limpia por ausencia de datos.
+- `status: 'connected'` es la palabra del backend. Un `connected` con refresh
+  token muerto limpiaría y el siguiente chunk volvería a pausar. Autolimitado y
+  sin pérdida de evidencia.
+- **`systemic` sigue sin ruta de limpieza**, fuera de alcance por diseño.
+- **El cableado `refreshDestination → clearRecoveredDestinationPauses` no está
+  cubierto por tests**: `refreshDestination` es un closure de componente. La
+  función está probada con 17 tests y tres mutation tests; que el componente la
+  invoque con las filas `status === 'connected'` —y no con
+  `destinationResolved`— es una propiedad de orden de código, verificable
+  leyendo el callsite. Es la misma limitación declarada para el hoist de R5.
