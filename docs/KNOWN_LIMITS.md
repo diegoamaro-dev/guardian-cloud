@@ -546,3 +546,349 @@ señal desbloquearía un destino roto.
   invoque con las filas `status === 'connected'` —y no con
   `destinationResolved`— es una propiedad de orden de código, verificable
   leyendo el callsite. Es la misma limitación declarada para el hoist de R5.
+
+---
+
+# 4. GC-DEV-RESET-001 — una herramienta DEV podía destruir evidencia pendiente
+
+## Estado
+
+**RELEASE BLOCKER · FIXED IN CODE / HARDWARE REVALIDATION NOT REQUIRED.**
+
+Redacción factual del incidente:
+
+> **Una acción manual accidental sobre una herramienta DEV permitió destruir
+> evidencia pendiente no confirmada remotamente.**
+
+No fue GC-DEST-PAUSE-001. El sistema **no** borró la evidencia por su cuenta:
+la borró una herramienta al ser activada.
+
+---
+
+## El incidente
+
+2026-08-21, OnePlus A6000, durante la Vía 2. Un long-press accidental sobre el
+control de reset de la pantalla Home destruyó:
+
+```
+54 chunks .b64          remote_reference 0 / 54
+1 776 751 bytes .aac    nunca subidos
+localSessionId aee2cd23-7320-44c2-86c8-0198f4eb47a5
+```
+
+El logcat lo registra sin ambigüedad: `GC_RESET start` / `GC_RESET done`, con
+**0** subidas a destino, **0** `remote_reference`, **0** `/complete` y **0**
+reap en todo el buffer. No fue una convergencia: fue un borrado.
+
+Contaminó la corrida de revalidación de GC-DEST-PAUSE-001, que quedó anulada.
+
+---
+
+## Causa raíz
+
+El control combinaba las tres peores propiedades a la vez:
+
+1. **Gesto accidental** — long-press de 800 ms sobre un objetivo de 10 px con
+   `opacity: 0.15`.
+2. **Sin confirmación** — ejecutaba al soltar.
+3. **Sin comprobación de evidencia** — la única guarda era «no mientras grabas».
+
+Y `hardResetAppState` borra `documentDirectory` y `cacheDirectory` **enteros y
+de forma recursiva**: se lleva chunks, segmentos nativos, audio y staging sin
+enumerar ni distinguir sesiones.
+
+Existía además una segunda superficie, `clearGuardianQueueDev`, cuyo docblock
+afirmaba que «el gate de la UI de Settings impone DEV-only» — **falso**:
+`app/settings.tsx` no contenía ninguna ocurrencia de `__DEV__`. Su componente
+(`DevQueueWipeBlock`) resultó no estar renderizado en ningún sitio, así que el
+riesgo era **latente, no vivo**; pero el gate se ha puesto igualmente.
+
+---
+
+## Corrección
+
+**Una única política de rechazo**, en `src/dev/reset.ts`, con dos mitades —
+GC_QUEUE y filesystem — y ninguna herramienta destructiva la puede eludir. La
+mitad de cola:
+
+```
+inspectPendingEvidence()
+  → hay algún chunk que NO es isChunkConfirmedOffDevice
+  → RECHAZO. No se borra ni un byte ni una clave.
+```
+
+Es un **rechazo**, no un diálogo. **No existe «borrar de todas formas».**
+`isChunkConfirmedOffDevice` se reutiliza tal cual: es el mismo predicado del
+export gate, del finalize gate y del banner de Home. Una segunda definición de
+«protegido» sería una segunda cosa que se puede equivocar.
+
+La regla es **prueba positiva**, no recuento de chunks. Una entrada solo es
+descartable si se puede demostrar que **no** contiene evidencia local que haga
+falta conservar. Y prueba de seguridad hay exactamente una forma: un array
+`chunks` **no vacío** en el que **todos** satisfagan `isChunkConfirmedOffDevice`.
+
+### Por qué cero chunks BLOQUEA
+
+Una versión anterior de este guard razonaba «sin chunks ⇒ sin bytes ⇒ seguro».
+Es falso en este código, y `tryFinalizeReadySessions` **ya lo decía con todas
+las letras**:
+
+> *«The empty set is fully uploaded» is true arithmetic and a catastrophic
+> operational rule. A zero-chunk entry is not proof of complete remote evidence
+> — it is proof of nothing at all.*
+
+**Toda captura nace con `chunks: []`**, escrita durablemente por 4A antes de que
+el chunker emita nada:
+
+| forma | `uri` al crearse |
+|---|---|
+| audio / vídeo legacy | la grabación real en `cacheDirectory` |
+| vídeo segmentado nativo | **`''`** — los segmentos viven en `files/segments/{id}/` y se adoptan como chunks más tarde |
+
+Así que **`uri` tampoco puede ser el discriminador**: el vídeo nativo lleva uno
+vacío legítimamente mientras ya existen bytes reales en disco. Una entrada de
+cero chunks puede ser una captura en curso, una tras un kill, un chunker que
+falló, o una captura demasiado corta para emitir.
+
+**Bloquean:** cualquier chunk no confirmado · **cero chunks, por el motivo que
+sea** · `chunks` ausente o no-array — **nunca** degradar a `[]` · una entrada
+que no es objeto · cola ilegible o no-array.
+
+**Superan esta comprobación:** cola realmente vacía (`[]`) · **toda** la
+evidencia confirmada fuera del dispositivo, que es cuando la copia local es
+redundante. Superar esta comprobación **no autoriza borrar ficheros** — ver la
+sección siguiente.
+
+---
+
+## La cola vacía NO es prueba suficiente: evidencia fuera de GC_QUEUE
+
+`hardResetAppState` borra `documentDirectory` **entero**, y una cola vacía no
+demuestra que ese directorio no contenga nada. El producto tiene una ruta que
+**produce exactamente ese estado a propósito**:
+
+```
+abandonUnregisteredSession()
+  1. mueve la captura a documentDirectory/guardian_recording_*
+  2. y DESPUÉS retira la entrada de GC_QUEUE
+```
+
+Ese orden es deliberado — una muerte de proceso entre los dos pasos deja una
+referencia de más, nunca ninguna — y la promoción **existe precisamente** para
+que `orphanScan()` pueda recuperar los bytes cuando ya nada en la cola apunta a
+ellos. Bajo la regla anterior, el reset destruía justo la evidencia que la
+promoción se había hecho para salvar.
+
+**Regla correcta: prueba positiva GLOBAL.** El reset procede solo si
+`inspectPendingEvidence()` **y** `inspectLocalArtifacts()` devuelven `null`.
+Cualquiera de las dos que falle, o que no se pueda determinar, rechaza.
+
+### Inventario de superficies locales
+
+**Evidencia local recuperable / no confirmada — BLOQUEA:**
+
+| Superficie | Por qué |
+|---|---|
+| `guardian_recording_*` recuperables (`orphanResult.orphans`) | Es lo que `orphanScan` existe para recuperar |
+| `orphanResult.oversized` | Que esta versión **no pueda** trocearlos no los hace seguros de destruir: es lo contrario — los bytes están atrapados en el dispositivo y el dispositivo es el único sitio donde existen |
+| `skipped_too_old` (> 7 días) | La antigüedad no es prueba de que no valgan. El scanner los oculta del banner; eso no es permiso para triturarlos |
+| `skipped_unknown_ext` | Un `guardian_recording_*` que no sabemos clasificar |
+| `skipped_zero_size` | El scanner cuenta aquí **tanto** los de 0 bytes **como** los fallos de `stat`, y el informe no los distingue: es un desconocido, no un cero |
+| `segments/<sid>/` sin autorización de limpieza | `segmentAdopter` los coloca **fuera** de `chunks/<sid>/` justamente para que **sobrevivan a la entrada de cola**. «No hay entrada» no dice nada de ellos |
+| `documentDirectory` ilegible | Desconocido nunca es vacío |
+| Diario de limpieza ilegible | Una autorización que no se puede interpretar no es una autorización |
+
+**Residuos localmente borrables con autorización durable — NO bloquean:**
+
+| Superficie | Por qué |
+|---|---|
+| `skipped_already_queued` | Su `uri` pertenece a una entrada viva, sobre la que la regla 1 ya ha bloqueado o ha demostrado confirmación completa. Si cada chunk troceado de ese fichero lleva `remote_reference`, el original local es redundante por la misma regla que autoriza reapear la entrada |
+| `segments/<sid>/` **con** entrada en `guardian.segment_cleanup.v1` | Es constancia durable de que el **backend** autorizó borrar la evidencia local de esa sesión. El runner tiene permiso y simplemente aún no ha llegado. Bloquear aquí atascaría la herramienta con basura inocua |
+| `documentDirectory/chunks/<sid>/` | Trozos siempre **derivados** de una fuente que sí está protegida (`entry.uri` mientras la entrada vive, `guardian_recording_*` tras la promoción). Sin entrada de cola ninguna ruta de recovery puede leerlos, y `reapEntry` borra el directorio solo tras una finalización confirmada, así que un resto es residuo post-autorización |
+| Ficheros no-`guardian_*` en `documentDirectory` | Bundles del dev-launcher, cachés de expo-router, scratch |
+
+**Staging nativo (`cacheDir/gc-segmented-recorder/<sid>/`)** queda cubierto de
+forma **transitiva**, y tiene que ser así: la ruta la posee el lado Kotlin y no
+es enumerable desde JS. La adopción es *COPY, VERIFY, KEEP BOTH*, de modo que un
+staging adoptado tiene contrapartida en `segments/<sid>/` (comprobado), y uno no
+adoptado conserva su entrada 4A en la cola (comprobado, y bloquea por cero
+chunks).
+
+### Por qué `scanOrphans()` se reutiliza pero no basta
+
+Se importa tal cual: el prefijo `guardian_recording_`, el conjunto de
+extensiones y el límite de tamaño se declaran **una sola vez**, en el módulo
+cuya razón de ser es encontrarlos. La herramienta DEV **no** inventa su propio
+concepto de orphan. Es un módulo hoja (solo FileSystem + AsyncStorage),
+read-only por contrato: ni ciclo ni efectos.
+
+Pero `scanOrphans()` responde a *«qué le OFREZCO al usuario para recuperar»*, y
+un guard de destrucción pregunta *«hay algo aquí»*. De ahí dos ajustes:
+
+1. **Se cuentan también las categorías que el scanner descarta** (tabla
+   anterior), leídas de su propio `report`.
+2. **Sonda de legibilidad independiente.** `scanOrphans()` devuelve un informe
+   **todo a cero** cuando `readDirectoryAsync` falla o no hay
+   `documentDirectory`. Para un banner es correcto; para un guard destructivo
+   está **invertido**: un informe a cero se lee como «no hay nada que
+   proteger», que es exactamente cómo un listado fallido autorizaría borrarlo
+   todo. Por eso el directorio se sondea antes, y uno ilegible rechaza.
+
+El diario de limpieza se lee reutilizando sus constantes exportadas y
+`isValidJournalEntry`, respetando su propia doctrina literal: **un documento es
+o completamente válido o inutilizable**. Una entrada malformada envenena el
+documento entero. Y su regla de autorización tampoco se relaja: *ni la edad, ni
+la ausencia de GC_QUEUE, ni un directorio vacío* cuentan jamás — solo una
+autorización durable, que solo produce un 200/409 real del backend. Un
+`segments/<sid>/` **vacío** sin autorización bloquea, misma forma que la regla
+de cero chunks.
+
+---
+
+## La inspección y la destrucción no estaban serializadas (TOCTOU)
+
+Inspeccionar bien no basta si entre el veredicto y el borrado puede empezar una
+captura. `reset.ts` llevaba el contrato escrito en prosa:
+
+> *Caller must ensure no recording is in flight.*
+
+Un comentario no es un mecanismo de exclusión, y menos para una operación que
+destruye evidencia.
+
+### Por qué no había nada reutilizable
+
+| Mecanismo | Ámbito | ¿Cubre el reset? | ¿Cubre al productor? |
+|---|---|---|---|
+| `writeChain` / `queueMutate` | módulo (`index.tsx`) | **No** — el reset usa `removeItem`/`deleteAsync` en crudo, por debajo de la cadena | Sí, pero solo por mutación, no a lo largo de un check→delete; y en audio el **recorder arranca antes** de la escritura 4A |
+| `isStartingRef` | `useRef` de componente | **No** — invisible desde `src/dev/reset.ts` | solo start-vs-start |
+| `hasActiveAudioRecording()` | módulo (`audioEngine`) | solo lectura | solo **después** de que el recorder ya esté vivo; ciego al vídeo segmentado nativo |
+| `isDraining`, latch de ownership, `inFlightResolution` | módulo | otro asunto | otro asunto |
+| `chunkerStates`, `inFlightAdoptions` | módulo | — | por sesión, **post-4A** |
+
+De ahí `src/recording/evidenceExclusion.ts`: módulo hoja, **cero imports**, que
+es justo lo que permite que dependan de él `app/index.tsx` y `src/dev/reset.ts`
+sin ciclo.
+
+### La garantía
+
+Todo `acquire` es **síncrono**. No hay `await` entre leer el estado y
+reclamarlo, así que en el hilo único de JS ninguna intercalación puede observar
+un estado a medio reclamar.
+
+```
+lease vivo      ⇒ acquireProducerSlot() = null
+algún slot vivo ⇒ acquireDestructiveExclusion() = null
+```
+
+**Prioridad en la colisión: gana la captura.** El destructor nunca espera, nunca
+cancela, nunca expropia. Un slot filtrado falla en la dirección **segura** — el
+reset se niega para siempre, que cuesta un `pm clear`; el fallo inverso cuesta
+la grabación de alguien.
+
+### La puerta
+
+El slot se toma en el **punto de compromiso** de `startRecording`, que precede a
+todo efecto irreversible **en los dos órdenes**:
+
+```
+audio / vídeo legacy      recorder primero  → 4A después
+vídeo segmentado nativo   4A primero        → cámara después
+```
+
+Rechazar **ahí** no cuesta nada: no se ha escrito un byte. Es la única razón por
+la que es aceptable rechazar una captura. En cualquier punto posterior, negarse
+sería destruir evidencia en vez de declinar crearla.
+
+**El lock NO se mantiene durante la grabación.** Cubre exactamente la ventana en
+la que la evidencia aún no es visible para `inspectResetSafety`; pasada 4A, la
+propia entrada bloquea. Lock e inspección son totales **solo juntos**.
+
+La vida del slot es idéntica a la de `isStartingRef` y se libera en el mismo
+`finally` — éxito, `return` anticipado del vídeo nativo, o excepción.
+
+### Productores auditados
+
+`abandonUnregisteredSession` y la recuperación de orphans **no necesitan lock**:
+en ambos, en todo instante, o existe la entrada de cola o existe el fichero en
+disco (la promoción mueve antes de retirar; la recuperación nunca borra el
+fichero antes de encolar). El chunker y la adopción operan sobre una entrada que
+ya existe. `startRecording` es el único productor de evidencia desde cero.
+
+---
+
+## Alcance por herramienta
+
+| Herramienta | Qué destruye | Prueba que exige |
+|---|---|---|
+| `clearGuardianQueueDev` | solo referencias de cola | exclusión **+** `inspectPendingEvidence()` |
+| `hardResetAppState` | `documentDirectory` + `cacheDirectory` | exclusión **+** `inspectResetSafety()` = cola **+** filesystem |
+
+La exclusión se toma **antes** de inspeccionar en ambas. Tomarla después dejaría
+el TOCTOU intacto.
+
+**Gesto:** el long-press ya no ejecuta nada. Comprueba (global), y si hay
+evidencia muestra el rechazo; si no, pide confirmación explícita. La herramienta
+vuelve a comprobar al confirmar, por si el diálogo estuvo abierto mientras una
+captura escribía.
+
+**Release:** el bloque de Settings devuelve `null` fuera de `__DEV__`.
+
+---
+
+## Coherencia de claves tras un reset autorizado
+
+**Se borra ahora también** `guardian.pending_session_registrations`. Un registro
+pendiente solo puede apuntar a una sesión que tuvo entrada en la cola (4A la
+escribe antes que nada), así que dejarlos tras borrar la cola producía
+**registros fantasma**: el bucle de replay reintentando `POST /sessions` para
+sesiones inexistentes. Esa era la incoherencia real.
+
+**Se conservan, por semántica y no por pulcritud:**
+
+| Clave | Por qué |
+|---|---|
+| `gc.identity.v1` | El reset no es un reset de identidad. Borrarla recrea GC-AUTH-001 |
+| `gc.legacy_probe.v1` | Ídem: recrearía GC-AUTH-MIGRATION-001 |
+| `gc.pause.global.v1` | Una pausa registra una condición real observada contra el backend. Borrarla **fingiría una recuperación**, que es justo lo que GC-DEST-PAUSE-001 prohíbe: solo una prueba positiva retira una pausa |
+| `guardian.segment_cleanup.v1` | Cada entrada es constancia durable de una autorización **del backend** para borrar evidencia local. El runner es idempotente y retira sus propias entradas, así que una entrada obsoleta se autolimpia |
+| preferencias de usuario | No son estado ni evidencia |
+
+**El reset DEV sigue sin equivaler a un fresh install.** El fresh install
+controlado se hace con `pm clear` por ADB, fuera de la aplicación. **No se ha
+creado ninguna tercera superficie destructiva dentro de Guardian Cloud.**
+
+---
+
+## Residuales
+
+- **El gate `__DEV__` y el diálogo de confirmación no están cubiertos por
+  tests**: son rutas de render de React. Los 62 tests conducen las funciones
+  destructivas, que es donde vive el rechazo — y esa colocación es
+  deliberada: una pantalla no debe ser lo único que separa una herramienta DEV
+  de la evidencia de alguien.
+- **La puerta de `startRecording` se verifica de forma estructural**, no
+  ejecutándola: vive en un componente React que la suite no renderiza. Tres
+  tests leen el fuente y comprueban el orden (`acquireProducerSlot` antes del
+  recorder y antes de 4A; liberación en el mismo `finally`; exclusión antes de
+  inspeccionar). Reordenarla sería silencioso sin ellos. El comportamiento del
+  primitivo sí se ejecuta, con barreras deterministas.
+- **Si algo lanza entre el punto de compromiso y el `try` de
+  `startRecording`, el slot se filtra** — exactamente la misma ventana en la
+  que hoy ya se filtra `isStartingRef`. La consecuencia es que el reset se
+  niega, que es la dirección segura.
+- `DevQueueWipeBlock` sigue existiendo sin renderizarse. Se ha gateado en lugar
+  de eliminarse, para no ampliar el alcance.
+- **Bytes grabados que aún no han sido troceados ni promovidos** no aparecen ni
+  en la cola ni bajo `guardian_recording_*`. La entrada 4A los cubre mientras
+  existe, y la guarda «no mientras grabas» cubre la ventana de captura; pero
+  una captura de vídeo cuya cola se borre externamente a mitad deja trozos en
+  `chunks/<sid>/` y el mp4 en `cacheDirectory`, y ninguna ruta de recovery los
+  ve. Es un hueco **preexistente** de recovery, no creado por este guard, y no
+  se ha ampliado el alcance para cerrarlo.
+- **`skipped_zero_size` bloquea de más**: un `guardian_recording_*` de 0 bytes
+  genuino es inofensivo, pero el informe no lo distingue de un `stat` fallido.
+  Se prefiere el falso positivo; se sale con `pm clear`.
+- El staging nativo **no se enumera directamente** (ruta propiedad de Kotlin).
+  La cobertura es transitiva y depende de que la adopción siga siendo *COPY,
+  VERIFY, KEEP BOTH*. Si esa regla cambiara a un movimiento destructivo, esta
+  cobertura dejaría de ser válida.

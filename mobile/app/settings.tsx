@@ -40,6 +40,7 @@ import { ReliabilityCard } from '@/components/ReliabilityCard';
 // DEV-only queue wipe — surfaced as a button at the bottom of this screen.
 // Does NOT touch auth/Drive/anything else; only Guardian Cloud queue keys.
 import { clearGuardianQueueDev } from '.';
+import { describeResetRefusal } from '@/dev/reset';
 
 // Mirror of the key written by the home screen after a session is created
 // or recovered. See index.tsx LAST_SESSION_ID_KEY. Kept as a literal on
@@ -895,16 +896,33 @@ export default function SettingsScreen() {
   );
 }
 
+/**
+ * GC-DEV-RESET-001 — DEV-only, and it must stay that way.
+ *
+ * This component is not currently rendered anywhere, but it was written
+ * to be, and `clearGuardianQueueDev` drops `test.pending_retry`: the
+ * chunk files survive on disk while nothing references them any more,
+ * which is unrecoverable from inside the app. The old docblock on that
+ * function claimed "the Settings UI gate is what enforces DEV-only" —
+ * there was no such gate. Now there is one, at the top of the render, so
+ * mounting it in a release build produces nothing at all.
+ *
+ * The refusal itself lives in `clearGuardianQueueDev`, not here: a screen
+ * must not be the thing standing between a dev tool and someone's
+ * evidence.
+ */
 function DevQueueWipeBlock() {
   const [busy, setBusy] = useState(false);
   const [resultMsg, setResultMsg] = useState<string | null>(null);
+
+  if (!__DEV__) return null;
 
   async function handleWipe() {
     Alert.alert(
       'Limpiar cola (DEV)',
       'Borra la cola persistida y el puntero de última sesión. ' +
         'NO toca tu sesión de Google ni el Drive conectado. ' +
-        '¿Continuar?',
+        'Se rechazará si queda evidencia sin subir. ¿Continuar?',
       [
         { text: 'Cancelar', style: 'cancel' },
         {
@@ -914,7 +932,14 @@ function DevQueueWipeBlock() {
             try {
               setBusy(true);
               setResultMsg(null);
-              const { removed } = await clearGuardianQueueDev();
+              const { removed, refused } = await clearGuardianQueueDev();
+              if (refused) {
+                // Not a confirmation the user can override — the tool
+                // declined. Wording comes from the guard, so the screen
+                // never restates the refusal taxonomy.
+                setResultMsg(`Cancelado: ${describeResetRefusal(refused)}`);
+                return;
+              }
               setResultMsg(`OK · borradas ${removed.length} claves`);
             } catch (err) {
               setResultMsg(

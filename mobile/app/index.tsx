@@ -71,7 +71,24 @@ import {
   resolveIdentityInitialized,
 } from '@/auth/identityMarker';
 import { appendHistoryEntry, type SessionMode } from '@/api/history';
-import { hardResetAppState } from '@/dev/reset';
+import {
+  describeResetRefusal,
+  hardResetAppState,
+  inspectPendingEvidence,
+  inspectResetSafety,
+  producerActiveRefusal,
+  type ResetRefusal,
+} from '@/dev/reset';
+// GC-DEV-RESET-001 (third gap) — mutual exclusion between capture starts
+// and destructive dev tools. Zero-import leaf; see the module docblock
+// for why nothing existing could be reused.
+import {
+  acquireDestructiveExclusion,
+  acquireProducerSlot,
+  releaseDestructiveExclusion,
+  releaseProducerSlot,
+  type ProducerSlot,
+} from '@/recording/evidenceExclusion';
 import type { ChunkPayload } from '@/recording/chunkProducer';
 import { RecordingController } from '@/recording/recordingController';
 // Native segmented recorder. Imported eagerly (same shape the validated D_15S_2S
@@ -1379,28 +1396,65 @@ export async function normalizeQueueOnRecovery(): Promise<NormalizationReport> {
  * attached to globalThis for one-off invocation from the React Native
  * debugger console:  `await clearGuardianQueueDev()`.
  *
- * Intentionally module-level (not behind __DEV__) so a release-mode build
- * can still surface it if we ever ship a recovery tool. The Settings UI
- * gate is what enforces "DEV-only" today.
+ * Module-level rather than behind `__DEV__` so a release build could
+ * surface it if we ever ship a recovery tool.
+ *
+ * GC-DEV-RESET-001 — the previous version of this docblock claimed "the
+ * Settings UI gate is what enforces DEV-only today". That was FALSE:
+ * `app/settings.tsx` contained no `__DEV__` at all, so a single tap in a
+ * shipped build could drop the queue. The screen is gated now, and this
+ * function no longer relies on a caller to be careful — it applies the
+ * same refusal policy as `hardResetAppState`, from the same module, so
+ * the two destructive dev tools cannot disagree about what "pending"
+ * means.
+ *
+ * Removing `test.pending_retry` orphans every chunk on disk: the files
+ * survive but nothing references them, which is unrecoverable from
+ * inside the app. That is why this refuses rather than confirms.
  */
 export async function clearGuardianQueueDev(): Promise<{
   removed: string[];
+  refused?: ResetRefusal;
 }> {
-  const keys = [PENDING_RETRY_KEY, LAST_SESSION_ID_KEY];
-  const removed: string[] = [];
-  for (const k of keys) {
-    try {
-      await AsyncStorage.removeItem(k);
-      removed.push(k);
-    } catch (err) {
-      console.log('GC_QUEUE clearGuardianQueueDev failed', { key: k, err });
-    }
+  // Same TOCTOU as `hardResetAppState`, and this one does not go through
+  // `queueMutate` either — it removes the key underneath the chain. The
+  // lease makes check-and-drop atomic against a capture start.
+  const lease = acquireDestructiveExclusion('clearGuardianQueueDev');
+  if (lease === null) {
+    console.log('GC_QUEUE clearGuardianQueueDev refused', {
+      reason: 'producer_active',
+    });
+    return { removed: [], refused: producerActiveRefusal() };
   }
-  // Reset module-level rehydration cache too — otherwise a stale base64
-  // copy could outlive the queue wipe.
-  rehydrationCache.clear();
-  console.log('GC_QUEUE clearGuardianQueueDev done', { removed });
-  return { removed };
+
+  try {
+    const refusal = await inspectPendingEvidence();
+    if (refusal) {
+      console.log('GC_QUEUE clearGuardianQueueDev refused — pending evidence', {
+        sessions: refusal.sessions,
+        unconfirmed_chunks: refusal.unconfirmed_chunks,
+      });
+      return { removed: [], refused: refusal };
+    }
+
+    const keys = [PENDING_RETRY_KEY, LAST_SESSION_ID_KEY];
+    const removed: string[] = [];
+    for (const k of keys) {
+      try {
+        await AsyncStorage.removeItem(k);
+        removed.push(k);
+      } catch (err) {
+        console.log('GC_QUEUE clearGuardianQueueDev failed', { key: k, err });
+      }
+    }
+    // Reset module-level rehydration cache too — otherwise a stale base64
+    // copy could outlive the queue wipe.
+    rehydrationCache.clear();
+    console.log('GC_QUEUE clearGuardianQueueDev done', { removed });
+    return { removed };
+  } finally {
+    releaseDestructiveExclusion(lease);
+  }
 }
 
 /**
@@ -6019,6 +6073,34 @@ export default function Index() {
       /* haptics not available — ignore */
     });
     isStartingRef.current = true;
+
+    // GC-DEV-RESET-001 (third gap) — THE DOOR.
+    //
+    // This is the commit point, and it sits before every irreversible
+    // effect on every path: before the recorder opens (audio/legacy
+    // video reach `startAudioRecording` / `recordAsync` first) and
+    // before the 4A durable write (native segmented video reaches
+    // `queueAppendNewSession` first). Neither ordering can slip past it.
+    //
+    // Returning null means a destructive dev tool currently holds
+    // exclusion. Aborting HERE costs nothing — not a byte has been
+    // written — which is the only reason it is acceptable to refuse a
+    // capture at all. One acquire, one door; anywhere later and the
+    // refusal would be destroying evidence rather than declining to
+    // create it.
+    //
+    // The slot's lifetime is exactly `isStartingRef`'s, released in the
+    // same `finally`, so it covers the window in which the capture's
+    // evidence is not yet visible to `inspectResetSafety`. After 4A the
+    // queue entry itself blocks a reset.
+    const producerSlot: ProducerSlot | null = acquireProducerSlot('startRecording');
+    if (producerSlot === null) {
+      isStartingRef.current = false;
+      console.log('REC START ignored — destructive operation holds exclusion');
+      setTestStatus('REC START bloqueado — reset en curso');
+      return;
+    }
+
     setIsStarting(true);
     resetProgress();
 
@@ -6602,6 +6684,11 @@ export default function Index() {
       videoRecordingUriRef.current = null;
     } finally {
       isStartingRef.current = false;
+      // Released here and only here — success, early return on the
+      // native-segmented path, or a throw. By this point the 4A entry is
+      // durable on every success path, so `inspectResetSafety` can see
+      // the capture and takes over the protection.
+      releaseProducerSlot(producerSlot);
       setIsStarting(false);
     }
   }
@@ -8648,7 +8735,19 @@ export default function Index() {
         </Text>
       )}
 
-      {/* DEV-only hard reset. Long-press, gated on __DEV__. */}
+      {/* GC-DEV-RESET-001 — DEV-only hard reset.
+        *
+        * This control destroyed a validation run on 2026-08-21: an
+        * accidental long-press wiped 54 chunks and 1 776 751 bytes of
+        * audio whose `remote_reference` was 0 of 54 — none of it had ever
+        * left the device. An 800 ms press on a 10 px target executed
+        * immediately, with no confirmation and no evidence check.
+        *
+        * Two things changed. The press no longer executes anything: it
+        * asks first. And `hardResetAppState` REFUSES outright while any
+        * chunk is unconfirmed — there is no "delete anyway", because a
+        * dev convenience may not be what loses someone's evidence.
+        */}
       {__DEV__ ? (
         <Pressable
           onLongPress={async () => {
@@ -8656,15 +8755,46 @@ export default function Index() {
               Alert.alert('Reset bloqueado', 'Stop recording before reset.');
               return;
             }
-            try {
-              await hardResetAppState();
-              Alert.alert('Reset hecho', 'App state cleared.');
-            } catch (err) {
-              Alert.alert(
-                'Reset error',
-                err instanceof Error ? err.message : String(err),
-              );
+            // Check BEFORE showing a dialog, so the refusal is what the
+            // user sees rather than a confirm prompt for something that
+            // was never going to run. GLOBAL check: this control deletes
+            // documentDirectory, where evidence survives with no queue
+            // entry by design (`abandonUnregisteredSession`).
+            const pending = await inspectResetSafety();
+            if (pending) {
+              Alert.alert('Reset bloqueado', describeResetRefusal(pending));
+              return;
             }
+            Alert.alert(
+              'Reset de estado (DEV)',
+              'Borra cola, historial y ficheros locales. No toca tu ' +
+                'identidad ni tu sesión de Google. ¿Continuar?',
+              [
+                { text: 'Cancelar', style: 'cancel' },
+                {
+                  text: 'Resetear',
+                  style: 'destructive',
+                  onPress: async () => {
+                    try {
+                      // Re-checked inside the tool: the dialog may have
+                      // been open while a capture wrote new chunks.
+                      const outcome = await hardResetAppState();
+                      Alert.alert(
+                        outcome.ok ? 'Reset hecho' : 'Reset bloqueado',
+                        outcome.ok
+                          ? 'App state cleared.'
+                          : describeResetRefusal(outcome),
+                      );
+                    } catch (err) {
+                      Alert.alert(
+                        'Reset error',
+                        err instanceof Error ? err.message : String(err),
+                      );
+                    }
+                  },
+                },
+              ],
+            );
           }}
           delayLongPress={800}
           hitSlop={20}
