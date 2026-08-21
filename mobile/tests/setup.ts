@@ -184,9 +184,16 @@ vi.mock('@/auth/supabase', () => ({
 vi.mock('@/auth/store', () => ({
   useAuthStore: {
     setState: vi.fn(),
-    getState: vi.fn(() => ({ status: 'loading' })),
+    getState: vi.fn(() => ({ status: 'loading', init: vi.fn(async () => {}) })),
   },
   getFreshAccessToken: vi.fn(async () => null),
+  // `client.ts` reads the classified result, not the bare token. Kept in
+  // sync with `getFreshAccessToken` above: both say "no session".
+  getAccessToken: vi.fn(async () => ({
+    ok: false as const,
+    reason: 'no_session' as const,
+    name: null,
+  })),
 }));
 
 vi.mock('@/config/env', () => ({

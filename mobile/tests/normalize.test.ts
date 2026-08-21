@@ -224,12 +224,16 @@ describe('normalizeQueueOnRecovery — Step 2: exact-duplicate chunks', () => {
 
 describe('normalizeQueueOnRecovery — Step 3: hash divergence at same chunk_index', () => {
   it('marks every chunk in the entry as `failed` with CORRUPT_HASH_DIVERGENCE', async () => {
+    // Seed real bytes. The previous version of this test asserted that
+    // `base64Slice` came back undefined, but its `chunk()` helper never
+    // set one — so the assertion was vacuous and silently blessed a
+    // recovery path that destroyed unconfirmed evidence.
     await seed([
       entry({
         chunks: [
-          chunk(0, 'a'.repeat(64)),
-          chunk(0, 'b'.repeat(64)), // same idx, different hash → corrupt
-          chunk(1, 'c'.repeat(64)),
+          { ...chunk(0, 'a'.repeat(64)), base64Slice: 'AAAA' },
+          { ...chunk(0, 'b'.repeat(64)), base64Slice: 'BBBB' }, // same idx, other hash → corrupt
+          { ...chunk(1, 'c'.repeat(64)), base64Slice: 'CCCC' },
         ],
       }),
     ]);
@@ -240,8 +244,15 @@ describe('normalizeQueueOnRecovery — Step 3: hash divergence at same chunk_ind
     const e = (await queueRead())[0]!;
     expect(e.chunks.every(c => c.status === 'failed')).toBe(true);
     expect(e.chunks[0]?.last_error?.code).toBe('CORRUPT_HASH_DIVERGENCE');
-    // base64Slice purged on failed.
-    expect(e.chunks.every(c => c.base64Slice === undefined)).toBe(true);
+
+    // PHASE 1A — expectation deliberately INVERTED. None of these
+    // chunks carries a `remote_reference`, so none was ever confirmed
+    // off-device. Recovery may flag them corrupt, but it may not
+    // destroy the only copy of the evidence. Bytes, hash and index all
+    // survive.
+    expect(e.chunks.every(c => c.base64Slice !== undefined)).toBe(true);
+    expect(e.chunks.map(c => c.base64Slice).sort()).toEqual(['AAAA', 'BBBB', 'CCCC']);
+    expect(e.chunks.every(c => c.hash.length === 64)).toBe(true);
   });
 
   it('preserves chunks server-side: corrupt entry is NOT deleted from the queue', async () => {
