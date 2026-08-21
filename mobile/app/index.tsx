@@ -5406,13 +5406,33 @@ export default function Index() {
     //   3. schedulePendingSessionRegistration on the deferred branch
     const pinnedDestinationType: DestinationType = activeDestinationType;
 
+    // GC-AUTH-001 (4C) — a missing token no longer refuses the capture.
+    //
+    // This used to abort with TOKEN_MISSING_AT_START, which meant that a
+    // device in IDENTITY_DEGRADED — one whose Supabase session had died
+    // and which, correctly, refuses to mint a replacement identity —
+    // could not record at all. Guardian Cloud's whole purpose is to get
+    // evidence off the device; refusing to capture because the backend
+    // cannot be reached inverts that. The backend is where evidence
+    // GOES, not permission to gather it.
+    //
+    // Nothing is improvised to make this safe. The path was built by the
+    // two preceding commits and is simply used here:
+    //   4A — the recorder going live writes a durable GC_QUEUE entry
+    //        before anything depends on the backend, and a zero-chunk
+    //        entry can never complete or be reaped;
+    //   4B — no token routes to `schedulePendingSessionRegistration`
+    //        under this same `localSessionId`, with no doomed HTTP call,
+    //        and the backend is idempotent on (id, user_id) so the
+    //        replay after identity returns yields one row.
+    // Chunks accumulate locally and the worker retries them; 401 and
+    // SESSION_NOT_FOUND are both already classified transient.
     const token = tokenRef.current;
     if (!token) {
-      console.log('ERROR REC: TOKEN_MISSING_AT_START');
-      setTestStatus('ERROR REC: TOKEN_MISSING_AT_START');
-      isStartingRef.current = false;
-      setIsStarting(false);
-      return;
+      console.log('GC_LOCAL_FIRST capture without identity', {
+        session_id: localSessionId,
+        mode: recordingMode,
+      });
     }
 
     // ----- KICK in PARALLEL (do NOT await — recorder doesn't need them) -----
@@ -5487,9 +5507,9 @@ export default function Index() {
       // and an error to re-classify. Skip straight to the durable
       // mechanism and say so plainly.
       //
-      // Unreachable while `TOKEN_MISSING_AT_START` still gates the
-      // caller — that gate belongs to 4C. This exists so removing it
-      // there is a deletion, not a rewrite.
+      // Live since 4C removed the TOKEN_MISSING_AT_START abort: this is
+      // now the ordinary path for a capture started in
+      // IDENTITY_DEGRADED.
       if (!token) {
         await schedulePendingSessionRegistration(
           localSessionId,
