@@ -1651,7 +1651,7 @@ interface PendingSessionRegistration {
   destination_type?: DestinationType;
 }
 
-async function loadPendingRegistrations(): Promise<PendingSessionRegistration[]> {
+export async function loadPendingRegistrations(): Promise<PendingSessionRegistration[]> {
   try {
     const raw = await AsyncStorage.getItem(PENDING_SESSIONS_KEY);
     if (!raw) return [];
@@ -1676,7 +1676,7 @@ async function savePendingRegistrations(
   await AsyncStorage.setItem(PENDING_SESSIONS_KEY, JSON.stringify(list));
 }
 
-async function addPendingRegistration(
+export async function addPendingRegistration(
   session_id: string,
   mode: SessionMode,
   destination_type?: DestinationType,
@@ -1779,18 +1779,34 @@ async function schedulePendingSessionRegistration(
  * Detect errors from `createSessionRequest` that warrant local-first
  * fallback (retry in background) rather than aborting the recording.
  *
- * Retryable: any failure that did NOT come back as a 4xx HTTP response.
+ * Retryable: any failure that did NOT come back as a STRUCTURAL 4xx.
  * That covers offline (TypeError "Network request failed"), DNS errors,
- * AbortError on timeout, and 5xx/408/429.
+ * AbortError on timeout, 5xx/408/429 — and 401.
  *
- * Not retryable: 4xx (validation/auth errors) — the user input is wrong
- * and recording should not start. The original `throw` path handles it.
+ * Not retryable: 400 / 403 / 409 / 422 — the request itself is wrong,
+ * and no amount of retrying will make it right. Those still abort.
+ *
+ * GC-AUTH-001: 401 used to sit with the structural 4xx, and that
+ * conflated two different statements. A 400 says "this request is
+ * invalid"; a 401 says "I do not know who you are RIGHT NOW". The
+ * second is a property of the session, not of the capture — the
+ * identity may be mid-refresh, or degraded and recovering — and
+ * answering it by throwing away a recording in progress destroys
+ * evidence over a condition that routinely resolves itself. Deferred
+ * registration is exactly the mechanism for "cannot register yet", and
+ * the backend is idempotent on (id, user_id), so replaying the same
+ * `localSessionId` once identity returns produces one row, not two.
+ *
+ * The 4xx block is deliberately NOT widened any further: turning every
+ * client error into an unbounded retry would hide real defects behind
+ * a loop that never ends.
  */
-function isRetryableSessionCreateError(err: unknown): boolean {
+export function isRetryableSessionCreateError(err: unknown): boolean {
   if (!(err instanceof Error)) return false;
   const m = err.message.match(/HTTP (\d{3})/);
   if (!m) return true; // no HTTP status → network/abort
   const status = Number(m[1]);
+  if (status === 401) return true; // identity, not input
   if (status === 408 || status === 429) return true;
   if (status >= 500 && status < 600) return true;
   return false;
@@ -5465,6 +5481,31 @@ export default function Index() {
       destination_type: pinnedDestinationType,
     });
     const sessionCreatePromise: Promise<string> = (async () => {
+      // GC-AUTH-001 (4B) — do not send a request we already know will
+      // come back 401. With no token there is nothing to authenticate
+      // with, so the round-trip buys nothing but latency, a log line
+      // and an error to re-classify. Skip straight to the durable
+      // mechanism and say so plainly.
+      //
+      // Unreachable while `TOKEN_MISSING_AT_START` still gates the
+      // caller — that gate belongs to 4C. This exists so removing it
+      // there is a deletion, not a rewrite.
+      if (!token) {
+        await schedulePendingSessionRegistration(
+          localSessionId,
+          recordingMode,
+          pinnedDestinationType,
+        );
+        console.log('GC_LOCAL_FIRST session deferred', {
+          session_id: localSessionId,
+          reason: 'no_token',
+        });
+        perfLog('GC_PERF_SESSION_CREATED', {
+          session_id: localSessionId,
+          deferred_offline: true,
+        });
+        return localSessionId;
+      }
       try {
         const sid = await createSessionRequest(
           token,
@@ -6275,13 +6316,31 @@ export default function Index() {
     // future attempt.
     const token = tokenRef.current;
     try {
-      if (!token) throw new Error('no_token');
-      await createSessionRequest(
-        token,
-        orphan.mode,
-        sessionId,
-        pinnedDestinationType,
-      );
+      if (!token) {
+        // GC-AUTH-001 (4B) — this used to be a sentinel
+        // `throw new Error('no_token')`, which reached the deferred
+        // branch only because that string happens not to match the
+        // `HTTP (\d{3})` probe in `isRetryableSessionCreateError`.
+        // Correct behaviour resting on a regex miss is a trap for
+        // whoever edits that classifier next, so state it directly —
+        // and skip a request that could only ever come back 401.
+        await schedulePendingSessionRegistration(
+          sessionId,
+          orphan.mode,
+          pinnedDestinationType,
+        );
+        console.log('GC_LOCAL_FIRST session deferred', {
+          session_id: sessionId,
+          reason: 'no_token',
+        });
+      } else {
+        await createSessionRequest(
+          token,
+          orphan.mode,
+          sessionId,
+          pinnedDestinationType,
+        );
+      }
     } catch (err) {
       if (isRetryableSessionCreateError(err)) {
         await schedulePendingSessionRegistration(
