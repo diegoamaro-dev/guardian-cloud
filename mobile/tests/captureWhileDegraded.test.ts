@@ -74,7 +74,11 @@ vi.mock('@/auth/supabase', () => ({
 }));
 
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { getFreshAccessToken } from '@/auth/store';
+import {
+  getFreshAccessToken,
+  getOwnershipAccessToken,
+  type OwnershipToken,
+} from '@/auth/store';
 import {
   decideIdentityState,
   resolveIdentityInitialized,
@@ -291,8 +295,14 @@ describe('TEST_CONVERGENCE_AFTER_IDENTITY_RETURNS', () => {
   });
 
   it('exactly one /complete once every chunk has uploaded', async () => {
-    // Identity has returned: the worker can authenticate again.
+    // Identity has returned AND its marker is durable, so the ownership
+    // authority hands out a token: the worker can authenticate again.
     vi.mocked(getFreshAccessToken).mockResolvedValue('test-token');
+    // The mock stands in for the ownership authority, which is the sole
+    // producer of the brand — so the cast belongs here and nowhere else.
+    vi.mocked(getOwnershipAccessToken).mockResolvedValue(
+      'test-token' as OwnershipToken,
+    );
     fetchMock.mockResolvedValue({
       ok: true,
       status: 200,

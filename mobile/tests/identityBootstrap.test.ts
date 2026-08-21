@@ -110,7 +110,12 @@ describe('TEST_IDENTITY_STATE_TRANSITION_TABLE', () => {
 
 describe('TEST_IDENTITY_MARKER_IS_IDEMPOTENT', () => {
   it('writes a marker when none exists', async () => {
-    const marker = await markIdentityInitialized('9095c9e7-9d19-48d4-a465-8b7');
+    // GC-AUTH-MIGRATION-001: the write now reports whether it landed, so
+    // the caller can refuse to treat an unrecorded identity as settled.
+    const { marker, persisted } = await markIdentityInitialized(
+      '9095c9e7-9d19-48d4-a465-8b7',
+    );
+    expect(persisted).toBe(true);
     expect(marker.version).toBe(1);
     expect(marker.sub_prefix).toBe('9095c9e7');
     expect(marker.migrated_from_legacy).toBe(false);
@@ -120,8 +125,10 @@ describe('TEST_IDENTITY_MARKER_IS_IDEMPOTENT', () => {
   it('never overwrites an existing marker', async () => {
     const first = await markIdentityInitialized('aaaaaaaa-1111');
     const second = await markIdentityInitialized('bbbbbbbb-2222');
-    expect(second.initialized_at).toBe(first.initialized_at);
-    expect(second.sub_prefix).toBe('aaaaaaaa');
+    expect(second.marker.initialized_at).toBe(first.marker.initialized_at);
+    expect(second.marker.sub_prefix).toBe('aaaaaaaa');
+    // An already-durable marker reports as persisted without rewriting.
+    expect(second.persisted).toBe(true);
   });
 
   it('stores no token material — only a version, a timestamp and 8 hex chars', async () => {
@@ -140,7 +147,7 @@ describe('TEST_IDENTITY_MARKER_IS_IDEMPOTENT', () => {
   });
 
   it('tolerates a missing user id', async () => {
-    const marker = await markIdentityInitialized(null);
+    const { marker } = await markIdentityInitialized(null);
     expect(marker.sub_prefix).toBeNull();
   });
 });

@@ -48,12 +48,20 @@ vi.mock('@react-native-async-storage/async-storage', () => {
 // then calls completeSession, which uses global `fetch`. We control
 // both so each test asserts the exact decision branch.
 vi.mock('@/auth/store', () => ({
+  // R6: no-op = ownership gate open. Tests that need it SHUT override it.
+  assertOwnershipGateOpen: vi.fn(),
+  isOwnershipGateOpen: vi.fn(() => true),
   useAuthStore: { setState: vi.fn(), getState: vi.fn(() => ({ status: 'loading' })) },
   getFreshAccessToken: vi.fn(async () => 'test-token'),
+  getOwnershipAccessToken: vi.fn(async () => 'test-token'),
 }));
 
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { getFreshAccessToken } from '@/auth/store';
+import {
+  getFreshAccessToken,
+  getOwnershipAccessToken,
+  type OwnershipToken,
+} from '@/auth/store';
 import {
   MAX_COMPLETE_ATTEMPTS,
   PENDING_RETRY_KEY,
@@ -118,6 +126,10 @@ beforeEach(async () => {
   await AsyncStorage.clear();
   vi.clearAllMocks();
   vi.mocked(getFreshAccessToken).mockResolvedValue('test-token');
+  // The mock stands in for the ownership authority, the sole producer.
+  vi.mocked(getOwnershipAccessToken).mockResolvedValue(
+    'test-token' as OwnershipToken,
+  );
   // Default fetch — will be overridden per test.
   vi.stubGlobal('fetch', vi.fn());
 });
@@ -300,8 +312,11 @@ describe('tryFinalizeReadySessions — completeSession failure', () => {
     expect(q[0]?.session_completed).toBe(false);
   });
 
-  it('bumps complete_attempts and leaves the entry when getFreshAccessToken returns null', async () => {
-    vi.mocked(getFreshAccessToken).mockResolvedValue(null);
+  // R5: the completion path takes its token from the ownership authority
+  // now, so "no token" is driven through that accessor. Same assertion:
+  // no request, entry retained, attempts bumped.
+  it('bumps complete_attempts and leaves the entry when no ownership token is available', async () => {
+    vi.mocked(getOwnershipAccessToken).mockResolvedValue(null);
     await queueAppendNewSession(
       entry({
         next_chunk_index: 1,

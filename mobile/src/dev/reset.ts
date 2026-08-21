@@ -21,6 +21,27 @@ import * as FileSystem from 'expo-file-system/legacy';
 // Adding it here would mean a reset followed by a lost session mints a
 // fresh anonymous user and silently orphans everything already uploaded,
 // which is exactly the GC-AUTH-001 failure. Leave it out.
+//
+// ALSO DELIBERATELY ABSENT: `gc.legacy_probe.v1` (GC-AUTH-MIGRATION-001).
+// Same reasoning, one step removed. The seal records the answer to a
+// historical migration question — "did this install carry traces of an
+// identity older than the migration boundary?" — and this reset is not a
+// migration. Worse, it deletes three of the four signals the probe reads
+// (they are the volatile keys below), so clearing the seal here would
+// re-ask the question against a store this function just emptied and
+// re-seal a negative that was never true.
+//
+// WHAT THIS MEANS FOR TESTING, AND IT MATTERS:
+//
+//   This reset does NOT produce a fresh install, and must never be used
+//   to claim one. It leaves behind the marker, the seal and the Supabase
+//   session. A "fresh install" run on hardware is `pm clear` (or an
+//   uninstall) — nothing else. Even that is only fresh on the device:
+//   the anonymous user still exists server-side.
+//
+//   Migration states (traces without a marker, a marker without a seal,
+//   a corrupt seal) are constructed in the test fixtures, not by this
+//   function. Do not grow a dev tool for them here.
 const VOLATILE_KEYS = [
   'test.pending_retry',
   'export.last_session_id',

@@ -27,6 +27,7 @@ import {
   getPreferredDestinationType,
   setPreferredDestinationType,
 } from '@/destinations/preference';
+import { ApiError } from '@/api/client';
 import { claimDriveOAuthCode } from '@/oauth/exchangeGuard';
 // ReliabilityCard — same component the home screen mounts in 'home' mode.
 // Here we mount it in 'settings' mode so it stays visible as a permanent
@@ -111,6 +112,27 @@ function parseCodeFromUrl(url: string): string | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * R5 — the Drive actions create remote state owned by this user (an OAuth
+ * link, a stored refresh token, a real file), so they wait for
+ * `gc.identity.v1` to be durable like every other ownership operation.
+ *
+ * That wait must NOT be silent: the user tapped a button and something has
+ * to answer. But it is also not an error and not a sign-in problem — the
+ * session is fine and the condition clears itself within a moment. So the
+ * copy stays non-technical and suggests the one useful action.
+ *
+ * Nothing else changes: no request is sent, no session is touched, no
+ * identity is created, no evidence is read or written, and there is no new
+ * screen or step.
+ */
+function describeDriveError(err: unknown): string {
+  if (err instanceof ApiError && err.code === 'IDENTITY_NOT_READY') {
+    return 'Preparando conexión segura… Inténtalo de nuevo en unos segundos.';
+  }
+  return err instanceof Error ? err.message : String(err);
 }
 
 export default function SettingsScreen() {
@@ -289,7 +311,7 @@ export default function SettingsScreen() {
           // since we never started one ourselves).
           await refreshState();
         } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
+          const msg = describeDriveError(err);
           setErrorMsg(`No se pudo completar la conexión: ${msg}`);
         } finally {
           setBusy(false);
@@ -317,7 +339,7 @@ export default function SettingsScreen() {
         } catch {
           /* getConnectedDrive failed — fall through to real error */
         }
-        const msg = err instanceof Error ? err.message : String(err);
+        const msg = describeDriveError(err);
         setErrorMsg(`No se pudo completar la conexión: ${msg}`);
       } finally {
         setBusy(false);
@@ -365,7 +387,7 @@ export default function SettingsScreen() {
       // Control returns via the deep-link listener above. We leave `busy`
       // as 'connecting' until then; the listener will flip to 'exchanging'.
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = describeDriveError(err);
       setErrorMsg(msg);
       setBusy(false);
     }
@@ -383,7 +405,7 @@ export default function SettingsScreen() {
         `Archivo de prueba subido correctamente.\nID: ${res.remote_reference}`,
       );
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = describeDriveError(err);
       setErrorMsg(`No se pudo subir el archivo de prueba: ${msg}`);
     } finally {
       setBusy(false);

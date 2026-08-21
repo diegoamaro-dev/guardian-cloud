@@ -54,8 +54,12 @@ vi.mock('@react-native-async-storage/async-storage', () => ({
 }));
 
 vi.mock('@/auth/store', () => ({
+  // R6: no-op = ownership gate open. Tests that need it SHUT override it.
+  assertOwnershipGateOpen: vi.fn(),
+  isOwnershipGateOpen: vi.fn(() => true),
   useAuthStore: { setState: vi.fn(), getState: vi.fn(() => ({ status: 'loading' })) },
   getFreshAccessToken: vi.fn(async () => 'test-token'),
+  getOwnershipAccessToken: vi.fn(async () => 'test-token'),
 }));
 
 // Hoisted: index.tsx builds the scheduler at module scope, so the factory runs

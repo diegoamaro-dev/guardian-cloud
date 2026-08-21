@@ -55,9 +55,18 @@ import {
   type GlobalPauseState,
 } from '@/upload/pauseStore';
 import { listSessionChunks } from '@/api/export';
-import { useAuthStore, getFreshAccessToken } from '@/auth/store';
 import {
+  useAuthStore,
+  getFreshAccessToken,
+  getOwnershipAccessToken,
+  assertOwnershipGateOpen,
+  type OwnershipToken,
+} from '@/auth/store';
+import {
+  LEGACY_PROBE_VERSION,
   decideIdentityState,
+  ensureMigrationBoundary,
+  invalidateLegacyProbeSeal,
   markIdentityInitialized,
   resolveIdentityInitialized,
 } from '@/auth/identityMarker';
@@ -1498,7 +1507,13 @@ export async function reconcileStaleSessionsWithBackend(): Promise<{
     const expected = entry.next_chunk_index;
     if (expected === 0) continue;
 
-    const token = await getFreshAccessToken();
+    // R6 — OWNERSHIP TOKEN. This block reads backend chunk state (a GET)
+    // but then hands the same token to `finalizeAndAuthorizeCleanup`,
+    // which calls POST /complete and authorises deleting local evidence.
+    // It used to take a plain read token, which is a genuine ownership
+    // leak — found by the branded type, not by reading the code. The
+    // ownership token satisfies the GET too, so nothing else changes.
+    const token = await getOwnershipAccessToken();
     if (!token) {
       console.log('GC_QUEUE_STALE_LOCAL_ERROR_NOT_RECONCILED', {
         session_id: entry.session_id,
@@ -1741,57 +1756,121 @@ let pendingRegistrationLoopRunning = false;
  * Single-flight: a second caller while the loop is already running is
  * a no-op (the running instance covers their entry too once persisted).
  */
+/**
+ * ONE pass of the deferred-registration replay: read the list, try to
+ * register every entry, report how many are still pending.
+ *
+ * Extracted from `runPendingRegistrationLoop` so a test can drive the
+ * REAL replay mechanism without waiting out the retry interval or
+ * reimplementing it. The loop below is now nothing but "run a pass, sleep
+ * if work remains" — cadence, interval and backoff are untouched and
+ * still live exclusively there. Production and tests execute the same
+ * code, which is the entire point: an earlier version of the R6 test
+ * drove `uploadDrainLoop` instead, which never touches this path at all,
+ * so it asserted "no request was sent" about a mechanism it never ran.
+ *
+ * Returns the number of registrations still outstanding afterwards.
+ */
+export async function runPendingRegistrationPass(): Promise<number> {
+  const list = await loadPendingRegistrations();
+  if (list.length === 0) return 0;
+
+  // R5 — OWNERSHIP TOKEN. This replay's whole job is `POST /sessions`, so
+  // it waits for a durable marker exactly as it already waits for a
+  // token. Only the authority that answers "may I?" has changed.
+  const token = await getOwnershipAccessToken();
+  if (token) {
+    for (const item of list) {
+      try {
+        // `destination_type` is optional on legacy entries persisted
+        // before the destination-truth fix — those fall back to the
+        // historical `'drive'` default so the backend insert still
+        // succeeds (the schema accepts both). New entries always
+        // carry the actual pinned destination from GRABAR time, so
+        // the backend record matches where chunks physically went.
+        const destinationType: DestinationType =
+          item.destination_type ?? 'drive';
+        await createSessionRequest(
+          token,
+          item.mode,
+          item.session_id,
+          destinationType,
+        );
+        console.log('GC_LOCAL_FIRST session registered', {
+          session_id: item.session_id,
+          mode: item.mode,
+          destination_type: destinationType,
+          legacyFallback: item.destination_type === undefined,
+        });
+        await removePendingRegistration(item.session_id);
+      } catch (err) {
+        console.log('GC_LOCAL_FIRST register retry failed', {
+          session_id: item.session_id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+  } else {
+    console.log('GC_LOCAL_FIRST register loop — no token yet');
+  }
+
+  return (await loadPendingRegistrations()).length;
+}
+
 async function runPendingRegistrationLoop(): Promise<void> {
   if (pendingRegistrationLoopRunning) return;
   pendingRegistrationLoopRunning = true;
   try {
     while (true) {
-      const list = await loadPendingRegistrations();
-      if (list.length === 0) return;
-
-      const token = await getFreshAccessToken();
-      if (token) {
-        for (const item of list) {
-          try {
-            // `destination_type` is optional on legacy entries persisted
-            // before the destination-truth fix — those fall back to the
-            // historical `'drive'` default so the backend insert still
-            // succeeds (the schema accepts both). New entries always
-            // carry the actual pinned destination from GRABAR time, so
-            // the backend record matches where chunks physically went.
-            const destinationType: DestinationType =
-              item.destination_type ?? 'drive';
-            await createSessionRequest(
-              token,
-              item.mode,
-              item.session_id,
-              destinationType,
-            );
-            console.log('GC_LOCAL_FIRST session registered', {
-              session_id: item.session_id,
-              mode: item.mode,
-              destination_type: destinationType,
-              legacyFallback: item.destination_type === undefined,
-            });
-            await removePendingRegistration(item.session_id);
-          } catch (err) {
-            console.log('GC_LOCAL_FIRST register retry failed', {
-              session_id: item.session_id,
-              error: err instanceof Error ? err.message : String(err),
-            });
-          }
-        }
-      } else {
-        console.log('GC_LOCAL_FIRST register loop — no token yet');
-      }
-
-      const remaining = await loadPendingRegistrations();
-      if (remaining.length === 0) return;
+      const remaining = await runPendingRegistrationPass();
+      if (remaining === 0) return;
       await sleep(PENDING_SESSIONS_RETRY_INTERVAL_MS);
     }
   } finally {
     pendingRegistrationLoopRunning = false;
   }
+}
+
+/**
+ * GC-AUTH-MIGRATION-001 — an identity is established but `gc.identity.v1`
+ * could not be written.
+ *
+ * The dangerous shape is durable `legacy_identity_evidence: false` sitting
+ * next to an absent marker. On a later boot with the session gone that
+ * reads as FIRST_IDENTITY and mints a SECOND identity, silently orphaning
+ * everything the first one uploaded. The marker is what normally prevents
+ * it, and the marker is exactly what just failed to land.
+ *
+ * So we stop trusting the seal. Dropping it makes the next boot re-decide
+ * the boundary, and any trace the established identity left — a queue
+ * entry, a history row — makes the probe answer "yes", which yields
+ * IDENTITY_DEGRADED and keeps ownership. On a device that genuinely left
+ * no trace the probe answers "no" again and re-seals; nothing is lost.
+ *
+ * What this deliberately does NOT do: sign out, mint again, drop the
+ * session, or touch a single byte of evidence. The identity we have is
+ * the one we keep, uploads under it stay valid, and the recording path is
+ * untouched. The only thing withdrawn is a stale claim that the migration
+ * question is settled.
+ *
+ * R4 — THIS IS THE FIRST LINE OF DEFENCE, NOT THE ONLY ONE. Removing the
+ * seal is itself a storage write and can fail too, and a protection that
+ * assumes "delete usually works" is not a protection. When both writes
+ * fail, `resolveIdentityInitialized` falls back to
+ * `hasProvenIdentityEvidence()`, which needs no write to have succeeded:
+ * it reads what the upload path already wrote. That is why this function
+ * is allowed to log a failure and carry on.
+ */
+async function guardUndurableIdentity(
+  persisted: boolean,
+  how: 'minted' | 'observed',
+): Promise<void> {
+  if (persisted) return;
+  const sealDropped = await invalidateLegacyProbeSeal();
+  console.log('GC_IDENTITY_MARKER_NOT_DURABLE', {
+    how,
+    seal_invalidated: sealDropped,
+  });
 }
 
 async function schedulePendingSessionRegistration(
@@ -2316,7 +2395,14 @@ async function drainBody(pause: GlobalPauseState): Promise<void> {
           // marks transient → retry on the next drain pass picks up a
           // fresh token. Same self-healing as before, fewer get-session
           // round-trips on the steady-state path.
-          const accessToken = await getFreshAccessToken();
+          // R5 — OWNERSHIP TOKEN. This is the worker's hot-path cache,
+          // reused for `uploadChunkBytes` AND the subsequent `POST /chunks`.
+          // Both create remote state, so the cache must be filled from the
+          // ownership authority; a plain token here would be the one way a
+          // `remote_reference` could appear under a non-durable identity.
+          // A null answer produces the same 401 the worker already treats
+          // as transient, so the chunk stays `pending` and nothing is lost.
+          const accessToken = await getOwnershipAccessToken();
           if (!accessToken) {
             throw new ApiError(401, 'NO_TOKEN', 'No access token in store', null);
           }
@@ -2793,7 +2879,7 @@ type FinalizeOutcome =
   | { kind: 'failed'; reason: FinalizeFailureReason };
 
 async function finalizeAndAuthorizeCleanup(
-  token: string,
+  token: OwnershipToken,
   sessionId: string,
   uri: string,
 ): Promise<FinalizeOutcome> {
@@ -3033,7 +3119,10 @@ export async function tryFinalizeReadySessions(): Promise<boolean> {
       continue;
     }
     try {
-      const token = await getFreshAccessToken();
+      // R5 — OWNERSHIP TOKEN. `POST /sessions/:id/complete` mutates a row
+      // this user owns and authorises deleting local evidence. Both are
+      // ownership operations.
+      const token = await getOwnershipAccessToken();
       if (!token) throw new ApiError(401, 'NO_TOKEN', 'No access token in store', null);
       // Both the fresh-200 and the already-completed-409 branches now go
       // through one helper, so the ordering that makes the cleanup journal
@@ -4077,12 +4166,16 @@ async function deleteRecordingBestEffort(
 const POST_CHUNKS_TIMEOUT_MS = 30_000;
 
 async function postChunk(
-  token: string,
+  token: OwnershipToken,
   sessionId: string,
   chunk: RealChunk,
   status: 'pending' | 'uploaded' | 'failed',
   remoteReference?: string | null,
 ): Promise<unknown> {
+  // R6 — last moment before a mutation can leave the device. The brand
+  // stops a plain string at compile time; this stops a forced cast at run
+  // time. One boolean, no I/O.
+  assertOwnershipGateOpen('/chunks');
   // Only include `remote_reference` in the body when the caller has
   // actually obtained one (i.e. the Drive proxy returned a file_id).
   // Omitting the field keeps the POST shape identical to the pre-Drive
@@ -4165,9 +4258,11 @@ function isIdempotentReplay(body: unknown): boolean {
  * without losing the evidence (the chunks themselves are already safe).
  */
 async function completeSession(
-  token: string,
+  token: OwnershipToken,
   sessionId: string,
 ): Promise<unknown> {
+  // R6 — see `postChunk`. Same authority, same last moment.
+  assertOwnershipGateOpen(`/sessions/${sessionId}/complete`);
   const url = `${env.apiUrl}/sessions/${sessionId}/complete`;
   if (!token) console.log('AUTH MISSING', { path: `/sessions/${sessionId}/complete` });
   console.log('API CALL', { method: 'POST', url, authed: true });
@@ -4194,7 +4289,7 @@ async function completeSession(
  * eventually reap it (chunks list is empty → all-settled → complete).
  */
 async function createSessionRequest(
-  token: string,
+  token: OwnershipToken,
   mode: SessionMode = 'audio',
   /**
    * Optional client-provided session id. The backend treats POST
@@ -4225,6 +4320,10 @@ async function createSessionRequest(
    */
   destinationType: DestinationType = 'drive',
 ): Promise<string> {
+  // R6 — see `postChunk`. A `sessions` row keyed by (id, user_id) is the
+  // first ownership a capture creates, so this is the most important of
+  // the three raw guards.
+  assertOwnershipGateOpen('/sessions');
   const sessionBody = JSON.stringify({
     user_id: 'test_user',
     mode,
@@ -4319,7 +4418,6 @@ export default function Index() {
   // mode === 'video', not on screen mount, so audio sessions never
   // surface a camera prompt.
   const [, requestCameraPermission] = useCameraPermissions();
-  const tokenRef = useRef<string | null>(null);
   /**
    * Session id of the currently-active recording. Set when GRABAR fires
    * `createSessionRequest`, cleared when stopRecording finishes (or on
@@ -5027,6 +5125,33 @@ export default function Index() {
   useEffect(() => {
     (async () => {
       try {
+        // GC-AUTH-MIGRATION-001 — start resolving the migration boundary
+        // FIRST, so it is settled as early as this effect can make it.
+        //
+        // It used to sit after `init()` and two `getSession()` calls,
+        // behind ~550ms of diagnostic sleeps. Every one of those can block
+        // for seconds on a hostile network — and 4C no longer refuses a
+        // capture without a token, so a recording started meanwhile would
+        // write a queue entry and a history row BEFORE the probe had
+        // looked, and the probe would then read the app's own fresh traces
+        // as proof of an identity that never existed.
+        //
+        // THIS HOIST ALONE DOES NOT CLOSE THE RACE, and an earlier version
+        // of this comment wrongly claimed it ran "before anything can be
+        // rendered or tapped". It does not: React commits the render — and
+        // paints an enabled GRABAR AHORA — before effects run. The
+        // structural guarantee lives in `startRecording`, which awaits
+        // `ensureMigrationBoundary()` before its first durable write. Both
+        // callers share one single-flight execution, so whichever arrives
+        // first does the work and the other joins it. The hoist is what
+        // makes that join almost always free.
+        const {
+          initialized,
+          fromLegacyProbe,
+          source: identitySource,
+          boundaryUnsealed,
+        } = await resolveIdentityInitialized();
+
         // DEBUG: unmistakable build sentinel. If this string does NOT appear
         // on screen at boot, the emulator is running a stale JS bundle and
         // none of the ZZ_HEALTH_PROBE_* / ZZ_FETCH_POST_START / enhanced
@@ -5092,18 +5217,28 @@ export default function Index() {
         // we could not find out.
         const bootstrapProbe = await supabase.auth.getSession();
         let bootstrapSession = bootstrapProbe.data.session;
-        const { initialized, fromLegacyProbe } =
-          await resolveIdentityInitialized();
+        // `initialized` / `fromLegacyProbe` / `identitySource` were resolved
+        // at the very top of this effect — see the GC-AUTH-MIGRATION-001
+        // note there for why they cannot wait until here.
         const decision = decideIdentityState({
           hasSession: !!bootstrapSession,
           hasError: !!bootstrapProbe.error,
           initialized,
+          boundaryUnsealed,
         });
         console.log('GC_IDENTITY_STATE', {
           state: decision.state,
           reason: decision.reason,
           initialized,
           from_legacy_probe: fromLegacyProbe,
+          // GC-AUTH-MIGRATION-001: which durable record decided it.
+          // 'seal' / 'probe' distinguishes a boundary crossing from every
+          // boot after it; 'marker_malformed' is the conservative refusal.
+          identity_source: identitySource,
+          probe_version: LEGACY_PROBE_VERSION,
+          // True only when the probe said "no prior identity" and that
+          // answer could not be written down. Minting stays closed.
+          boundary_unsealed: boundaryUnsealed,
           had_error: !!bootstrapProbe.error,
           error_name: bootstrapProbe.error?.name ?? null,
         });
@@ -5135,14 +5270,19 @@ export default function Index() {
             return;
           }
           bootstrapSession = anonData.session;
-          await markIdentityInitialized(anonData.user?.id ?? null);
+          const mint = await markIdentityInitialized(anonData.user?.id ?? null);
+          await guardUndurableIdentity(mint.persisted, 'minted');
           console.log('AUTH ANON_SIGNIN_OK', {
             sub_prefix: anonData.user?.id?.slice(0, 8) ?? null,
+            marker_durable: mint.persisted,
           });
         } else {
           // IDENTITY_OK. Back-fill the marker for devices that already
           // had a live identity before this shipped. Idempotent.
-          await markIdentityInitialized(bootstrapSession?.user?.id ?? null);
+          const backfill = await markIdentityInitialized(
+            bootstrapSession?.user?.id ?? null,
+          );
+          await guardUndurableIdentity(backfill.persisted, 'observed');
         }
 
         const {
@@ -5154,7 +5294,6 @@ export default function Index() {
           console.log('ERROR: missing access_token');
           return;
         }
-        tokenRef.current = token;
         // Make the token visible to `apiFetch` (via useAuthStore) so the
         // destinations client and the Settings screen can issue
         // authenticated calls without re-running the login flow. This is
@@ -5774,6 +5913,35 @@ export default function Index() {
     setIsStarting(true);
     resetProgress();
 
+    // GC-AUTH-MIGRATION-001 — the migration boundary must be decided
+    // before this function writes ANYTHING durable.
+    //
+    // Everything below leaves signals the legacy probe reads as proof of
+    // a historical identity: the GC_QUEUE entry, the history row, the
+    // pending registration, the last-session id. Since 4C a capture can
+    // start with no identity at all, so a fresh install whose first mint
+    // failed can manufacture its own false "prior identity" — unless the
+    // probe has already answered.
+    //
+    // The bootstrap effect starts this resolution, but React commits the
+    // render before effects run, so GRABAR AHORA is tappable first. That
+    // is why the guarantee lives HERE and not in the effect, and why it
+    // is structural rather than a matter of timing: both callers share
+    // one single-flight execution, so whichever arrives first performs
+    // the probe and the seal while the other awaits the same promise.
+    //
+    // Local storage only — no network, no session, no token — so this
+    // costs a few milliseconds and usually zero, and it can never hold a
+    // recording behind a dead network.
+    //
+    // The property, stated exactly: before this capture creates a legacy
+    // signal, migration-boundary RESOLUTION HAS RUN. It does NOT gate on
+    // that resolution reaching disk — if the seal cannot be persisted
+    // even after a retry, the recording proceeds anyway, because evidence
+    // outranks migration hygiene. What protects the install in that case
+    // is that the minting gate stays closed, not that the capture waited.
+    await ensureMigrationBoundary();
+
     // Capture mode synchronously so it cannot change mid-flight if the
     // user somehow flips the toggle (the UI locks it, but defense in
     // depth keeps createSessionRequest, appendHistoryEntry, and the
@@ -5815,7 +5983,12 @@ export default function Index() {
     //        replay after identity returns yields one row.
     // Chunks accumulate locally and the worker retries them; 401 and
     // SESSION_NOT_FOUND are both already classified transient.
-    const token = tokenRef.current;
+    // R5 — OWNERSHIP TOKEN. `POST /sessions` creates a `sessions` row keyed
+    // by (id, user_id): that is remote ownership, and it may not be created
+    // before `gc.identity.v1` is durable. A null answer here routes to the
+    // SAME deferral 4B already built, so nothing new is invented and the
+    // capture is not affected in any way.
+    const token = await getOwnershipAccessToken();
     if (!token) {
       console.log('GC_LOCAL_FIRST capture without identity', {
         session_id: localSessionId,
@@ -6906,7 +7079,11 @@ export default function Index() {
     // Non-retryable 4xx errors propagate to the catch below — recovery
     // for that orphan is abandoned and the file stays on disk for a
     // future attempt.
-    const token = tokenRef.current;
+    //
+    // R5 — OWNERSHIP TOKEN, for the same reason as startRecording: this
+    // path also ends in `createSessionRequest`. A null answer takes the
+    // deferral branch immediately below, which already exists.
+    const token = await getOwnershipAccessToken();
     try {
       if (!token) {
         // GC-AUTH-001 (4B) — this used to be a sentinel

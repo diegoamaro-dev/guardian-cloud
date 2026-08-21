@@ -37,8 +37,15 @@ vi.mock('@react-native-async-storage/async-storage', () => {
 
 const getFreshAccessToken = vi.fn(async (): Promise<string | null> => null);
 vi.mock('@/auth/store', () => ({
+  // R6: no-op = ownership gate open. Tests that need it SHUT override it.
+  assertOwnershipGateOpen: vi.fn(),
+  isOwnershipGateOpen: vi.fn(() => true),
   useAuthStore: { setState: vi.fn(), getState: vi.fn(() => ({ status: 'loading' })) },
   getFreshAccessToken: (...a: unknown[]) =>
+    (getFreshAccessToken as unknown as (...x: unknown[]) => Promise<string | null>)(...a),
+  // R5: ownership callers use a distinct accessor; same spy so existing
+  // assertions about token attempts keep counting the same thing.
+  getOwnershipAccessToken: (...a: unknown[]) =>
     (getFreshAccessToken as unknown as (...x: unknown[]) => Promise<string | null>)(...a),
 }));
 
