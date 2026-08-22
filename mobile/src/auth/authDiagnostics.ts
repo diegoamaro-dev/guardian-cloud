@@ -128,21 +128,104 @@ export function redactForLog(value: unknown): unknown {
  * answer. Matching is on the SANITISED message, so a token can never
  * reach the filter either.
  */
-const INTERESTING = [
+const AUTHJS_PATHS = [
   '_removeSession',
   '_saveSession',
   '_callRefreshToken',
   '_recoverAndRefresh',
   '_autoRefreshTokenTick',
-  'session is not valid',
-  'session from storage is not valid',
-  'refresh failed',
-  'removing the session',
-  'expired',
+  '__loadSession',
+  '_useSession',
+  '_notifyAllSubscribers',
+  '_signOut',
+  'getUser',
+  'getSession',
+] as const;
+
+/**
+ * Paths that MAY TRIGGER a line on their own. The rest are identified
+ * when something else fires, but never emit by themselves.
+ *
+ * The split exists because volume is not uniform. `_useSession`,
+ * `getSession` and `_saveSession` fire several times a second on a
+ * device in a refresh storm — run A measured 4-5 refreshes a minute plus
+ * every `getSession()` the worker makes — and forwarding those would
+ * bury the rare events under exactly the noise D0.1 was authorised to
+ * remove. These five are rare AND decisive.
+ */
+const TRIGGER_PATHS: readonly string[] = [
+  '_removeSession',
+  '_callRefreshToken',
+  '_recoverAndRefresh',
+  '_autoRefreshTokenTick',
+  '_signOut',
 ];
 
-function isInteresting(sanitised: string): boolean {
-  return INTERESTING.some((needle) => sanitised.includes(needle));
+/**
+ * Verdict strings auth-js emits next to a path — the ones that decide
+ * whether a session lives or dies, quoted from the 2.103.3 source. ANY
+ * of these emits, whatever path it came from.
+ *
+ * This is what makes the hot-path exclusion safe: `#getSession()` is not
+ * a trigger, but `#getSession() 'session from storage is not valid'` —
+ * one of the three silent removal paths — still lands, because the
+ * verdict fires it.
+ *
+ * 'begin' and 'end' are deliberately NOT here. They accompany every path
+ * and answer nothing.
+ */
+const AUTHJS_VERDICTS = [
+  'session from storage is not valid',
+  'session is not valid',
+  'refresh failed with a non-retryable error',
+  'removing the session',
+  'refresh failed',
+  'used outside of an acquired lock',
+  'no session',
+] as const;
+
+export type AuthJsPath = (typeof AUTHJS_PATHS)[number];
+
+/**
+ * D0.1 · B — the real call shape, measured in run A rather than assumed.
+ *
+ * auth-js calls `this.logger(this._logPrefix(), ...args)`:
+ *
+ *   message  'GoTrueClient@<id>:0 (2.103.3) 2026-08-22T20:28:17.410Z'
+ *   args[0]  '#_recoverAndRefresh()' | '#_callRefreshToken(xxxxx...)'
+ *   args[1]  'begin' | 'end' | 'session is not valid'
+ *   args[2+] objects
+ *
+ * `message` is pure boilerplate — an instance id and a timestamp, never a
+ * path. D0 inspected `message` and `args[0]` only, and that MISSED a
+ * removal path: `#__loadSession()` carries its verdict in args[1], and
+ * `__loadSession` was not even in the known set. One of the three SILENT
+ * paths was therefore invisible.
+ *
+ * This scans EVERY argument. Strings are scrubbed BEFORE they are
+ * matched, so a token cannot reach the matcher; objects are never
+ * inspected at all. It extracts known identifiers — it does not widen
+ * the dump.
+ */
+export function extractAuthPath(
+  message: string,
+  args: readonly unknown[],
+): { path: AuthJsPath | null; verdicts: string[] } {
+  const haystack = [message, ...args]
+    .filter((a): a is string => typeof a === 'string')
+    .map(scrubString)
+    .join('   ');
+
+  const path = AUTHJS_PATHS.find((p) => haystack.includes(p)) ?? null;
+  // Longest first, so 'session from storage is not valid' is not also
+  // reported as the shorter 'session is not valid'.
+  const verdicts: string[] = [];
+  for (const v of AUTHJS_VERDICTS) {
+    if (haystack.includes(v) && !verdicts.some((seen) => seen.includes(v))) {
+      verdicts.push(v);
+    }
+  }
+  return { path, verdicts };
 }
 
 type LogFn = (event: string, fields?: Record<string, unknown>) => void;
@@ -162,9 +245,36 @@ export function __setAuthDiagnosticsSink(fn: LogFn | null): void {
     });
 }
 
+/**
+ * D0.1 · C — CORRELATION, NOT CAUSALITY.
+ *
+ * Every line carries a monotonic `seq`, and the one event that matters —
+ * `removeItem(primary_session)` — records the seq, path, error class and
+ * age of the last relevant debug line seen before it.
+ *
+ * Those fields are named `preceding_*` deliberately. They say what came
+ * BEFORE in this process and nothing else. A device in a refresh storm
+ * emits several lines a second, so adjacency here is cheap and proves
+ * nothing on its own. The naming is the warning.
+ */
+let seqCounter = 0;
+let lastRelevant: {
+  seq: number;
+  at: number;
+  path: string | null;
+  error_class: string;
+} | null = null;
+
+/** Test seam: `seq` and the correlation window are process state. */
+export function __resetAuthDiagnosticsStateForTests(): void {
+  seqCounter = 0;
+  lastRelevant = null;
+}
+
 function emit(event: string, fields: Record<string, unknown>): void {
   try {
-    sink(event, fields);
+    seqCounter += 1;
+    sink(event, { seq: seqCounter, ...fields });
   } catch {
     // Diagnostics may never break the caller. auth-js invokes the logger
     // inside its own lock; a throw here would take the auth client down.
@@ -179,14 +289,28 @@ function emit(event: string, fields: Record<string, unknown>): void {
  */
 export function authDebugLogger(message: string, ...args: unknown[]): void {
   try {
-    const sanitised = scrubString(String(message ?? ''));
-    // The message auth-js passes is a PREFIX; the interesting part is
-    // usually the second argument, so both are checked.
-    const detail = args.length > 0 ? scrubString(String(args[0] ?? '')) : '';
-    if (!isInteresting(sanitised) && !isInteresting(detail)) return;
+    const { path, verdicts } = extractAuthPath(String(message ?? ''), args);
+    // NARROWER than a dump of auth-js: a line passes only on a verdict,
+    // or on one of the five rare decisive paths. `path` is still
+    // reported for the hot paths when a verdict carries the line.
+    const triggered = verdicts.length > 0 || (path !== null && TRIGGER_PATHS.includes(path));
+    if (!triggered) return;
+
+    // An Error can ride along in any position — `_recoverAndRefresh`
+    // passes it third.
+    const errArg = args.find((a) => a instanceof Error);
+    const error_class = errArg === undefined ? 'none' : classifyAuthError(errArg);
+
+    const at = Date.now();
+    lastRelevant = { seq: seqCounter + 1, at, path, error_class };
+
     emit(TAG_DEBUG, {
-      at: Date.now(),
-      msg: sanitised,
+      at,
+      path,
+      verdicts,
+      error_class,
+      // Shape only, never values. Kept because the KEY LIST of a session
+      // object distinguishes a whole session from a partial one.
       args: args.map(redactForLog),
     });
   } catch {
@@ -267,7 +391,15 @@ export function describeSession(session: unknown): Record<string, unknown> {
  * than this one is the proof of that ordering.
  */
 export function logAuthStateChange(event: string, session: unknown): void {
-  emit(TAG_EVENT, { at: Date.now(), event, ...describeSession(session) });
+  emit(TAG_EVENT, {
+    at: Date.now(),
+    event,
+    ...describeSession(session),
+    // Ordering is the point: `_removeSession` deletes the key BEFORE it
+    // notifies, so a storage line with a LOWER `seq` than this one is
+    // proof of that order — not an inference from wall-clock timestamps.
+    preceding_seq: lastRelevant?.seq ?? null,
+  });
 }
 
 // ---------------------------------------------------------------- storage
@@ -295,6 +427,44 @@ export function redactSessionKey(key: string): string {
   const m = /^sb-.+-auth-token(-.+)?$/.exec(key);
   if (m === null) return '<non-session-key>';
   return `sb-<redacted>-auth-token${m[1] ?? ''}`;
+}
+
+/**
+ * D0.1 · A — WHICH key, because they are not equivalent.
+ *
+ * Run A produced 45 `removeItem` events in nine minutes and every one was
+ * `-code-verifier` with `stored_present: false`: routine cleanup auth-js
+ * performs after each sign-in and each refresh. On a device in a refresh
+ * storm that is several per minute, and it drowned the one event that
+ * means anything.
+ *
+ *   primary_session        the session itself — access AND refresh token.
+ *                          Deleting this IS the loss under investigation.
+ *   user_suffix            `-user`, the split-out user object.
+ *   code_verifier_suffix   `-code-verifier`, PKCE scratch. Routine noise.
+ *   other_session_variant  an `sb-*-auth-token-*` we do not recognise.
+ *   non_session            anything else — not instrumented at all.
+ */
+export type SessionKeyKind =
+  | 'primary_session'
+  | 'user_suffix'
+  | 'code_verifier_suffix'
+  | 'other_session_variant'
+  | 'non_session';
+
+export function classifySessionKey(key: string): SessionKeyKind {
+  const m = /^sb-.+-auth-token(-.+)?$/.exec(key);
+  if (m === null) return 'non_session';
+  const suffix = m[1];
+  if (suffix === undefined) return 'primary_session';
+  if (suffix === '-user') return 'user_suffix';
+  if (suffix === '-code-verifier') return 'code_verifier_suffix';
+  return 'other_session_variant';
+}
+
+/** The ONE deletion that means the credential is gone. */
+export function isPrimarySessionLoss(key: string, op: 'removeItem'): boolean {
+  return op === 'removeItem' && classifySessionKey(key) === 'primary_session';
 }
 
 /**
@@ -365,10 +535,12 @@ export function instrumentAuthStorage(delegate: AuthStorage): AuthStorage {
     },
 
     setItem(key: string, value: string) {
-      if (isSupabaseSessionKey(key)) {
+      const kind = classifySessionKey(key);
+      if (kind !== 'non_session') {
         emit(TAG_STORAGE, {
           at: Date.now(),
           op: 'setItem',
+          kind,
           key: redactSessionKey(key),
           ...describeStoredValue(value),
         });
@@ -377,21 +549,48 @@ export function instrumentAuthStorage(delegate: AuthStorage): AuthStorage {
     },
 
     async removeItem(key: string) {
-      if (!isSupabaseSessionKey(key)) {
+      const kind = classifySessionKey(key);
+      if (kind === 'non_session') {
         return await delegate.removeItem(key);
       }
-      let before: Record<string, unknown>;
-      try {
-        before = describeStoredValue(await delegate.getItem(key));
-      } catch (err) {
-        before = { stored_present: null, probe_error: classifyAuthError(err) };
+
+      // Only the primary key earns a pre-read. The suffix keys are
+      // routine cleanup, fired several times a minute on a device in a
+      // refresh storm; probing them would add I/O and answer nothing.
+      const primary = kind === 'primary_session';
+      let before: Record<string, unknown> = {};
+      if (primary) {
+        try {
+          before = describeStoredValue(await delegate.getItem(key));
+        } catch (err) {
+          before = { stored_present: null, probe_error: classifyAuthError(err) };
+        }
       }
+
+      const at = Date.now();
       emit(TAG_STORAGE, {
-        at: Date.now(),
+        at,
         op: 'removeItem',
+        kind,
+        // THE alarm. Routine `-code-verifier` cleanup must never read as
+        // credential loss — that is exactly what drowned run A.
+        session_loss: primary,
         key: redactSessionKey(key),
         ...before,
-        caller: callerTrail(),
+        ...(primary
+          ? {
+              // Temporal antecedents ONLY — see the note on `lastRelevant`.
+              preceding_seq: lastRelevant?.seq ?? null,
+              preceding_path: lastRelevant?.path ?? null,
+              preceding_error_class: lastRelevant?.error_class ?? null,
+              preceding_age_ms: lastRelevant === null ? null : at - lastRelevant.at,
+              // Hermes strips auth-js frame names through the async
+              // transpile — run A returned ['?anon_0_','next',…]. Kept
+              // because it costs nothing and another engine may carry
+              // them; `preceding_path` is the identifier that works here.
+              caller: callerTrail(),
+            }
+          : {}),
       });
       return await delegate.removeItem(key);
     },

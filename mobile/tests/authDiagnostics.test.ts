@@ -25,6 +25,10 @@ import {
   isSupabaseSessionKey,
   logAuthStateChange,
   redactSessionKey,
+  classifySessionKey,
+  isPrimarySessionLoss,
+  extractAuthPath,
+  __resetAuthDiagnosticsStateForTests,
   redactForLog,
   scrubString,
   __setAuthDiagnosticsSink,
@@ -96,6 +100,7 @@ function makeDelegate(initial: Record<string, string> = {}) {
 
 beforeEach(() => {
   emitted = [];
+  __resetAuthDiagnosticsStateForTests();
   __setAuthDiagnosticsSink((event, fields) => {
     emitted.push({ event, fields: fields ?? {} });
   });
@@ -111,8 +116,12 @@ describe('GC_AUTH_D0_NO_SECRET_EVER_REACHES_A_LOG', () => {
   it('THE auth-js trap: `_callRefreshToken(v1n4m...)` leaks 5 chars — we do not', () => {
     // auth-js builds `#_callRefreshToken(${refreshToken.substring(0, 5)}...)`
     // and puts it in EVERY debug line of that function.
+    // Passed as an ARGUMENT, which is where auth-js actually puts it:
+    // `logger(_logPrefix(), '#_callRefreshToken(xxxxx...)', 'begin')`.
+    // D0.1 no longer emits `message` at all, so asserting through the
+    // first parameter would pass without exercising the redactor.
     const authJsStyle = `#_callRefreshToken(${REFRESH_TOKEN.substring(0, 5)}...)`;
-    authDebugLogger(authJsStyle, 'begin');
+    authDebugLogger('GoTrueClient@x:0 (2.103.3)', authJsStyle, 'refresh failed');
 
     const text = allLoggedText();
     expect(text).not.toContain(REFRESH_TOKEN.substring(0, 5));
@@ -120,9 +129,10 @@ describe('GC_AUTH_D0_NO_SECRET_EVER_REACHES_A_LOG', () => {
   });
 
   it('a whole session object passed as an argument yields KEYS ONLY', () => {
-    // This is what `#_saveSession()` and `#getSession() session from
-    // storage` hand to the logger.
-    authDebugLogger('#_saveSession()', realSession());
+    // auth-js hands whole sessions to the logger from four sites. Driven
+    // here through `_recoverAndRefresh`, which is a trigger path, so the
+    // line is actually emitted and the redaction is really exercised.
+    authDebugLogger('#_recoverAndRefresh()', 'refresh failed', realSession());
 
     const text = allLoggedText();
     expect(text).not.toContain(ACCESS_TOKEN);
@@ -397,14 +407,17 @@ describe('GC_AUTH_D0_THE_QUESTIONS_THE_LAST_RUN_COULD_NOT_ANSWER', () => {
 });
 
 describe('GC_AUTH_D0_CHANGES_NOTHING', () => {
-  it('the debug logger drops auth-js noise and keeps the removal signal', () => {
+  it('the debug logger drops the HOT paths and keeps the decisive ones', () => {
+    // Measured in run A: these fire several times a second on a device in
+    // a refresh storm. Forwarding them buries the rare events.
     authDebugLogger('#_useSession', 'begin');
     authDebugLogger('#_useSession', 'end');
     authDebugLogger('#getSession()', 'session from storage', realSession());
+    authDebugLogger('#_saveSession()', realSession());
     expect(emitted).toHaveLength(0);
 
     authDebugLogger('#_removeSession()');
-    authDebugLogger('#_recoverAndRefresh()', 'session from storage is not valid');
+    authDebugLogger('#_callRefreshToken(<redacted>)', 'begin');
     expect(emitted).toHaveLength(2);
   });
 
@@ -466,5 +479,246 @@ describe('GC_AUTH_D0_TEETH', () => {
     expect(scrubString(raw)).not.toMatch(
       /\b[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/,
     );
+  });
+});
+
+describe('GC_AUTH_D01_KEY_CLASSIFICATION', () => {
+  /**
+   * Run A produced 45 `removeItem` events in nine minutes and every one
+   * was `-code-verifier` with `stored_present: false` — routine cleanup
+   * after each sign-in and each refresh. On a device in a refresh storm
+   * that is several a minute, and it drowned the one event that matters.
+   */
+  it('classifies every variant of the session key', () => {
+    expect(classifySessionKey(SESSION_KEY)).toBe('primary_session');
+    expect(classifySessionKey(`${SESSION_KEY}-user`)).toBe('user_suffix');
+    expect(classifySessionKey(`${SESSION_KEY}-code-verifier`)).toBe('code_verifier_suffix');
+    expect(classifySessionKey(`${SESSION_KEY}-something-new`)).toBe('other_session_variant');
+    expect(classifySessionKey('test.pending_retry')).toBe('non_session');
+    expect(classifySessionKey('gc.identity.v1')).toBe('non_session');
+  });
+
+  it('ONLY the primary key is credential loss', () => {
+    expect(isPrimarySessionLoss(SESSION_KEY, 'removeItem')).toBe(true);
+    expect(isPrimarySessionLoss(`${SESSION_KEY}-code-verifier`, 'removeItem')).toBe(false);
+    expect(isPrimarySessionLoss(`${SESSION_KEY}-user`, 'removeItem')).toBe(false);
+    expect(isPrimarySessionLoss('gc.identity.v1', 'removeItem')).toBe(false);
+  });
+
+  it('deleting the PRIMARY key raises the alarm and probes the credential', async () => {
+    const delegate = makeDelegate({ [SESSION_KEY]: JSON.stringify(realSession()) });
+    const wrapped = instrumentAuthStorage(delegate);
+
+    await wrapped.removeItem(SESSION_KEY);
+
+    const f = at(0).fields;
+    expect(f.kind).toBe('primary_session');
+    expect(f.session_loss).toBe(true);
+    expect(f.refresh_present).toBe(true);
+    // The pre-read ran: probe, then delete.
+    expect(delegate.__calls).toEqual([`getItem:${SESSION_KEY}`, `removeItem:${SESSION_KEY}`]);
+  });
+
+  it('THE RUN-A NOISE: code-verifier cleanup is logged but is NOT loss', async () => {
+    const delegate = makeDelegate();
+    const wrapped = instrumentAuthStorage(delegate);
+
+    await wrapped.removeItem(`${SESSION_KEY}-code-verifier`);
+
+    const f = at(0).fields;
+    expect(f.kind).toBe('code_verifier_suffix');
+    expect(f.session_loss).toBe(false);
+    // No pre-read: probing routine cleanup is I/O that answers nothing.
+    expect(delegate.__calls).toEqual([`removeItem:${SESSION_KEY}-code-verifier`]);
+    // And no correlation payload — those belong to the real alarm only.
+    expect(f.preceding_path).toBeUndefined();
+    expect(f.caller).toBeUndefined();
+  });
+
+  it('a storm of code-verifier cleanups never reports a single loss', async () => {
+    const wrapped = instrumentAuthStorage(makeDelegate());
+    for (let i = 0; i < 45; i += 1) {
+      await wrapped.removeItem(`${SESSION_KEY}-code-verifier`);
+    }
+    expect(emitted).toHaveLength(45);
+    expect(emitted.filter((e) => e.fields.session_loss === true)).toHaveLength(0);
+  });
+});
+
+describe('GC_AUTH_D01_INTERNAL_PATH_EXTRACTION', () => {
+  /**
+   * Shapes taken verbatim from run A's logcat. auth-js calls
+   * `logger(_logPrefix(), ...args)`, so the path is in args[0] and the
+   * verdict in args[1] — D0 inspected only message and args[0].
+   */
+  const PREFIX = 'GoTrueClient@abcdefghijklmnopqrstuvwxyz123456:0 (2.103.3) 2026-08-22T20:28:17.410Z';
+
+  it('extracts the path from args[0], as auth-js actually passes it', () => {
+    expect(extractAuthPath(PREFIX, ['#_recoverAndRefresh()', 'begin']).path).toBe(
+      '_recoverAndRefresh',
+    );
+    expect(extractAuthPath(PREFIX, ['#_callRefreshToken(<redacted>)', 'end']).path).toBe(
+      '_callRefreshToken',
+    );
+    expect(extractAuthPath(PREFIX, ['#_removeSession()']).path).toBe('_removeSession');
+  });
+
+  it('THE D0 HOLE: a verdict in args[1] is now seen', () => {
+    // `#__loadSession()` + 'session from storage is not valid' is one of
+    // the three SILENT removal paths. D0 checked message and args[0]
+    // only, and `__loadSession` was not even in its list, so this line
+    // was invisible.
+    const r = extractAuthPath(PREFIX, ['#__loadSession()', 'session from storage is not valid']);
+    expect(r.path).toBe('__loadSession');
+    expect(r.verdicts).toContain('session from storage is not valid');
+  });
+
+  it('the longest verdict wins, so one line is not double-reported', () => {
+    const r = extractAuthPath(PREFIX, ['#getSession()', 'session from storage is not valid']);
+    expect(r.verdicts).toEqual(['session from storage is not valid']);
+  });
+
+  it('a HOT path still emits when it carries a verdict', () => {
+    // `getSession` is not a trigger, but this exact line IS a removal path.
+    authDebugLogger(PREFIX, '#getSession()', 'session from storage is not valid');
+    expect(emitted).toHaveLength(1);
+    expect(at(0).fields.path).toBe('getSession');
+    expect(at(0).fields.verdicts).toEqual(['session from storage is not valid']);
+  });
+
+  it('the non-retryable refresh verdict is captured with its error class', () => {
+    const err = Object.assign(new Error('bad'), {
+      name: 'AuthApiError',
+      code: 'invalid_grant',
+      status: 400,
+    });
+    authDebugLogger(
+      PREFIX,
+      '#_recoverAndRefresh()',
+      'refresh failed with a non-retryable error, removing the session',
+      err,
+    );
+    const f = at(0).fields;
+    expect(f.path).toBe('_recoverAndRefresh');
+    expect(f.error_class).toBe('invalid_grant');
+    expect(f.verdicts).toContain('refresh failed with a non-retryable error');
+  });
+
+  it('an unrecognised line emits nothing at all', () => {
+    authDebugLogger(PREFIX, '#somethingElse()', 'chatter');
+    expect(emitted).toHaveLength(0);
+  });
+});
+
+describe('GC_AUTH_D01_CORRELATION_NOT_CAUSALITY', () => {
+  const PREFIX = 'GoTrueClient@abcdefghijklmnopqrstuvwxyz123456:0 (2.103.3) 2026-08-22T20:28:17.410Z';
+
+  it('every line carries a monotonic seq', async () => {
+    authDebugLogger(PREFIX, '#_removeSession()');
+    logAuthStateChange('SIGNED_OUT', null);
+    const wrapped = instrumentAuthStorage(makeDelegate());
+    await wrapped.removeItem(SESSION_KEY);
+
+    expect(emitted.map((e) => e.fields.seq)).toEqual([1, 2, 3]);
+  });
+
+  it('a primary removal records what PRECEDED it — labelled as such', async () => {
+    const err = Object.assign(new Error('x'), { name: 'AuthApiError', code: 'invalid_grant' });
+    authDebugLogger(PREFIX, '#_callRefreshToken(<redacted>)', 'refresh failed', err);
+
+    const wrapped = instrumentAuthStorage(
+      makeDelegate({ [SESSION_KEY]: JSON.stringify(realSession()) }),
+    );
+    await wrapped.removeItem(SESSION_KEY);
+
+    const f = at(1).fields;
+    expect(f.session_loss).toBe(true);
+    expect(f.preceding_seq).toBe(1);
+    expect(f.preceding_path).toBe('_callRefreshToken');
+    expect(f.preceding_error_class).toBe('invalid_grant');
+    expect(typeof f.preceding_age_ms).toBe('number');
+  });
+
+  it('the removal → SIGNED_OUT ORDER is reconstructible from seq alone', async () => {
+    // `_removeSession` deletes the key and THEN notifies. Proving that
+    // order is the point; wall-clock timestamps can tie at ms resolution.
+    const wrapped = instrumentAuthStorage(
+      makeDelegate({ [SESSION_KEY]: JSON.stringify(realSession()) }),
+    );
+    await wrapped.removeItem(SESSION_KEY);
+    logAuthStateChange('SIGNED_OUT', null);
+
+    const removal = emitted.find((e) => e.fields.session_loss === true)!;
+    const signedOut = emitted.find((e) => e.fields.event === 'SIGNED_OUT')!;
+    expect(Number(removal.fields.seq)).toBeLessThan(Number(signedOut.fields.seq));
+  });
+
+  it('with no preceding debug line the fields are null, not invented', async () => {
+    const wrapped = instrumentAuthStorage(
+      makeDelegate({ [SESSION_KEY]: JSON.stringify(realSession()) }),
+    );
+    await wrapped.removeItem(SESSION_KEY);
+
+    const f = at(0).fields;
+    expect(f.preceding_seq).toBeNull();
+    expect(f.preceding_path).toBeNull();
+    expect(f.preceding_error_class).toBeNull();
+    expect(f.preceding_age_ms).toBeNull();
+  });
+});
+
+describe('GC_AUTH_D01_STILL_NO_SECRETS', () => {
+  const PREFIX = 'GoTrueClient@abcdefghijklmnopqrstuvwxyz123456:0 (2.103.3) 2026-08-22T20:28:17.410Z';
+
+  it('SWEEP over every D0.1 surface', async () => {
+    authDebugLogger(PREFIX, '#_removeSession()', realSession());
+    authDebugLogger(PREFIX, `#_callRefreshToken(${REFRESH_TOKEN.substring(0, 5)}...)`, 'refresh failed');
+    authDebugLogger(PREFIX, '#__loadSession()', 'session from storage is not valid', realSession());
+    logAuthStateChange('SIGNED_OUT', null);
+    const wrapped = instrumentAuthStorage(
+      makeDelegate({ [SESSION_KEY]: JSON.stringify(realSession()) }),
+    );
+    await wrapped.setItem(SESSION_KEY, JSON.stringify(realSession()));
+    await wrapped.removeItem(SESSION_KEY);
+
+    const text = allLoggedText();
+    expect(text).not.toMatch(/\b[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/);
+    for (const secret of [
+      ACCESS_TOKEN,
+      REFRESH_TOKEN,
+      REFRESH_TOKEN.substring(0, 5),
+      USER_ID,
+      'nahksdkcvhveoctpjrea',
+      'abcdefghijklmnopqrstuvwxyz123456',
+    ]) {
+      expect(text).not.toContain(secret);
+    }
+    expect(emitted.length).toBeGreaterThan(4);
+  });
+
+  it('the auth-js instance id in the prefix is redacted too', () => {
+    authDebugLogger(PREFIX, '#_removeSession()');
+    expect(allLoggedText()).not.toContain('abcdefghijklmnopqrstuvwxyz123456');
+  });
+});
+
+describe('GC_AUTH_D01_TEETH', () => {
+  const PREFIX = 'GoTrueClient@abcdefghijklmnopqrstuvwxyz123456:0 (2.103.3) 2026-08-22T20:28:17.410Z';
+
+  it('the noise/loss distinction is not vacuous: both paths really run', async () => {
+    const wrapped = instrumentAuthStorage(
+      makeDelegate({ [SESSION_KEY]: JSON.stringify(realSession()) }),
+    );
+    await wrapped.removeItem(`${SESSION_KEY}-code-verifier`);
+    await wrapped.removeItem(SESSION_KEY);
+
+    expect(emitted).toHaveLength(2);
+    expect(at(0).fields.session_loss).toBe(false);
+    expect(at(1).fields.session_loss).toBe(true);
+  });
+
+  it('the path extractor is not vacuous: an unknown path yields null', () => {
+    expect(extractAuthPath(PREFIX, ['#_recoverAndRefresh()']).path).toBe('_recoverAndRefresh');
+    expect(extractAuthPath(PREFIX, ['#totallyUnknown()']).path).toBeNull();
   });
 });
