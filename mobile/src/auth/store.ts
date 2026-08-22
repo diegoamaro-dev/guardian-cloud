@@ -21,6 +21,8 @@ import {
   type User,
 } from '@supabase/supabase-js';
 import { supabase } from './supabase';
+// GC-AUTH-SESSION-RECOVERY-001 · D0 — observability. Zero-import leaf.
+import { logAuthStateChange } from './authDiagnostics';
 // R5 — the marker is the durable proof the ownership gate consults. Leaf
 // module; importing it here cannot form a cycle.
 import { markIdentityInitialized } from './identityMarker';
@@ -121,7 +123,12 @@ export const useAuthStore = create<AuthState>((set) => ({
     }
 
     if (!subscribed) {
-      supabase.auth.onAuthStateChange((_event, session) => {
+      supabase.auth.onAuthStateChange((event, session) => {
+        // GC-AUTH-SESSION-RECOVERY-001 · D0 — this used to be `_event`.
+        // Discarding the name meant the SIGNED_OUT that `_removeSession()`
+        // raises left no trace, so a run could not tell a session that was
+        // deleted from one that never loaded. Metadata only; no tokens.
+        logAuthStateChange(event, session);
         set(applySession(session));
         // "Usable" means a session that actually carries an access
         // token — a null session, or one without a token, must never
