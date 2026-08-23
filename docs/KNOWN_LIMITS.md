@@ -892,3 +892,254 @@ creado ninguna tercera superficie destructiva dentro de Guardian Cloud.**
   La cobertura es transitiva y depende de que la adopción siga siendo *COPY,
   VERIFY, KEEP BOTH*. Si esa regla cambiara a un movimiento destructivo, esta
   cobertura dejaría de ser válida.
+
+---
+
+# 5. GC-AUTH-SESSION-RECOVERY-001 — un fallo transitorio del refresh destruía la credencial
+
+## Estado
+
+**OPEN.** Mitigado en dos entregas, **validado en banco de pruebas, NO en
+dispositivo.**
+
+```
+D2-B = IMPLEMENTED / VALIDATED IN TEST BENCH   upgrade a @supabase/supabase-js 2.112.3
+D2-C = IMPLEMENTED / VALIDATED IN TEST BENCH   clasificador de rate limit del refresh
+GC-AUTH-SESSION-RECOVERY-001 = OPEN
+GC-START-LATENCY-001         = OPEN
+```
+
+No se declara `HARDWARE_VALIDATED`. No se declara cerrado ningún release
+blocker. **No se declara demostrada la causa histórica del incidente del
+2026-08-22.**
+
+---
+
+## El incidente
+
+2026-08-22, OnePlus A6000, sobre `e289dcb`. Un dispositivo con **87 chunks**
+de evidencia sin subir perdió su sesión de Supabase: la clave
+`sb-<ref>-auth-token` desapareció de AsyncStorage y `getSession()` pasó a
+responder `{session: null, error: null}` —una resolución limpia, no un fallo de
+red—. El marker de identidad, **correctamente**, se negó a acuñar una identidad
+de reemplazo.
+
+Con identidad anónima no existe flujo de re-autenticación. No hay pantalla de
+login que ofrecer. La evidencia quedó íntegra en el dispositivo y sin poder
+salir de él.
+
+---
+
+## Causa mecánica demostrada
+
+`@supabase/auth-js` decide si un refresh fallido destruye la sesión con **una
+sola pregunta**: `isAuthRetryableFetchError(error)`, que es
+`error.name === 'AuthRetryableFetchError'` y nada más. Esa clase se construye
+únicamente para un fallo sin `Response` o para un status en
+`NETWORK_ERROR_CODES`. En 2.103.3 esa lista era:
+
+```js
+[502, 503, 504, 520, 521, 522, 523, 524, 530]
+```
+
+Un `429` o un `500` quedaban fuera → `AuthApiError` → `_removeSession()`, que
+borra la clave entera: **access token y refresh token viven bajo una sola
+clave**. El borrado es irreversible desde el dispositivo.
+
+Un `429` dice que el servidor quiere menos peticiones. **No dice nada sobre si
+la credencial es válida.**
+
+### Banco causal — commit `9d682bc`
+
+`mobile/tests/authSessionLossCausality.test.ts` reproduce la cadena de forma
+determinista, con un `fetch` sintético en proceso de pruebas: sin tocar
+Supabase, sin castigar el endpoint real, sin dispositivo. Firma observada bajo
+2.103.3:
+
+```
+GC_AUTH_DEBUG    error_class 'other'  error_status 429
+GC_AUTH_STORAGE  op 'removeItem'  kind 'primary_session'
+                 session_loss true   refresh_present TRUE   ← la credencial estaba intacta
+GC_AUTH_EVENT    event 'SIGNED_OUT'
+```
+
+`refresh_present: true` es el dato decisivo: la credencial **estaba intacta en
+el instante en que se destruyó**.
+
+> **Causa suficiente demostrada ≠ causa histórica demostrada.**
+> Queda probado que un `429` o un `500` bastan para producir exactamente la
+> firma terminal del 22/08. **No** queda probado que aquello fuera un `429` o
+> un `500`: esa respuesta nunca se capturó —D0.1 no existía aún— y ningún
+> experimento posterior puede recuperarla. La distinción no se debe borrar en
+> revisiones futuras.
+
+---
+
+## D2-B — upgrade a 2.112.3
+
+Dentro del rango semver ya declarado; sólo cambió el lockfile y el mínimo
+declarado. Tres correcciones de upstream, **verificadas observablemente en el
+banco**, no aceptadas por changelog:
+
+| | |
+|---|---|
+| **Lista ampliada** | `[500, 501, 502, 503, 504, 520…530]`. Un `500` y un `525` ahora se reintentan y la sesión sobrevive |
+| **proactive-preserve** | Un refresh fallido con el **access token todavía válido** ya no destruye nada. `_callRefreshToken` lee `expires_at` antes de decidir |
+| **`REFRESH_FAILURE_COOLDOWN_MS`** | 60 000 ms. Caché del último fallo indexada por refresh token: las llamadas siguientes no hacen red |
+
+### Lo que el upgrade NO cerró
+
+**`429` con el access token ya caducado sigue destruyendo la credencial.** El
+`429` no entró en `NETWORK_ERROR_CODES`, y proactive-preserve sólo salva
+mientras el access token siga vivo. Ése es precisamente el estado al que llega
+un dispositivo tras cualquier ventana offline prolongada.
+
+### Hallazgo colateral, no previsto por la lectura del diff
+
+**`401` con el access token todavía válido también preserva la sesión.**
+proactive-preserve no pregunta si el rechazo fue genuino: un refresh token que
+el servidor rechaza de plano sobrevive mientras el access token no caduque.
+Defendible en los términos de upstream —el access token sigue funcionando—
+pero significa que **«un 401 limpia» es ahora una afirmación sobre sesiones
+caducadas, no una regla general**. Cualquier política que asuma limpieza
+inmediata ante un `401` es incorrecta aquí.
+
+---
+
+## D2-C — clasificador de rate limit
+
+`mobile/src/auth/refreshRateLimit.ts`, integrado por el único punto de
+extensión que ofrece `GoTrueClientOptions`: `createClient({ global: { fetch } })`.
+No existe ningún hook de reintento ni de clasificación de errores.
+
+### La regla completa
+
+Interviene **sólo** si se cumplen todas:
+
+```
+method                        POST
+pathname                      /auth/v1/token        (comparación exacta, no substring)
+searchParams.get('grant_type') === 'refresh_token'  (parseado, no substring)
+status                        429
+error_code                    over_request_rate_limit
+```
+
+En ese único caso **lanza**, y `_handleRequest` lo convierte en
+`AuthRetryableFetchError` con **status 0** — que significa *no hubo respuesta*,
+no un status HTTP inventado. El `429` real no se oculta: se registra con su
+código en `GC_AUTH_RATE_LIMIT`.
+
+### Todo lo demás: pass-through fail-closed
+
+Devuelve la `Response` original intacta, y auth-js se comporta como si el
+módulo no existiera:
+
+```
+429 sin error_code                     → pass-through → borra
+429 con código desconocido             → pass-through → borra
+429 con cuerpo ilegible                → pass-through → borra
+429 con `code` numérico                → pass-through → borra
+refresh_token_not_found                → pass-through → borra   (correcto)
+refresh_token_already_used             → pass-through → borra   (correcto)
+session_expired · session_not_found    → pass-through → borra   (correcto)
+400 / 401 / 403                        → pass-through, sin mirar
+500 / 502 / 525-529                    → ni se miran; D2-B ya los cubre
+cualquier otro endpoint o método       → pass-through
+excepción del propio clasificador      → pass-through
+```
+
+**«HTTP 429» por sí solo nunca preserva nada.** Preserva la combinación de
+status y código explícito del servidor. Un fallo nuestro jamás se convierte en
+una decisión de conservar una credencial.
+
+### Lo que D2-C NO contiene, deliberadamente
+
+**Ni retry, ni contador, ni presupuesto, ni `setTimeout`, ni sleep, ni jitter,
+ni espera por `Retry-After`, ni estado persistente, ni copia en la sombra de
+ningún token.**
+
+El motivo es aritmético, no estético: auth-js invoca el wrapper **una vez por
+intento** de su propio bucle `retryable`, así que cualquier espera añadida aquí
+se multiplica por el número de intentos. Respetar `Retry-After` con 5 s de
+sueño añadiría hasta 40 s a un camino que `startRecording` espera. El backoff
+exponencial que espacia esos intentos ya existe, ya está acotado a 30 s, y ya
+va seguido de un cooldown de 60 s.
+
+Coste de D2-C sobre `startRecording`: **0 ms de sleep/backoff intencional.** No
+es computacionalmente gratis —en la ruta clasificada ejecuta un
+`Response.clone().json()` y una línea de log—, y la distinción se mantiene en
+vez de redondearla a «coste cero».
+
+---
+
+## Cotas del `429` persistente
+
+Constantes leídas del código, no supuestas: `sleep(200 · 2^(intento−1))`,
+reintento mientras `transcurrido + 200 · 2^intento < 30 000`.
+
+```
+peticiones HTTP reales      8
+reintentos de auth-js       7
+tiempo total del episodio   25 400 ms   (backoff de auth-js, no nuestro)
+tiempo añadido por D2-C     0 ms de sleep intencional
+durante el cooldown (60 s)  0 peticiones
+régimen estacionario        8 peticiones / 85,4 s ≈ 5,6 por minuto
+```
+
+Es la misma forma de tráfico que un `502` ya producía antes de D2-C.
+
+---
+
+## Lo demostrado en banco
+
+43 pruebas en `authSessionLossCausality.test.ts`. Recuperación completa, con
+reloj controlado:
+
+```
+sesión válida, access token caducado
+→ 429 over_request_rate_limit persistente
+→ 8 peticiones acotadas · 0 removeItem · refresh token preservado
+→ durante el cooldown: 0 peticiones
+→ el cooldown expira
+→ nuevo refresh, 200
+→ setItem, nunca removeItem
+→ MISMO user.id (uuid completo, no prefijo)
+→ refresh token rotado
+→ SIGNED_OUT = 0
+```
+
+Con teeth check en ambas direcciones: sin avanzar el reloj el baseline no
+recibe ninguna petición, y sin el clasificador el mismo `429` vuelve a
+destruir la credencial.
+
+---
+
+## Lo que sigue abierto
+
+- **Validación en hardware.** Nada de esto se ha ejecutado en dispositivo. El
+  banco prueba la mecánica de `auth-js` y de nuestro clasificador; no prueba el
+  comportamiento del producto bajo estrés real.
+- **`GC-START-LATENCY-001`**, abierto y ahora cuantificado: el camino de
+  `auth-js` puede consumir **~25,4 s de backoff**, y `startRecording` espera a
+  `getOwnershipAccessToken()`. Esa exposición **la introdujo D2-B** al hacer
+  reintentable el `500`; D2-C no la agrava ni la corrige, y su cierre pertenece
+  a ese finding.
+- **Rate limit sostenido.** El dispositivo conservaría la credencial sin poder
+  usarla. Es evidencia preservada, no recuperación.
+- **La causa histórica del 22/08 sigue sin demostrar**, y ninguna prueba futura
+  puede demostrarla.
+
+---
+
+## Lo que NO hay que volver a intentar
+
+- **No reclasificar por status a secas.** GoTrue ya distingue semánticamente
+  `over_request_rate_limit` de `refresh_token_not_found`; el status HTTP no.
+- **No reescribir el `429` como `503`.** Falsea el status observado y convierte
+  1 petición en 8 contra un endpoint que acaba de pedir menos tráfico.
+- **No guardar una copia en la sombra del refresh token.** Duplica una
+  credencial en una segunda clave, exige bendición de `SECURITY.md`, y con un
+  token realmente revocado entra en bucle restaurar → 401 → borrar → restaurar.
+- **No vetar el borrado desde el adaptador de storage.** `_removeSession` limpia
+  `lastRefreshFailure` **antes** de tocar storage, así que el veto desactivaría
+  el cooldown de 60 s que es justo la protección anti-storm que trajo D2-B.

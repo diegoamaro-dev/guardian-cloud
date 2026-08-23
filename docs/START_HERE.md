@@ -52,7 +52,7 @@ baseline `v0.3.0-rc.1`, no la rama actual.
 
 | Comprobación | Resultado |
 |---|---|
-| Suite completa | **738/738**, en **39 ficheros** |
+| Suite completa | **781/781**, en **40 ficheros** |
 | Typecheck | **12 errores históricos, cero nuevos** — **NO** verde |
 | `git diff --check` | Limpio |
 
@@ -68,14 +68,14 @@ ha reejecutado desde el 20/08.
 | GC-DEV-RESET-001 | RELEASE BLOCKER · `FIXED IN CODE`, revalidación no requerida |
 | GC-DEST-PAUSE-001 | `FIXED IN CODE`, **revalidación hardware pendiente** |
 | GC-AUTH-001 | `FIXED IN CODE`; identidad PASS en hardware, flujo completo **no alcanzado** |
-| GC-AUTH-SESSION-RECOVERY-001 | **`OPEN`** — sólo observabilidad; el defecto sigue |
+| GC-AUTH-SESSION-RECOVERY-001 | **`OPEN`** — mitigado por D2-B y D2-C, **validado en banco, NO en dispositivo** |
 | GC-START-LATENCY-001 | **`OPEN`** |
 | GC-DEST-STATUS-001 | **`OPEN`** — backend |
-| GC-AUTH-RETRY-CLASSIFICATION-001 | RELEASE RISK, causalidad no probada |
+| GC-AUTH-RETRY-CLASSIFICATION-001 | causa **suficiente** demostrada; causalidad con el 22/08 **no** probada |
 
 Detalle y alcance exacto de cada uno en
 [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md#findings-abiertos-de-identidad-destino-y-herramientas)
-y en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §1–§4.
+y en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §1–§5.
 
 ### Por qué sigue `NO APTO PARA RELEASE`
 

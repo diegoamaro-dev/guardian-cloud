@@ -65,7 +65,7 @@ documento, pero sí cobertura automática densa: `legacyProbeSeal` (52),
 * También está `HARDWARE_VALIDATED` el recovery real de una sesión pendiente
   tras restaurar la autorización de Drive.
 * Validación automática vigente, ejecutada el 2026-08-23 sobre `34412a0`:
-  **738/738 tests en 39 ficheros**; 12 errores TypeScript históricos y cero
+  **781/781 tests en 40 ficheros**; 12 errores TypeScript históricos y cero
   nuevos; `git diff --check` limpio. `compileDebugKotlin` dio
   `BUILD SUCCESSFUL` el 20/08 y **no se ha reejecutado desde entonces**.
   *(La cifra 360/360 que figuraba aquí era del corte del 20/08.)*

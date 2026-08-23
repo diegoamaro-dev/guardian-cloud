@@ -17,6 +17,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { createClient } from '@supabase/supabase-js';
 import { env } from '@/config/env';
 import { authDebugLogger, instrumentAuthStorage } from './authDiagnostics';
+import { instrumentRefreshFetch } from './refreshRateLimit';
 
 /**
  * GC-AUTH-SESSION-RECOVERY-001 · D0 — OBSERVABILITY ONLY.
@@ -34,6 +35,18 @@ import { authDebugLogger, instrumentAuthStorage } from './authDiagnostics';
  * characters of the live refresh token. Our logger forwards no argument
  * by value — see `authDiagnostics.ts`.
  */
+/**
+ * GC-AUTH-SESSION-RECOVERY-001 · D2-C — the refresh rate-limit classifier.
+ *
+ * `global.fetch` is the only extension point `GoTrueClientOptions` offers;
+ * there is no retry or error-classification hook. The wrapper declines to
+ * hand auth-js a `429 over_request_rate_limit` on the refresh endpoint,
+ * because auth-js would read it as a fatal credential error and delete the
+ * session — access and refresh token together, under one key. With an
+ * anonymous identity that deletion is terminal.
+ *
+ * Everything else passes through untouched. See `refreshRateLimit.ts`.
+ */
 export const supabase = createClient(env.supabaseUrl, env.supabaseAnonKey, {
   auth: {
     storage: instrumentAuthStorage(AsyncStorage),
@@ -42,4 +55,5 @@ export const supabase = createClient(env.supabaseUrl, env.supabaseAnonKey, {
     detectSessionInUrl: false,
     debug: authDebugLogger,
   },
+  global: { fetch: instrumentRefreshFetch(fetch) },
 });

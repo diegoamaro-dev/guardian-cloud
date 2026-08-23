@@ -127,7 +127,7 @@ Leer en este orden:
 
 1. docs/START_HERE.md
 2. **docs/IMPLEMENTATION_STATUS.md** — referencia canónica de qué está implementado y qué validado
-3. **docs/KNOWN_LIMITS.md** — límites vigentes y findings §1–§4
+3. **docs/KNOWN_LIMITS.md** — límites vigentes y findings §1–§5
 4. **docs/RELEASE_CHECKLIST_v0.3.md** — §0 es un invariante **bloqueante** de release
 5. **docs/releases/v0.3.0-rc.1.md** — baseline técnica vigente
 6. **docs/DEVELOPMENT_WORKFLOW.md** — cómo se avanza sobre la baseline
@@ -155,7 +155,7 @@ se fija aquí ninguna cifra como objetivo: quedaría obsoleta al añadir pruebas
 empujaría a «arreglar» el documento en vez del código. Registrar el total
 observado al ejecutarla.
 
-Última ejecución registrada: **738/738 en 39 ficheros**, el 2026-08-23 sobre
+Última ejecución registrada: **781/781 en 40 ficheros**, el 2026-08-23 sobre
 `34412a0`.
 
 **12 errores TypeScript heredados** (typecheck **NO** verde) · sin CI.

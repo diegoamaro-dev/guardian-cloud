@@ -12,7 +12,7 @@ Estado vigente a 2026-08-23, sobre `34412a0`.
 
 Fuentes de continuidad y evidencia:
 
-* [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) — límites vigentes y findings §1–§4;
+* [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) — límites vigentes y findings §1–§5;
 * [`RELEASE_CHECKLIST_v0.3.md`](./RELEASE_CHECKLIST_v0.3.md) §0 — invariante de migración de identidad, bloqueante;
 * [validación física del vídeo nativo con durable cleanup del 20/08](./audits/GUARDIAN_CLOUD_NATIVE_SEGMENTED_DURABLE_CLEANUP_VALIDATION_2026-08-20.md);
 * [validación física de la integración nativa segmentada del 13/08](./audits/GUARDIAN_CLOUD_NATIVE_SEGMENTED_INTEGRATION_VALIDATION_2026-08-13.md);
@@ -123,10 +123,10 @@ Demostrado **sólo por pruebas automáticas**, pendiente de hardware:
 ## Findings abiertos de identidad, destino y herramientas
 
 Ocho findings registrados entre el 20/08 y el 23/08. **Ninguno está CLOSED
-salvo donde se indica explícitamente.** Los estados de §1–§4 son los de
-[`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md); los tres siguientes provienen de sus
-fichas de evidencia congeladas fuera del repositorio y **no tienen registro
-propio en `docs/`**.
+salvo donde se indica explícitamente.** Los estados de §1–§5 son los de
+[`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md); `GC-START-LATENCY-001` y
+`GC-DEST-STATUS-001` provienen de sus fichas de evidencia congeladas fuera del
+repositorio y **no tienen registro propio en `docs/`**.
 
 ### Vocabulario de estado
 
@@ -145,10 +145,10 @@ propio en `docs/`**.
 | **GC-DEV-RESET-001** | RELEASE BLOCKER · `FIXED IN CODE` / revalidación hardware **no requerida** | `e289dcb` | El defecto es de política de borrado, demostrable en pruebas. 62 tests en `devResetGuard.test.ts` |
 | **GC-DEST-PAUSE-001** | `FIXED IN CODE` / **`HARDWARE REVALIDATION REQUIRED`** | `3fae4f6` | La corrida de revalidación del 21/08 quedó **anulada** por la destrucción accidental de evidencia que originó GC-DEV-RESET-001 |
 | **GC-AUTH-001** | `FIXED IN CODE` · ruta de identidad **PASS en hardware** · flujo extremo a extremo **no alcanzado** | `ad8756b`…`8615ba6`, integrados en `e215e5c` | La Vía 2 del 21/08 dio `Identity PASS` y `Registration PASS`, pero `Upload BLOCKED`, `Completion NOT REACHED` y `Cleanup NOT EXECUTED`. **No es un cierre** |
-| **GC-AUTH-SESSION-RECOVERY-001** | **`OPEN`** | — | Sólo se entregó observabilidad (D0, `02551a1` + `34412a0`). El propio módulo lo declara: *«It does NOT fix the defect»*. Tras una ventana offline prolongada la sesión de Supabase desaparece y 87 chunks quedaron sin poder subirse (22/08) |
+| **GC-AUTH-SESSION-RECOVERY-001** | **`OPEN`** · mitigado, **validado en banco, NO en dispositivo** | D0 `02551a1`+`34412a0` · D2-B `08e3cd2` · D2-C sin commitear | Tras una ventana offline prolongada la sesión de Supabase desaparecía y 87 chunks quedaron sin poder subirse (22/08). **D2-B** (upgrade a 2.112.3) corrige la destrucción ante // y añade proactive-preserve y un cooldown de 60 s. **D2-C** clasifica  en el refresh como reintentable; todo lo demás hace pass-through fail-closed. Detalle en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §5 |
 | **GC-START-LATENCY-001** | **`OPEN`** | — | Con la red remota muerta, `startRecording` se bloquea ~4 min 30 s en `getOwnershipAccessToken()`. No aparece el diálogo de micrófono y la app parece colgada (22/08) |
 | **GC-DEST-STATUS-001** | **`OPEN`** · defecto de **backend** | — | Ningún camino de código escribe `revoked` ni `error`. Un destino Drive con refresh token revocado sigue reportándose `connected`. Ver [`API_SPEC.md`](./API_SPEC.md#estado-de-los-destinos--defecto-abierto) |
-| **GC-AUTH-RETRY-CLASSIFICATION-001** | RELEASE RISK · relación causal **no probada** | — | Hallazgo estático sobre `@supabase/auth-js` 2.103.3: destruye la sesión ante un `429` o un `500` genérico. **No** está demostrado que causara el incidente de GC-AUTH-SESSION-RECOVERY-001 |
+| **GC-AUTH-RETRY-CLASSIFICATION-001** | **causa suficiente demostrada** · relación causal con el 22/08 **no probada** | banco `9d682bc` · D2-B `08e3cd2` · D2-C sin commitear | Dejó de ser estático: el banco reproduce de forma determinista que un / en el refresh destruye una credencial **intacta** (). Corregido para  por D2-B y para  por D2-C. **Sigue sin demostrarse** que el incidente del 22/08 fuera uno de esos dos: la respuesta nunca se capturó |
 
 ### Consecuencia sobre el veredicto
 
@@ -162,8 +162,11 @@ distinta y todavía sin corregir.
 
 ### Dónde vive la evidencia
 
-Las fichas de `GC-AUTH-SESSION-RECOVERY-001`, `GC-START-LATENCY-001`,
-`GC-DEST-STATUS-001` y `GC-AUTH-RETRY-CLASSIFICATION-001` están **fuera del
+`GC-AUTH-SESSION-RECOVERY-001` y `GC-AUTH-RETRY-CLASSIFICATION-001` **ya
+tienen registro en el repositorio**: [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §5,
+escrito al cerrar D2-B y D2-C.
+
+Las fichas de `GC-START-LATENCY-001` y `GC-DEST-STATUS-001` siguen **fuera del
 repositorio**, en el archivo de evidencia congelada. No hay ningún documento en
 `docs/` que las contenga. Esa asimetría es deuda documental conocida, no un
 descuido de este documento.
@@ -176,7 +179,7 @@ Ejecutada el 2026-08-23 sobre `34412a0`.
 
 | Comprobación | Resultado |
 |---|---|
-| Suite completa | **738/738**, en **39 ficheros** |
+| Suite completa | **781/781**, en **40 ficheros** |
 | Typecheck | **12 errores TypeScript históricos, cero nuevos** — typecheck **NO** verde |
 | `git diff --check` | Limpio |
 
