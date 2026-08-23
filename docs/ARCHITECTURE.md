@@ -42,12 +42,26 @@ Tecnologías reales (MVP actual):
   entries `PendingQueueEntry` (sesión + chunks + status). Lectura/escritura
   serializada con un `writeChain` para evitar carreras.
 - expo-file-system para los archivos de grabación y los chunks en disco
-- expo-av para audio
+- **expo-audio** para el motor de grabación de audio. La única importación
+  está en `mobile/src/audio/audioEngine.ts`, que aísla la librería del resto
+  de la app; ningún consumidor la importa directamente. Su configuración
+  replica 1:1 la de expo-av anterior (mono / 64 kbps)
 - módulo nativo Android `gc-segmented-recorder` para vídeo segmentado;
   expo-camera permanece como fallback y ambos productores son mutuamente
   excluyentes
 - react-native-background-actions para el foreground service Android
   (notificación persistente "Guardian Cloud está protegiendo tu evidencia")
+
+> **expo-av ya NO es el motor de audio.** Sigue declarado como dependencia
+> (`~16.0.8`) y lo importan únicamente las dos rutas de diagnóstico
+> `app/debug-camera-probe/`. Retirar ambas y la dependencia está registrado
+> como deuda en [`KNOWN_DEBT.md`](./KNOWN_DEBT.md) y como `F-15` en el plan de
+> remediación; sin ejecutar.
+>
+> La limitación de `Audio.Recording` huérfano descrita en
+> [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §1 **sigue siendo contexto
+> obligatorio**: documenta el motor histórico y el porqué de varias guardas
+> vigentes. La migración no la anula.
 
 > SQLite NO se usa. Se evaluó al inicio y se descartó: AsyncStorage cubre
 > el volumen real (chunks por sesión cuentan en decenas o cientos, no
