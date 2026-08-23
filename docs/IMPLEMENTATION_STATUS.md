@@ -1,9 +1,19 @@
 # IMPLEMENTATION_STATUS.md
 
-⛔ NO APTO PARA RELEASE — por cifrado local, recovery `I5c`, export `.mp4` y cobertura de dispositivos. **Ya no por `GC-AUD-001`.**
+⛔ NO APTO PARA RELEASE — por cifrado local, recovery `I5c`, export `.mp4`, cobertura de dispositivos **y cuatro findings de identidad/destino abiertos**. **Ya no por `GC-AUD-001`.**
 
-Estado vigente a 2026-08-20. Fuentes de continuidad y evidencia:
+Estado vigente a 2026-08-23, sobre `34412a0`.
 
+> **Corte anterior: 2026-08-20.** Entre el 20/08 y el 23/08 la rama
+> `fix/gc-auth-001-main-integration` incorporó seis commits que este documento
+> no reflejaba. La sección
+> [Findings abiertos](#findings-abiertos-de-identidad-destino-y-herramientas)
+> los recoge con su estado exacto.
+
+Fuentes de continuidad y evidencia:
+
+* [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) — límites vigentes y findings §1–§4;
+* [`RELEASE_CHECKLIST_v0.3.md`](./RELEASE_CHECKLIST_v0.3.md) §0 — invariante de migración de identidad, bloqueante;
 * [validación física del vídeo nativo con durable cleanup del 20/08](./audits/GUARDIAN_CLOUD_NATIVE_SEGMENTED_DURABLE_CLEANUP_VALIDATION_2026-08-20.md);
 * [validación física de la integración nativa segmentada del 13/08](./audits/GUARDIAN_CLOUD_NATIVE_SEGMENTED_INTEGRATION_VALIDATION_2026-08-13.md);
 * [configuración OAuth de Drive](./OAUTH_DRIVE_CONFIGURATION.md).
@@ -110,14 +120,75 @@ Demostrado **sólo por pruebas automáticas**, pendiente de hardware:
 * un reap diferido exitoso retira `GC_QUEUE` y vuelve a solicitar cleanup con
   motivo `finalized`.
 
+## Findings abiertos de identidad, destino y herramientas
+
+Ocho findings registrados entre el 20/08 y el 23/08. **Ninguno está CLOSED
+salvo donde se indica explícitamente.** Los estados de §1–§4 son los de
+[`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md); los tres siguientes provienen de sus
+fichas de evidencia congeladas fuera del repositorio y **no tienen registro
+propio en `docs/`**.
+
+### Vocabulario de estado
+
+| Etiqueta | Significa |
+|---|---|
+| `FIXED IN CODE` | La corrección está en la rama y cubierta por pruebas. **No** dice nada sobre dispositivo |
+| `CLOSED IN HARDWARE` | Reproducido y verificado corregido en dispositivo, con evidencia fechada |
+| `HARDWARE REVALIDATION REQUIRED` | Corregido en código; la corrida física que lo cerraría no se ha completado |
+| `OPEN` | Observado y caracterizado. **Sin corregir** |
+
+### Tabla
+
+| Finding | Estado | Corregido en | Alcance de la validación |
+|---|---|---|---|
+| **GC-AUTH-MIGRATION-001** | **CLOSED IN HARDWARE** | `3f14063` | Único cierre en hardware del bloque. OnePlus A6000, 21/08, desde `pm clear`: la sonda selló el veredicto negativo en disco antes de que existiera un byte de captura |
+| **GC-DEV-RESET-001** | RELEASE BLOCKER · `FIXED IN CODE` / revalidación hardware **no requerida** | `e289dcb` | El defecto es de política de borrado, demostrable en pruebas. 62 tests en `devResetGuard.test.ts` |
+| **GC-DEST-PAUSE-001** | `FIXED IN CODE` / **`HARDWARE REVALIDATION REQUIRED`** | `3fae4f6` | La corrida de revalidación del 21/08 quedó **anulada** por la destrucción accidental de evidencia que originó GC-DEV-RESET-001 |
+| **GC-AUTH-001** | `FIXED IN CODE` · ruta de identidad **PASS en hardware** · flujo extremo a extremo **no alcanzado** | `ad8756b`…`8615ba6`, integrados en `e215e5c` | La Vía 2 del 21/08 dio `Identity PASS` y `Registration PASS`, pero `Upload BLOCKED`, `Completion NOT REACHED` y `Cleanup NOT EXECUTED`. **No es un cierre** |
+| **GC-AUTH-SESSION-RECOVERY-001** | **`OPEN`** | — | Sólo se entregó observabilidad (D0, `02551a1` + `34412a0`). El propio módulo lo declara: *«It does NOT fix the defect»*. Tras una ventana offline prolongada la sesión de Supabase desaparece y 87 chunks quedaron sin poder subirse (22/08) |
+| **GC-START-LATENCY-001** | **`OPEN`** | — | Con la red remota muerta, `startRecording` se bloquea ~4 min 30 s en `getOwnershipAccessToken()`. No aparece el diálogo de micrófono y la app parece colgada (22/08) |
+| **GC-DEST-STATUS-001** | **`OPEN`** · defecto de **backend** | — | Ningún camino de código escribe `revoked` ni `error`. Un destino Drive con refresh token revocado sigue reportándose `connected`. Ver [`API_SPEC.md`](./API_SPEC.md#estado-de-los-destinos--defecto-abierto) |
+| **GC-AUTH-RETRY-CLASSIFICATION-001** | RELEASE RISK · relación causal **no probada** | — | Hallazgo estático sobre `@supabase/auth-js` 2.103.3: destruye la sesión ante un `429` o un `500` genérico. **No** está demostrado que causara el incidente de GC-AUTH-SESSION-RECOVERY-001 |
+
+### Consecuencia sobre el veredicto
+
+`GC-DEV-RESET-001` es **release blocker** por derecho propio: así lo declara
+[`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §4. `GC-DEST-PAUSE-001` **no** lleva esa
+etiqueta en §3 y este documento no se la añade; lo que impide cerrarlo es que su
+corrida de revalidación física quedó anulada. `GC-AUTH-SESSION-RECOVERY-001`
+es el más grave de los abiertos: reproduce el modo de fallo que da nombre a
+`GC-AUTH-001` —evidencia que no puede salir del dispositivo— por una causa
+distinta y todavía sin corregir.
+
+### Dónde vive la evidencia
+
+Las fichas de `GC-AUTH-SESSION-RECOVERY-001`, `GC-START-LATENCY-001`,
+`GC-DEST-STATUS-001` y `GC-AUTH-RETRY-CLASSIFICATION-001` están **fuera del
+repositorio**, en el archivo de evidencia congelada. No hay ningún documento en
+`docs/` que las contenga. Esa asimetría es deuda documental conocida, no un
+descuido de este documento.
+
+---
+
 ### Validación automática actual
+
+Ejecutada el 2026-08-23 sobre `34412a0`.
 
 | Comprobación | Resultado |
 |---|---|
-| Suite completa | **360/360** |
-| Typecheck | **12 errores TypeScript históricos, cero nuevos** |
-| `:gc-segmented-recorder:compileDebugKotlin` | **BUILD SUCCESSFUL** |
+| Suite completa | **738/738**, en **39 ficheros** |
+| Typecheck | **12 errores TypeScript históricos, cero nuevos** — typecheck **NO** verde |
 | `git diff --check` | Limpio |
+
+> La cifra **360/360** que figuraba aquí correspondía al corte del 20/08. El
+> crecimiento hasta 738 proviene de los ficheros añadidos por los findings:
+> `devResetGuard` (62), `legacyProbeSeal` (52), `authDiagnostics` (46),
+> `ownershipGate` (26), `destinationPauseClear` (17), `ownershipBrand` (10).
+
+> **`:gc-segmented-recorder:compileDebugKotlin` no se ha reejecutado.** Su
+> `BUILD SUCCESSFUL` es del 20/08 y ningún commit posterior toca el módulo
+> Kotlin; aun así, este documento no lo declara como resultado actual porque no
+> se ha vuelto a compilar.
 
 ### Estado del gate
 
@@ -302,20 +373,43 @@ That validation covers a single device — OnePlus A6000 / Android 11 / API 30 /
 multi-device coverage and the scheduler's artificial failure paths are **not**
 declared physically validated.
 
-## Product status
+## Product status — HISTÓRICO / SUPERSEDED
 
-The system is no longer a prototype.
+> **HISTÓRICO / SUPERSEDED — NO representa el veredicto actual.**
+>
+> Este apartado es el veredicto de una baseline anterior, previo a la auditoría
+> del 2026-07-28. Se conserva como registro; **contradice** la cabecera de este
+> mismo documento, y en ese conflicto **gana la cabecera**.
+>
+> El veredicto vigente es `NO APTO PARA RELEASE`, y el estado por capacidad se
+> lee en [Capacidades por nivel](#capacidades-por-nivel-referencia-canónica) y
+> en [Findings abiertos](#findings-abiertos-de-identidad-destino-y-herramientas).
 
-The historical audio/legacy MVP path has been validated under:
+Lo que aquella baseline afirmaba, en sus propios términos:
 
-* app kill
-* network loss
-* background execution
-* recovery after restart
+> The system is no longer a prototype.
+>
+> The historical audio/legacy MVP path has been validated under:
+>
+> * app kill
+> * network loss
+> * background execution
+> * recovery after restart
+>
+> This confirms:
+>
+> > Guardian Cloud fulfills its core promise: evidence survival under real conditions
 
-This confirms:
+**Por qué no se sostiene hoy.** La auditoría del 2026-07-28 retiró
+explícitamente esas tres afirmaciones —«validado bajo kill, pérdida de red,
+background y reinicio», «el sistema ya no es un prototipo» y «cumple su promesa
+central»— por no tener ni un registro de prueba detrás.
 
-> Guardian Cloud fulfills its core promise: evidence survival under real conditions
+Y hay una razón vigente, no sólo histórica: **`GC-AUTH-SESSION-RECOVERY-001`
+sigue `OPEN`.** El 2026-08-22, en hardware, un dispositivo con 87 chunks de
+evidencia sin subir perdió su sesión de Supabase y la evidencia quedó sin poder
+salir del dispositivo. Mientras ese defecto siga abierto, este repositorio **no
+afirma** que Guardian Cloud cumpla su promesa central de forma general.
 
 ---
 

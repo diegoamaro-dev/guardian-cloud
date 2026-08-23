@@ -16,32 +16,39 @@ El proyecto se divide en 3 capas:
 
 Define el sistema real:
 
-- START_HERE.md :contentReference[oaicite:0]{index=0}  
-- ARCHITECTURE.md  
-- API_SPEC.md  
-- MVP_SCOPE.md  
-- APP_STATES.md  
-- PRODUCT_PRINCIPLES.md  
-- DESIGN.md  
-- UI_SCREENS.md  
-- TEST_SCENARIOS.md  
-- IMPLEMENTATION_STATUS.md  
-- RELEASE_CHECKLIST_v0.3.md  
-- SECURITY.md  
+- docs/START_HERE.md
+- docs/IMPLEMENTATION_STATUS.md — **referencia canónica** del estado por capacidad; prevalece sobre ARCHITECTURE, DESIGN, UI_SCREENS y MVP_SCOPE
+- docs/KNOWN_LIMITS.md — límites vigentes y findings; contexto obligatorio
+- docs/RELEASE_CHECKLIST_v0.3.md — su §0 es un invariante **bloqueante**
+- docs/ARCHITECTURE.md
+- docs/API_SPEC.md
+- docs/MVP_SCOPE.md
+- docs/APP_STATES.md
+- docs/PRODUCT_PRINCIPLES.md
+- docs/DESIGN.md
+- docs/UI_SCREENS.md
+- docs/TEST_SCENARIOS.md
+- docs/SECURITY.md
 
 Regla:
 > /docs define cómo funciona el sistema
 
 ---
 
-### /playbook → DECISION SYSTEM
+### Sistema de decisión
 
-Define cómo se toman decisiones:
+Define cómo se toman decisiones. **Ojo: estos cuatro documentos NO están todos
+en `/playbook`.** Rutas reales:
 
-- GUARDIAN_CLOUD_DECISION_RULES.md  
-- FEATURE_EVALUATION_TEMPLATE.md  
-- WEEKLY_PRODUCT_REVIEW.md  
-- CHANGE_GUARDRAILS.md  
+- docs/GUARDIAN_CLOUD_DECISION_RULES.md
+- docs/FEATURE_EVALUATION_TEMPLATE.md
+- docs/WEEKLY_PRODUCT_REVIEW.md
+- playbook/CHANGE_GUARDRAILS.md
+
+El resto de `/playbook` —`WORKFLOW.md`, `TASK_TEMPLATE.md`, `RISK_MAP.md`,
+`METRICS.md`, `DAILY_DASHBOARD.md`, `CLAUDE_PROMPTS.md`— es material de apoyo.
+`playbook/UX_STRESS_RULES.md` está **vacío (0 bytes)**: la versión con
+contenido es `docs/UX_STRESS_RULES.md`.
 
 Regla:
 > guía decisiones, NO define comportamiento
@@ -50,9 +57,9 @@ Regla:
 
 ### /strategy → CONTEXTO (NO CRÍTICO)
 
-- MONETIZATION.md  
-- CONVERSION_FLOW.md  
-- POST_MVP_ROADMAP.md  
+- MONETIZATION.md
+- CONVERSION_FLOW.md
+- POST_MVP_ROADMAP.md
 
 Regla:
 > no afecta decisiones del sistema actual
@@ -64,8 +71,12 @@ Regla:
 En caso de conflicto:
 
 1. /docs
-2. /playbook
+2. sistema de decisión (§2)
 3. /strategy (ignorar si contradice)
+
+Dentro de /docs, cuando dos documentos discrepen sobre **qué está implementado
+o validado**, gana docs/IMPLEMENTATION_STATUS.md. Así lo declaran ya
+ARCHITECTURE.md, DESIGN.md, UI_SCREENS.md y MVP_SCOPE.md en sus encabezados.
 
 ---
 
@@ -86,8 +97,8 @@ En caso de conflicto:
 ### ✅ HACER
 
 - seguir MVP_SCOPE.md
-- respetar PRODUCT_PRINCIPLES.md :contentReference[oaicite:1]{index=1}  
-- validar con TEST_SCENARIOS.md :contentReference[oaicite:2]{index=2}  
+- respetar PRODUCT_PRINCIPLES.md
+- validar con TEST_SCENARIOS.md
 - priorizar funcionamiento real sobre diseño
 
 ---
@@ -155,7 +166,7 @@ Si no:
 
 ## 9. Seguridad
 
-Seguir SECURITY.md :contentReference[oaicite:3]{index=3}  
+Seguir SECURITY.md
 
 Pero:
 
@@ -165,8 +176,8 @@ Pero:
 
 ## 10. UX
 
-Seguir UI_SCREENS.md :contentReference[oaicite:4]{index=4}  
-y UX_RELEASE_CHECKLIST.md :contentReference[oaicite:5]{index=5}  
+Seguir UI_SCREENS.md
+y UX_RELEASE_CHECKLIST.md
 
 Regla:
 
@@ -192,15 +203,22 @@ Si no mejora:
 
 ## 12. Fase actual
 
-El sistema YA funciona:
+Están implementados y con evidencia disponible:
 
 - chunking
-- subida
-- recovery
-- background
-- export
+- subida durante la grabación (audio y vídeo nativo segmentado)
+- recovery tras kill y al abrir la app
+- subida en background
+- export `.m4a`
 
-No es prototipo.
+Estado: **`NO APTO PARA RELEASE`**. Los motivos vigentes están en
+docs/START_HERE.md y el detalle por capacidad en docs/IMPLEMENTATION_STATUS.md.
+
+> La frase «no es prototipo» que ocupaba este apartado quedó retirada por la
+> auditoría del 2026-07-28 junto con «validado bajo kill, pérdida de red,
+> background y reinicio» y «cumple su promesa central»: ninguna de las tres
+> tenía un registro de prueba detrás. Lo implementado sí es real; lo validado
+> se decide en IMPLEMENTATION_STATUS.md, capacidad por capacidad.
 
 ---
 
@@ -289,7 +307,14 @@ If debugging breaks:
 
 ROLL BACK IMMEDIATELY to:
 
-beta-preview-v0.3.1
-(commit a9e6e23)
+v0.3.0-rc.1
+(tag → commit dc7de26; APK construido desde 5ac4a03)
 
-This tag is the current stable baseline.
+Esta es la baseline técnica vigente. Registro completo, con Build ID de EAS y
+SHA-256 del APK, en docs/releases/v0.3.0-rc.1.md.
+
+> **beta-preview-v0.3.1 (a9e6e23) ya NO es el punto de retorno.** El tag sigue
+> existiendo y docs/BETA_STABLE_BASELINE.md se conserva por sus reglas de
+> depuración e invariantes, pero su encabezado lo declara superado desde el
+> 2026-07-30. Volver a él hoy retrocedería por debajo del grabador nativo
+> segmentado y de todo el bloque de identidad.

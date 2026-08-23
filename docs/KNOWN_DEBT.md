@@ -18,7 +18,9 @@ Detalle completo en [`releases/v0.3.0-rc.1.md`](./releases/v0.3.0-rc.1.md) §7.
 - **12 errores heredados**; el typecheck **no** está verde. 6 en `app.config.ts`
   (tipos de `ExpoConfig`/`ManifestService`), 4 en `app/index.tsx` y 2 en
   `src/api/*` (`Uint8Array<ArrayBufferLike>` vs `BufferSource`/`BodyInit`).
-- **No hay CI.** Los 198 tests corren sólo en la máquina del desarrollador.
+- **No hay CI.** Los tests corren sólo en la máquina del desarrollador — **738
+  el 2026-08-23**, sobre `34412a0`. *(Esta línea decía «los 198 tests»: la
+  cifra era del corte de `v0.3.0-rc.1`; la deuda de CI no ha cambiado.)*
 - `npm ci` **falla** sin `--legacy-peer-deps`: el lockfile no materializa los
   peers `react-dom` y `scheduler`.
 - 29 vulnerabilidades de `npm audit` (1 baja, 17 moderadas, 8 altas, 3
@@ -95,11 +97,51 @@ configuración implicada en [`OAUTH_DRIVE_CONFIGURATION.md`](./OAUTH_DRIVE_CONFI
 
 ## Known technical debt
 
+> **Convención.** Una entrada nunca se borra. Cuando deja de ser cierta se
+> antepone `**RESOLVED**` o `**RECLASSIFIED**` con la fecha y lo que la
+> acredita, y el texto original se conserva. Saber que algo fue deuda y por qué
+> dejó de serlo vale más que una lista corta.
+
 - ngrok is temporary and not valid for production.
+  **RESOLVED (2026-07-28)** — sustituido por Cloudflare Tunnel; ver
+  [`CLOUDFLARE_TUNNEL_SETUP.md`](./CLOUDFLARE_TUNNEL_SETUP.md).
 - Backend proxy Drive upload is acceptable for MVP, but should be reviewed before production.
 - expo-av is deprecated and should later migrate to expo-audio / expo-video.
+  **RECLASSIFIED (2026-08-23)** — la migración del **camino de grabación** ya se
+  hizo: `mobile/src/audio/audioEngine.ts:47` importa de `expo-audio`. Lo que
+  queda es distinto y menor: `expo-av` sigue en `package.json`
+  (`~16.0.8`) y sólo lo importan las dos rutas `app/debug-camera-probe/`. La
+  deuda vigente es **retirar esas rutas y la dependencia**, no migrar el motor.
+  Registrado como `F-15` en el plan de remediación, sin ejecutar.
+  > Cuidado: [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §1 documenta una limitación
+  > real de `expo-av` con `Audio.Recording` huérfano. **Sigue siendo contexto
+  > obligatorio** — describe el motor histórico y el porqué de varias guardas.
 - Existing failing tests need review after the recovery flow is stabilized.
+  **RESOLVED (2026-08-23)** — la suite está en 738/738 sin tests saltados. El
+  typecheck sigue en 12 errores heredados, que es deuda aparte y está arriba.
 - Logs should be reduced before release.
 - Export flow has no entry point from the home screen yet (reachable only via direct route `/session/:id`). A Historial brick should list past sessions and link in (see `TODO(export-history)`).
+  **RESOLVED** — `mobile/app/history.tsx` existe (382 líneas) y
+  `mobile/app/index.tsx:8094` navega con `router.push('/history')`. La
+  auditoría de trazabilidad ya lo había marcado obsoleto como defecto `D14`.
 - Export accumulates the full session bytes in memory before writing. Acceptable for MVP-size recordings but will OOM on large files — switch to an incremental append (see `TODO(export-large)`).
 - A partial export missing the last chunk loses the MP4 `moov` atom and the resulting .m4a is generally unplayable. File is still produced as forensic output; moov-patching is out of scope (see `TODO(export-headerless-partial)`).
+
+---
+
+## Lo que NO es deuda y no vive aquí
+
+Los findings del bloque de identidad, destino y herramientas (21/08 – 23/08)
+**no son deuda técnica**: unos son release blockers y otros defectos abiertos.
+Se registran en otro sitio y no deben duplicarse aquí.
+
+| Dónde | Qué contiene |
+|---|---|
+| [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §1–§4 | `GC-AUTH-MIGRATION-001`, `GC-DEST-PAUSE-001`, `GC-DEV-RESET-001` y el límite de `expo-av` |
+| [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md#findings-abiertos-de-identidad-destino-y-herramientas) | Tabla de estado de los ocho findings |
+| [`RELEASE_CHECKLIST_v0.3.md`](./RELEASE_CHECKLIST_v0.3.md) §0 | Invariante bloqueante de migración de identidad |
+
+`GC-AUTH-SESSION-RECOVERY-001`, `GC-START-LATENCY-001`, `GC-DEST-STATUS-001` y
+`GC-AUTH-RETRY-CLASSIFICATION-001` **no tienen documento propio en `docs/`**;
+sus fichas están congeladas fuera del repositorio. Esa asimetría es la deuda
+documental vigente más relevante.

@@ -4,6 +4,57 @@
 
 Validar el producto bajo condiciones reales, no solo en demo feliz.
 
+## Los cuatro niveles — no confundirlos
+
+Un escenario escrito aquí **no** es un escenario probado. Un escenario probado
+en la suite **no** es un escenario validado en dispositivo. Esta distinción es
+el motivo por el que la auditoría del 2026-07-28 retiró las afirmaciones de
+validación del repositorio, y se mantiene explícita para no repetirlo.
+
+| Nivel | Significa | Qué lo acredita |
+|---|---|---|
+| `DEFINIDO` | El escenario está escrito. **Nada más** | Este documento |
+| `PROBADO EN TESTS` | Hay pruebas automáticas que ejercitan su lógica | Un fichero de `mobile/tests/` |
+| `HARDWARE_VALIDATED` | Ejecutado en dispositivo real, con evidencia fechada | Un informe de `docs/audits/` o el archivo de evidencia |
+| `HARDWARE PENDIENTE` | Implementado y probado; **sin** ejecutar en dispositivo | La ausencia de lo anterior |
+
+> `PROBADO EN TESTS` nunca asciende a `HARDWARE_VALIDATED` por acumulación. Son
+> ejes distintos: una prueba unitaria demuestra lógica, no comportamiento del
+> sistema operativo bajo estrés.
+
+### Estado por escenario
+
+Mapeo por asunto de los ficheros de prueba, sobre `34412a0`. **No es
+exhaustivo**: marca el nivel que se puede acreditar, no el máximo alcanzable.
+
+| Escenario | Nivel | Acreditación |
+|---|---|---|
+| 1 — Grabación corta | `HARDWARE_VALIDATED` | Validación 20/08 (vídeo) · `durableBeforeBackend`, `queue` |
+| 2 — Pérdida de conexión | `PROBADO EN TESTS` · **HARDWARE PENDIENTE** | `drainPause`, `errorPolicy`, `classifyError`, `deferredRegistration`, `captureWhileDegraded`. **`GC-START-LATENCY-001` está abierto en esta condición exacta** |
+| 3 — Cierre forzado | `HARDWARE_VALIDATED` | Vía 2 fase 2.3, 21/08 · `durableBeforeBackend`, `captureWhileDegraded`, `finalize`, `normalize` |
+| 4 — Reinicio del dispositivo | `PROBADO EN TESTS` · **HARDWARE PENDIENTE** | `drainPause`. El recovery autónomo tras reinicio (`I5c`) **no está implementado** |
+| 5 — Permisos denegados | `DEFINIDO` | Sin cobertura automática identificada |
+| 6 — Drive desconectado | `PROBADO EN TESTS` | `drainPause`, `destinationPauseClear`, `authPauseRecovery`. **`GC-DEST-STATUS-001` abierto**: `connected` no prueba que el destino funcione |
+| 7 — Chunk duplicado | `PROBADO EN TESTS` | `normalize` (pasos 2 y 3) · idempotencia de backend por `UNIQUE(session_id, chunk_index)` |
+| 8 — Batería baja | `DEFINIDO` | Sin cobertura automática identificada |
+| 9 — Historial | `DEFINIDO` | Sin cobertura automática identificada |
+| 10 — Modo Kids | `DEFINIDO` | Post-MVP. No implementado |
+| 11–13 — Chunks corruptos y export sin chunks válidos | `PROBADO EN TESTS` | `exportFromChunkRefs` |
+| 14 — UI de export bajo fallo | `PROBADO EN TESTS` | `exportRunner` |
+| 15 — Uso bajo estrés | `DEFINIDO` · **HARDWARE PENDIENTE** | Sin corrida registrada con el artefacto vigente |
+| 16 — Recuperación por usuario | `HARDWARE_VALIDATED` **parcial** | Recovery de una sesión pendiente tras restaurar Drive, 20/08 · `recoveryVerdict`, `exportFromChunkRefs`. Los casos 2–7 de este escenario **no** están validados en hardware |
+| 17 — Vídeo nativo con durable cleanup | `HARDWARE_VALIDATED` en su **ruta normal** | Validación 20/08 · puntos 5–8 en `HARDWARE_HARDENING_PENDING` |
+
+### Escenarios de identidad — sin entrada propia todavía
+
+Los findings del bloque de identidad no tienen escenario numerado en este
+documento, pero sí cobertura automática densa: `legacyProbeSeal` (52),
+`devResetGuard` (62), `authDiagnostics` (46), `ownershipGate` (26),
+`destinationPauseClear` (17), `ownershipBrand` (10). Su estado exacto está en
+[`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md#findings-abiertos-de-identidad-destino-y-herramientas).
+
+**Sólo `GC-AUTH-MIGRATION-001` está `HARDWARE_VALIDATED`.**
+
 ## Estado de validación vigente
 
 * La grabación nativa segmentada, la **subida de vídeo durante la captura** y
@@ -13,10 +64,11 @@ Validar el producto bajo condiciones reales, no solo en demo feliz.
   [validación del 20/08](./audits/GUARDIAN_CLOUD_NATIVE_SEGMENTED_DURABLE_CLEANUP_VALIDATION_2026-08-20.md).
 * También está `HARDWARE_VALIDATED` el recovery real de una sesión pendiente
   tras restaurar la autorización de Drive.
-* Validación automática actual: 360/360 tests; 12 errores TypeScript
-  históricos y cero nuevos; Kotlin
-  `:gc-segmented-recorder:compileDebugKotlin` con `BUILD SUCCESSFUL`;
-  `git diff --check` limpio.
+* Validación automática vigente, ejecutada el 2026-08-23 sobre `34412a0`:
+  **738/738 tests en 39 ficheros**; 12 errores TypeScript históricos y cero
+  nuevos; `git diff --check` limpio. `compileDebugKotlin` dio
+  `BUILD SUCCESSFUL` el 20/08 y **no se ha reejecutado desde entonces**.
+  *(La cifra 360/360 que figuraba aquí era del corte del 20/08.)*
 * **No** se declaran validados: recovery completo de vídeo, export final
   `.mp4`, cobertura multi-dispositivo, Android 13+ ni las rutas artificiales de
   fallo del scheduler.

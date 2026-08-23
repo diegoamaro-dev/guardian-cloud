@@ -1,91 +1,217 @@
 # Guardian Cloud — API Spec v1
 
+> **Aviso de estado — reconciliado el 2026-08-23 contra `34412a0`.**
+>
+> Este documento describía una API que en parte **nunca existió**. La versión
+> anterior documentaba `POST /auth/login`, `POST /auth/logout`, `POST /alerts`
+> y `GET /alerts`; ninguno de los cuatro está montado en `backend/src/app.ts`.
+> También declaraba `user_id` en el cuerpo de `POST /sessions`, que el backend
+> **rechaza como fuente de identidad** por diseño.
+>
+> **Alcance de esta reconciliación:** el inventario de endpoints, el mecanismo
+> de autenticación y los tamaños de chunk se han derivado leyendo los routers
+> y los esquemas reales, y son verificables. Los **esquemas campo a campo de
+> petición y respuesta no están documentados aquí** salvo donde ya se habían
+> verificado: inventarlos sería repetir el defecto que este documento acaba de
+> corregir. La fuente de verdad de cada contrato es su `zod` schema.
+>
+> Rutas: `backend/src/routes/` · montaje: `backend/src/app.ts:118-134`.
+
 ## Objetivo
 
 Definir la API mínima del MVP.
 
+---
+
 ## Auth
 
-### POST /auth/login
-Inicia sesión o intercambia token con proveedor externo.
+**No hay endpoints de autenticación.** El backend no emite, refresca ni revoca
+sesiones: sólo las verifica.
 
-### POST /auth/logout
-Cierra sesión.
+| | |
+|---|---|
+| Mecanismo | `Authorization: Bearer <JWT de Supabase>` |
+| Verificación | JWKS público de Supabase Auth (`utils/jwtVerifier.ts`) |
+| Identidad | **anónima** (`signInAnonymously`), sin login de usuario |
+| `user_id` | **siempre** del claim `sub` del JWT, **nunca** del cuerpo |
+| Fallo | `401 UNAUTHORIZED` con mensaje opaco — no distingue expirado, firma inválida, issuer incorrecto ni JWKS inalcanzable |
+| Timeout | 4000 ms sobre la fase de verificación (`AUTH_TIMEOUT_MS`) |
 
-## Sesiones
+Fuente: `backend/src/middleware/auth.ts`.
+
+> Un `401` **no** es un error estructural de la petición. El cliente lo trata
+> como reintentable — la identidad puede estar refrescándose o degradada — y
+> cae a captura local-first en lugar de abortar. Ver `GC-AUTH-001` en
+> [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md).
+
+El único endpoint bajo el prefijo `/auth` es el callback de OAuth de Drive:
+
+### GET /auth/drive/callback
+Recibe el `code` de Google tras la autorización del usuario. No lleva
+`authMiddleware`: la autenticación viaja en el `state` del flujo OAuth.
+
+---
+
+## Inventario real de endpoints
+
+Verificado sobre `34412a0`. Todos exigen `authMiddleware` salvo donde se indica.
+
+### Salud
+
+| Método | Ruta | Auth |
+|---|---|---|
+| `GET` | `/health` | no |
+
+### Sesiones
+
+| Método | Ruta | Auth |
+|---|---|---|
+| `POST` | `/sessions` | sí |
+| `GET` | `/sessions/:id` | sí |
+| `GET` | `/sessions/:id/chunks` | sí |
+| `POST` | `/sessions/:id/complete` | sí |
+| `GET` | `/sessions/:id/chunks/:index/download` | sí |
+
+### Chunks
+
+| Método | Ruta | Auth |
+|---|---|---|
+| `POST` | `/chunks` | sí |
+
+### Destinos
+
+| Método | Ruta | Auth |
+|---|---|---|
+| `GET` | `/destinations` | sí |
+| `POST` | `/destinations` | sí |
+| `POST` | `/destinations/drive/connect` | sí |
+| `POST` | `/destinations/drive/test-upload` | sí |
+| `POST` | `/destinations/drive/chunks` | sí |
+| `POST` | `/destinations/nas` | sí |
+| `POST` | `/destinations/nas/test-upload` | sí |
+| `POST` | `/destinations/nas/chunks` | sí |
+
+### Recovery
+
+| Método | Ruta | Auth |
+|---|---|---|
+| `GET` | `/recovery/manifests` | sí |
+| `GET` | `/recovery/manifests/:manifest_file_id` | sí |
+| `GET` | `/recovery/chunks/:manifest_file_id/:chunk_index/download` | sí |
+
+---
+
+## Contratos verificados
 
 ### POST /sessions
-Crea una sesión de grabación.
 
-Body:
-- user_id
-- mode
-- destination_type
+Crea —o **readopta**— una sesión de grabación.
 
-Response:
-- session_id
-- created_at
-- status
+Body (`schemas/sessions.schema.ts`):
 
-### GET /sessions/:id
-Devuelve estado de sesión.
+| Campo | Tipo | Obligatorio |
+|---|---|---|
+| `mode` | `'audio' \| 'video'` | sí |
+| `destination_type` | `'drive' \| 'nas' \| 'none'` | sí |
+| `id` | `uuid` | no |
 
-### POST /sessions/:id/complete
-Marca sesión como completada.
+**`user_id` NO se envía.** Se extrae del JWT.
 
-## Chunks
+`id` es el identificador generado por el cliente. Existe para que la app pueda
+empezar a grabar sin red usando un UUID local y registrar **ese mismo id** más
+tarde. El handler es idempotente: reenviar el mismo `id` + `user_id` devuelve
+la fila existente en lugar de fallar.
+
+Respuesta `201`:
+
+```json
+{
+  "session_id": "uuid",
+  "status": "...",
+  "mode": "audio",
+  "destination_type": "drive"
+}
+```
 
 ### POST /chunks
-Registra chunk subido o recibido.
 
-Body:
-- session_id
-- chunk_index
-- hash
-- size
-- status
-- remote_reference
+Registra el metadato de un chunk. **No transporta bytes** — los bytes van por
+`POST /destinations/drive/chunks` o `/nas/chunks`.
 
-### GET /sessions/:id/chunks
-Lista chunks de una sesión.
+Body (`chunkBodySchema`, `routes/chunks.routes.ts:41-48`):
 
-## Destinos
+| Campo | Tipo | Restricción |
+|---|---|---|
+| `session_id` | `uuid` | — |
+| `chunk_index` | `int` | `>= 0` |
+| `hash` | `string` | `^[a-f0-9]{64}$` (sha256) |
+| `size` | `int` | `> 0`, máx. `20 MB` |
+| `status` | `'pending' \| 'uploaded' \| 'failed'` | — |
+| `remote_reference` | `string \| null` | opcional |
 
-### GET /destinations
-Lista destinos configurados por el usuario.
+> `status === 'uploaded'` **con `remote_reference` no vacío** es el único
+> predicado que acredita que un fragmento está fuera del dispositivo. Lo
+> comparten el export gate, el finalize gate, el banner de Home y el guard de
+> reset. Ver `isChunkConfirmedOffDevice`.
 
-### POST /destinations/drive/connect
-Inicia conexión con Google Drive.
+**Idempotencia:** `UNIQUE(session_id, chunk_index)` en base de datos más
+reconciliación en aplicación ante violación `23505`. Mismo hash → replay `200`;
+hash distinto → rechazo. La transición a `uploaded` es terminal.
 
-### POST /destinations
-Guarda configuración de destino.
+### Tamaños de chunk
 
-## Alertas
+Definidos en el cliente (`mobile/app/index.tsx:392-397`):
 
-### POST /alerts
-Crea alerta asociada a una sesión.
+| Modo | Bytes crudos | Constante |
+|---|---|---|
+| Audio | **32 768** (32 KB) | `CHUNK_SIZE_AUDIO` |
+| Vídeo | **262 144** (256 KB) | `CHUNK_SIZE_VIDEO` |
 
-### GET /alerts
-Lista alertas del usuario.
+El transporte es base64, así que la longitud emitida es la del bloque base64
+alineado a 4 (`CHUNK_SIZE_BASE64_*`). El campo `size` del contrato admite
+hasta 20 MB; el límite real lo fija el cliente, no la API.
 
-## Salud
+> La cifra **16384** que aparecía en este documento nunca correspondió al
+> código en producción. Estaba registrada como defecto `D3` en
+> [`GUARDIAN_CLOUD_TRACEABILITY_2026-07-28.md`](./audits/GUARDIAN_CLOUD_TRACEABILITY_2026-07-28.md).
 
-### GET /health
-Estado básico del backend.
+### POST /sessions/:id/complete
 
-## Notas
+Marca la sesión como completada. Como efecto secundario **best-effort**
+intenta generar el manifest cross-device (`tryGenerateManifest`, que nunca
+lanza). El fallo del manifest no altera la respuesta al cliente.
 
-- la API v1 no debe ser enorme
-- primero debe ser estable
-- la fuente de verdad crítica es el estado de sesión y chunk
+### GET /sessions/:id/chunks/:index/download
 
-## Evidence Manifest (futuro)
+Contrapartida de lectura del pipeline de subida. El backend hace de proxy: el
+cliente **nunca** recibe un access token de Drive. Exige `status='uploaded'` y
+`remote_reference` no nulo. Devuelve bytes crudos con
+`Content-Type: application/octet-stream` y cabecera `X-Chunk-Hash` para que el
+cliente verifique el sha256 localmente.
 
-### GET /sessions/:id/manifest
+---
 
-Devuelve el manifest de reconstrucción de una sesión.
+## Estado de los destinos — defecto abierto
 
-Response:
+El esquema permite `status ∈ {connected, revoked, error}`, pero **ningún camino
+de código escribe `revoked` ni `error`**. Un destino Drive sigue reportándose
+`connected` después de que su refresh token haya sido revocado.
+
+Registrado como `GC-DEST-STATUS-001` (`OPEN`). Consumir `status` como prueba
+de que un destino funciona es incorrecto hoy.
+
+---
+
+## Evidence Manifest
+
+### GET /sessions/:id/manifest — NO IMPLEMENTADO
+
+Este endpoint **no existe**. Se documentó como futuro y sigue siéndolo.
+
+El manifest sí se genera, pero por otra vía: como efecto secundario de
+`POST /sessions/:id/complete`, y se consume desde `/recovery/manifests*`.
+
+Diseño previsto, sin implementar:
 
 ```json
 {
@@ -93,61 +219,25 @@ Response:
   "mode": "audio",
   "format": "m4a",
   "chunks": [
-    {
-      "index": 0,
-      "hash": "...",
-      "size": 16384,
-      "remote_reference": "drive_file_id"
-    }
+    { "index": 0, "hash": "...", "size": 32768, "remote_reference": "drive_file_id" }
   ]
 }
 ```
 
----
+Restricciones de diseño que siguen vigentes:
 
-### Notas
-
-* NO es necesario para el MVP
-* se basa en datos ya existentes (`chunks`)
-* no introduce nueva lógica de negocio
-* permite reconstrucción externa sin app
+* el manifest es una **vista derivada**, no una entidad nueva;
+* se genera desde la tabla de chunks más la metadata de sesión;
+* debe ser idempotente, no duplicar datos y no introducir estado adicional;
+* no es necesario para el MVP.
 
 ---
-
-### Decisión
-
-> El manifest es una vista derivada, no una entidad nueva
-
-Se genera a partir de:
-
-* tabla de chunks
-* metadata de sesión
-
----
-
-### Motivación
-
-Permitir:
-
-* reconstrucción manual
-* uso forense
-* independencia del cliente
-
----
-
-### Restricciones
-
-* debe ser idempotente
-* no duplicar datos
-* no introducir estado adicional
 
 ## Recovery
 
 ### GET /recovery/manifests
 
 Lista manifests recuperables del usuario.
-
-Response:
 
 ```json
 {
@@ -164,3 +254,38 @@ Response:
     }
   ]
 }
+```
+
+### GET /recovery/manifests/:manifest_file_id
+
+Devuelve un manifest concreto.
+
+### GET /recovery/chunks/:manifest_file_id/:chunk_index/download
+
+Descarga un chunk referenciado por un manifest, sin necesidad de que la sesión
+exista localmente. Es la ruta de reconstrucción desde otro dispositivo.
+
+---
+
+## Retirado de este documento
+
+Cuatro endpoints documentados que **nunca estuvieron montados**:
+
+| Endpoint retirado | Realidad |
+|---|---|
+| `POST /auth/login` | No existe. La identidad es anónima y la emite Supabase, no este backend |
+| `POST /auth/logout` | No existe. No hay sesión de servidor que cerrar |
+| `POST /alerts` | No existe. El modo alertas es post-MVP — ver [`POST_MVP_ROADMAP.md`](../strategy/POST_MVP_ROADMAP.md) |
+| `GET /alerts` | Ídem |
+
+Queda una referencia a `/alerts` en un comentario de
+`backend/src/middleware/auth.ts:9`, dentro del alcance de código y por tanto
+fuera del alcance de esta reconciliación documental.
+
+---
+
+## Notas
+
+- la API v1 no debe ser enorme
+- primero debe ser estable
+- la fuente de verdad crítica es el estado de sesión y chunk
