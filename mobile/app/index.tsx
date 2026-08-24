@@ -6174,18 +6174,27 @@ export default function Index() {
     //        replay after identity returns yields one row.
     // Chunks accumulate locally and the worker retries them; 401 and
     // SESSION_NOT_FOUND are both already classified transient.
-    // R5 — OWNERSHIP TOKEN. `POST /sessions` creates a `sessions` row keyed
-    // by (id, user_id): that is remote ownership, and it may not be created
-    // before `gc.identity.v1` is durable. A null answer here routes to the
-    // SAME deferral 4B already built, so nothing new is invented and the
-    // capture is not affected in any way.
-    const token = await getOwnershipAccessToken();
-    if (!token) {
-      console.log('GC_LOCAL_FIRST capture without identity', {
-        session_id: localSessionId,
-        mode: recordingMode,
-      });
-    }
+    // GC-START-LATENCY-001 — THE OWNERSHIP TOKEN IS NOT READ HERE.
+    //
+    // It used to be, and that `await` sat on the critical path between the
+    // tap and the first byte. `getOwnershipAccessToken()` goes through
+    // `supabase.auth.getSession()`, which refreshes over the network once
+    // the access token has expired, and NOTHING on that path carries a
+    // timeout: auth-js sets none, and the fetch wrapper adds none. (Our
+    // own backend client defaults to 10 s — see `src/api/client.ts`. The
+    // asymmetry was the defect.) With the remote unreachable, the recorder
+    // waited on a request the platform alone decided when to fail.
+    //
+    // The value was never needed here. Its only consumers live inside
+    // `sessionCreatePromise` below, which is deliberately NOT awaited
+    // before the recorder starts. Reading it there costs nothing and
+    // removes an entire class of "the network decides when you may begin
+    // gathering evidence" — which inverts the product.
+    //
+    // R5 is unaffected and travels with the read; see its docblock at the
+    // new site. Nothing else moves: `ensureMigrationBoundary()` still runs
+    // before any durable write, `queueAppendNewSession` still precedes the
+    // producer, and the deferral path is the one 4B already built.
 
     // ----- KICK in PARALLEL (do NOT await — recorder doesn't need them) -----
 
@@ -6253,6 +6262,26 @@ export default function Index() {
       destination_type: pinnedDestinationType,
     });
     const sessionCreatePromise: Promise<string> = (async () => {
+      // R5 — OWNERSHIP TOKEN. `POST /sessions` creates a `sessions` row
+      // keyed by (id, user_id): that is remote ownership, and it may not
+      // be created before `gc.identity.v1` is durable. The gate lives
+      // INSIDE `getOwnershipAccessToken`, which returns null unless the
+      // marker is durable — so reading the token here leaves R5 exactly as
+      // it was. The gate still closes in front of the POST, which is the
+      // only thing it ever guarded; it never guarded the capture.
+      //
+      // GC-START-LATENCY-001 — this is the read that used to block the
+      // critical path. It NEVER rejects (see its docblock): auth, storage
+      // or network failure all resolve to null, which routes to the same
+      // deferral below. Awaiting it here delays only the remote row.
+      const token = await getOwnershipAccessToken();
+      if (!token) {
+        console.log('GC_LOCAL_FIRST capture without identity', {
+          session_id: localSessionId,
+          mode: recordingMode,
+        });
+      }
+
       // GC-AUTH-001 (4B) — do not send a request we already know will
       // come back 401. With no token there is nothing to authenticate
       // with, so the round-trip buys nothing but latency, a log line
