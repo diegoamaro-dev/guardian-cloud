@@ -46,10 +46,11 @@ captura. `GC-AUD-001` deja de ser un defecto vigente.
 identidad/destino abiertos**. **Ya no por `GC-AUD-001`.**
 Empezar por [`START_HERE.md`](./START_HERE.md).
 
-> **Bloque de identidad (21/08 – 23/08).** Ocho findings registrados; **uno solo
-> cerrado en hardware** (`GC-AUTH-MIGRATION-001`). Un release blocker corregido
-> en código (`GC-DEV-RESET-001`), otro corregido pero sin revalidar en hardware
-> (`GC-DEST-PAUSE-001`) y cuatro abiertos, el más grave
+> **Bloque de identidad (21/08 – 24/08).** Ocho findings registrados; **uno
+> cerrado en hardware** (`GC-AUTH-MIGRATION-001`) y **otro revalidado en
+> hardware** el 24/08 (`GC-DEST-PAUSE-001`, `FIXED IN CODE` /
+> `HARDWARE REVALIDATED`). Un release blocker corregido en código
+> (`GC-DEV-RESET-001`) y cuatro abiertos, el más grave
 > `GC-AUTH-SESSION-RECOVERY-001`. Tabla completa en
 > [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md#findings-abiertos-de-identidad-destino-y-herramientas)
 > y detalle en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md).

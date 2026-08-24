@@ -2,7 +2,16 @@
 
 ⛔ NO APTO PARA RELEASE — por cifrado local, recovery `I5c`, export `.mp4`, cobertura de dispositivos **y cuatro findings de identidad/destino abiertos**. **Ya no por `GC-AUD-001`.**
 
-Estado vigente a 2026-08-23, sobre `34412a0`.
+| Qué | Cuándo / sobre qué |
+|---|---|
+| Estado documental vigente | **2026-08-24** |
+| Producto usado para la revalidación de `GC-DEST-PAUSE-001` | **`22a9b26`** (APK release `2b3be062…`) |
+| Última suite automática registrada | **2026-08-23**, sobre **`34412a0`** — 781/781 en 40 ficheros |
+
+> Las tres fechas son distintas a propósito. **781/781 NO se ejecutaron sobre
+> `22a9b26`**: esa cifra es del corte del 23/08 sobre `34412a0` y no se ha
+> vuelto a medir. La revalidación del 24/08 fue en hardware, no una corrida de
+> la suite.
 
 > **Corte anterior: 2026-08-20.** Entre el 20/08 y el 23/08 la rama
 > `fix/gc-auth-001-main-integration` incorporó seis commits que este documento
@@ -135,7 +144,15 @@ repositorio y **no tienen registro propio en `docs/`**.
 | `FIXED IN CODE` | La corrección está en la rama y cubierta por pruebas. **No** dice nada sobre dispositivo |
 | `CLOSED IN HARDWARE` | Reproducido y verificado corregido en dispositivo, con evidencia fechada |
 | `HARDWARE REVALIDATION REQUIRED` | Corregido en código; la corrida física que lo cerraría no se ha completado |
+| `HARDWARE REVALIDATED` | Una corrección ya implementada ha sido **reejecutada y revalidada con éxito en dispositivo real**, con evidencia fechada. Se escribe junto a `FIXED IN CODE`, no en su lugar |
 | `OPEN` | Observado y caracterizado. **Sin corregir** |
+
+> **`HARDWARE REVALIDATED` no es `CLOSED IN HARDWARE`.** En el segundo, el
+> dispositivo **reprodujo** el fallo y luego verificó su corrección: el ciclo
+> completo ocurrió allí. En el primero, el fallo se había caracterizado antes y
+> lo que el dispositivo acredita es que la corrección **funciona**. Es una
+> acreditación más débil en origen, no en rigor, y por eso el estado conserva
+> `FIXED IN CODE` delante. Ninguna etiqueta histórica se renombra por esto.
 
 ### Tabla
 
@@ -143,19 +160,20 @@ repositorio y **no tienen registro propio en `docs/`**.
 |---|---|---|---|
 | **GC-AUTH-MIGRATION-001** | **CLOSED IN HARDWARE** | `3f14063` | Único cierre en hardware del bloque. OnePlus A6000, 21/08, desde `pm clear`: la sonda selló el veredicto negativo en disco antes de que existiera un byte de captura |
 | **GC-DEV-RESET-001** | RELEASE BLOCKER · `FIXED IN CODE` / revalidación hardware **no requerida** | `e289dcb` | El defecto es de política de borrado, demostrable en pruebas. 62 tests en `devResetGuard.test.ts` |
-| **GC-DEST-PAUSE-001** | `FIXED IN CODE` / **`HARDWARE REVALIDATION REQUIRED`** | `3fae4f6` | La corrida de revalidación del 21/08 quedó **anulada** por la destrucción accidental de evidencia que originó GC-DEV-RESET-001 |
+| **GC-DEST-PAUSE-001** | `FIXED IN CODE` / **`HARDWARE REVALIDATED`** | `3fae4f6` | Revalidado el 24/08 como **cross-build durable-state recovery validation**: la pausa la escribió el build `34412a0`-era y la retiró producto `22a9b26`. Reconexión real por OAuth → pausa retirada → 10/10 chunks con referencias remotas distintas → `/complete` → cleanup, en ese orden. Identidad estable (`08c0875e`). La corrida del 21/08 había quedado **anulada** por GC-DEV-RESET-001. Detalle en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §3 |
 | **GC-AUTH-001** | `FIXED IN CODE` · ruta de identidad **PASS en hardware** · flujo extremo a extremo **no alcanzado** | `ad8756b`…`8615ba6`, integrados en `e215e5c` | La Vía 2 del 21/08 dio `Identity PASS` y `Registration PASS`, pero `Upload BLOCKED`, `Completion NOT REACHED` y `Cleanup NOT EXECUTED`. **No es un cierre** |
-| **GC-AUTH-SESSION-RECOVERY-001** | **`OPEN`** · mitigado, **validado en banco, NO en dispositivo** | D0 `02551a1`+`34412a0` · D2-B `08e3cd2` · D2-C sin commitear | Tras una ventana offline prolongada la sesión de Supabase desaparecía y 87 chunks quedaron sin poder subirse (22/08). **D2-B** (upgrade a 2.112.3) corrige la destrucción ante // y añade proactive-preserve y un cooldown de 60 s. **D2-C** clasifica  en el refresh como reintentable; todo lo demás hace pass-through fail-closed. Detalle en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §5 |
+| **GC-AUTH-SESSION-RECOVERY-001** | **`OPEN`** · mitigado, **validado en banco, NO en dispositivo** | D0 `02551a1`+`34412a0` · D2-B `08e3cd2` · D2-C `22a9b26` | Tras una ventana offline prolongada la sesión de Supabase desaparecía y 87 chunks quedaron sin poder subirse (22/08). **D2-B** (upgrade a 2.112.3) corrige la destrucción ante `500` / `502` / `525-529` y añade proactive-preserve y un cooldown de 60 s. **D2-C** clasifica `429` en el refresh como reintentable; todo lo demás hace pass-through fail-closed. Detalle en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §5 |
 | **GC-START-LATENCY-001** | **`OPEN`** | — | Con la red remota muerta, `startRecording` se bloquea ~4 min 30 s en `getOwnershipAccessToken()`. No aparece el diálogo de micrófono y la app parece colgada (22/08) |
 | **GC-DEST-STATUS-001** | **`OPEN`** · defecto de **backend** | — | Ningún camino de código escribe `revoked` ni `error`. Un destino Drive con refresh token revocado sigue reportándose `connected`. Ver [`API_SPEC.md`](./API_SPEC.md#estado-de-los-destinos--defecto-abierto) |
-| **GC-AUTH-RETRY-CLASSIFICATION-001** | **causa suficiente demostrada** · relación causal con el 22/08 **no probada** | banco `9d682bc` · D2-B `08e3cd2` · D2-C sin commitear | Dejó de ser estático: el banco reproduce de forma determinista que un / en el refresh destruye una credencial **intacta** (). Corregido para  por D2-B y para  por D2-C. **Sigue sin demostrarse** que el incidente del 22/08 fuera uno de esos dos: la respuesta nunca se capturó |
+| **GC-AUTH-RETRY-CLASSIFICATION-001** | **causa suficiente demostrada** · relación causal con el 22/08 **no probada** | banco `9d682bc` · D2-B `08e3cd2` · D2-C `22a9b26` | Dejó de ser estático: el banco reproduce de forma determinista que un `429` / `500` en el refresh destruye una credencial **intacta** (`refresh_present: true`). Corregido para `500` por D2-B y para `429` por D2-C. **Sigue sin demostrarse** que el incidente del 22/08 fuera uno de esos dos: la respuesta nunca se capturó |
 
 ### Consecuencia sobre el veredicto
 
 `GC-DEV-RESET-001` es **release blocker** por derecho propio: así lo declara
 [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §4. `GC-DEST-PAUSE-001` **no** lleva esa
-etiqueta en §3 y este documento no se la añade; lo que impide cerrarlo es que su
-corrida de revalidación física quedó anulada. `GC-AUTH-SESSION-RECOVERY-001`
+etiqueta en §3 y este documento no se la añade; su revalidación física, que el
+21/08 había quedado anulada, **se completó el 24/08**.
+`GC-AUTH-SESSION-RECOVERY-001`
 es el más grave de los abiertos: reproduce el modo de fallo que da nombre a
 `GC-AUTH-001` —evidencia que no puede salir del dispositivo— por una causa
 distinta y todavía sin corregir.
@@ -183,10 +201,10 @@ Ejecutada el 2026-08-23 sobre `34412a0`.
 | Typecheck | **12 errores TypeScript históricos, cero nuevos** — typecheck **NO** verde |
 | `git diff --check` | Limpio |
 
-> La cifra **360/360** que figuraba aquí correspondía al corte del 20/08. El
-> crecimiento hasta 738 proviene de los ficheros añadidos por los findings:
-> `devResetGuard` (62), `legacyProbeSeal` (52), `authDiagnostics` (46),
-> `ownershipGate` (26), `destinationPauseClear` (17), `ownershipBrand` (10).
+> La cifra **360/360** correspondía al corte del 20/08. La última ejecución
+> automática registrada es **781/781 en 40 ficheros**, ejecutada el
+> **2026-08-23 sobre `34412a0`**. Este documento **no atribuye los incrementos
+> intermedios a cambios concretos** sin un recuento acreditado.
 
 > **`:gc-segmented-recorder:compileDebugKotlin` no se ha reejecutado.** Su
 > `BUILD SUCCESSFUL` es del 20/08 y ningún commit posterior toca el módulo

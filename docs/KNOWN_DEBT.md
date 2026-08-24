@@ -47,6 +47,16 @@ Detalle completo en [`releases/v0.3.0-rc.1.md`](./releases/v0.3.0-rc.1.md) §7.
 - La ReliabilityCard **desplaza el botón principal** hacia abajo en Home.
 - El botón legacy de exención de batería en Ajustes coexiste a propósito con la
   tarjeta; su retirada está diferida.
+- **`Subiendo evidencia` con la cola pausada** *(UX observation, 2026-08-24 — no
+  es finding abierto)*. Con `uploading: 0` y el drain saliendo por
+  `all remaining entries paused`, Home rotula en ámbar **«Subiendo evidencia»**:
+  afirma una actividad que no está ocurriendo. Las dos líneas de apoyo sí eran
+  exactas —«Todavía no protegido fuera del dispositivo» y «Sin destino
+  conectado»—, así que el usuario no queda engañado sobre el riesgo, sólo sobre
+  el mecanismo. Observado durante la revalidación de `GC-DEST-PAUSE-001`, en 261
+  ciclos consecutivos de drain pausado. **Sin investigar y sin corregir**: se
+  registra para no perderlo. Es claridad de estado, no integridad — no se pierde
+  evidencia.
 
 ### Repositorio
 

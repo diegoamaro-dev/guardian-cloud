@@ -463,11 +463,65 @@ servidor.
 
 ## Estado
 
-**FIXED IN CODE / HARDWARE REVALIDATION REQUIRED.**
+**FIXED IN CODE / HARDWARE REVALIDATED.**
 
 Observado en hardware el 2026-08-21 (OnePlus A6000) durante la Vía 2 desde
-instalación limpia. **No cerrado en hardware:** la corrección está probada en
-código y pendiente de revalidación en dispositivo.
+instalación limpia. **Revalidado en hardware el 2026-08-24** sobre el mismo
+dispositivo. La corrida del 21/08 quedó anulada por
+[`GC-DEV-RESET-001`](#4-gc-dev-reset-001--una-herramienta-dev-podía-destruir-evidencia-pendiente);
+la del 24/08 es la que cuenta.
+
+---
+
+## Revalidación en hardware — 2026-08-24
+
+**Cross-build durable-state recovery validation.** No es una reproducción
+intra-build, y eso es parte de la provenance: **la pausa la escribió un build
+anterior** (era `34412a0`, sin D2-B ni D2-C, APK `ab3a638e…`, pausa sellada el
+2026-08-23T01:20:47Z) y **la retirada la ejecutó producto `22a9b26`** desde un
+APK release autónomo distinto (`2b3be062…`). El estado durable sobrevivió a la
+sustitución del paquete: `adb install -r` conservó `firstInstallTime`, así que
+`/data` no se borró en ningún momento.
+
+Precondición congelada y hasheada antes de instalar: sesión
+`3c86e4e2`, 10 chunks `pending`, `uploading 0`, `remote_reference` nulo,
+`gc.pause.global.v1` con `destinations.drive = DRIVE_NOT_CONNECTED`, backend
+con **0 de 10**. La pausa llevaba ~20 h en vigor.
+
+Cadena causal observada, en orden atribuible:
+
+| Hora (dispositivo) | Evento |
+|---|---|
+| 03:50:03 | `POST /destinations/drive/connect` — inicio del OAuth real |
+| 03:50:13 | vuelta del navegador; `POST …/connect` de cierre |
+| 03:50:13 – 03:50:17 | `drain exit — all remaining entries paused` — **la pausa todavía aguanta** |
+| 03:50:18.868 | `GC_QUEUE destination pause cleared { destinations: ['drive'] }` |
+| 03:50:18.921 | primer `POST /destinations/drive/chunks` — el drain vuelve a elegir |
+| 03:50:22 – 03:50:49 | 10 × `GC_PERF_DRAIN_POST_CHUNKS`; `pending` 10 → 0 |
+| 03:50:49.653 | `completion gate` `expected=10 uploaded=10 missing=[]` |
+| 03:50:49.654 | `POST /sessions/3c86e4e2…/complete` — **solo después** |
+| 03:50:52.569 | `GC_CLEANUP_AUTHORIZED { authorization: 'http_200' }` |
+| 03:50:52.594 | borrado del `.aac` — **después** de la autorización, nunca antes |
+
+10 `remote_reference` **distintas** para 10 chunks. Identidad estable durante
+todo el proceso: un único `user_prefix` (`08c0875e`), con `GC_ANON_SIGNIN`,
+`SIGNED_OUT` y `removeItem(primary_session)` a **cero**.
+
+**Lo que la prueba NO demuestra**, dicho explícitamente:
+
+- El campo `attempts` **no se emite** en esta ruta del drain. No existe registro
+  literal de «`attempts` deja de ser 0». Lo que sí consta —y es más fuerte— son
+  10 POST reales y 10 referencias remotas distintas.
+- El APK es release y por tanto **no** `debuggable`: sin `run-as` no se leyó
+  ningún estado privado posterior a la corrida. El veredicto se apoya en
+  logcat, en la respuesta del backend y en la baseline preservada.
+- `GC-DEST-STATUS-001` sigue abierto y no queda invalidado por esto: aquí Drive
+  se reconectó **explícitamente** por OAuth, así que un `connected` inmediatamente
+  posterior es atribuible al flujo real.
+
+Paquete de evidencia congelado, con barrido de secretos y `SHA256SUMS`
+verificado, en `2026-08-24-gc-dest-pause-001-revalidation` (fuera del
+repositorio).
 
 ---
 
@@ -540,12 +594,16 @@ señal desbloquearía un destino roto.
   token muerto limpiaría y el siguiente chunk volvería a pausar. Autolimitado y
   sin pérdida de evidencia.
 - **`systemic` sigue sin ruta de limpieza**, fuera de alcance por diseño.
-- **El cableado `refreshDestination → clearRecoveredDestinationPauses` no está
-  cubierto por tests**: `refreshDestination` es un closure de componente. La
+- **El cableado `refreshDestination → clearRecoveredDestinationPauses` sigue sin
+  cobertura de tests**: `refreshDestination` es un closure de componente. La
   función está probada con 17 tests y tres mutation tests; que el componente la
   invoque con las filas `status === 'connected'` —y no con
   `destinationResolved`— es una propiedad de orden de código, verificable
   leyendo el callsite. Es la misma limitación declarada para el hoist de R5.
+  > La revalidación del 24/08 **ejercitó ese cableado en hardware** y lo
+  > encontró correcto: la pausa se mantuvo mientras `destinationResolved` ya era
+  > `true` y sólo se retiró tras la reconexión real. Es una observación, no
+  > cobertura: la deuda de test sigue viva.
 
 ---
 

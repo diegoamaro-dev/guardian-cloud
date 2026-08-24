@@ -56,9 +56,15 @@ baseline `v0.3.0-rc.1`, no la rama actual.
 | Typecheck | **12 errores históricos, cero nuevos** — **NO** verde |
 | `git diff --check` | Limpio |
 
-El salto de 360 a 738 son los ficheros que trajeron los findings del bloque de
-identidad, no una ampliación de cobertura del vídeo. `compileDebugKotlin` no se
-ha reejecutado desde el 20/08.
+La cifra vigente es la de la tabla: **781 tests en 40 ficheros**, sobre
+`34412a0`. **De dónde procede cada incremento no está documentado**, y esta
+guía no se lo atribuye a nada. `compileDebugKotlin` no se ha reejecutado desde
+el 20/08.
+
+> Esta línea decía «el salto de 360 a 738 son los ficheros que trajeron los
+> findings del bloque de identidad, no una ampliación de cobertura del vídeo».
+> Retirada el 2026-08-24: las dos cifras contradecían la tabla inmediatamente
+> superior y la atribución no tenía un recuento detrás.
 
 ### Findings del 21/08 al 23/08
 
@@ -66,7 +72,7 @@ ha reejecutado desde el 20/08.
 |---|---|
 | GC-AUTH-MIGRATION-001 | **CLOSED IN HARDWARE** — el único cerrado |
 | GC-DEV-RESET-001 | RELEASE BLOCKER · `FIXED IN CODE`, revalidación no requerida |
-| GC-DEST-PAUSE-001 | `FIXED IN CODE`, **revalidación hardware pendiente** |
+| GC-DEST-PAUSE-001 | `FIXED IN CODE` / **`HARDWARE REVALIDATED`** — cross-build, 24/08 |
 | GC-AUTH-001 | `FIXED IN CODE`; identidad PASS en hardware, flujo completo **no alcanzado** |
 | GC-AUTH-SESSION-RECOVERY-001 | **`OPEN`** — mitigado por D2-B y D2-C, **validado en banco, NO en dispositivo** |
 | GC-START-LATENCY-001 | **`OPEN`** |
@@ -89,16 +95,20 @@ Los motivos son ahora otros, y ninguno es la captura de vídeo:
    Android 13+;
 5. **recovery completo de vídeo** no demostrado;
 6. sin AAB de producción, Closed Testing ni usuarios externos;
-7. **`GC-DEST-PAUSE-001`** — corregido en código, sin revalidación física;
-8. **`GC-DEV-RESET-001`** — corregido en código;
-9. **`GC-AUTH-SESSION-RECOVERY-001`** — abierto: la sesión de Supabase
+7. **`GC-DEV-RESET-001`** — corregido en código;
+8. **`GC-AUTH-SESSION-RECOVERY-001`** — abierto: la sesión de Supabase
    desaparece tras una ventana offline prolongada y la evidencia queda sin
    poder subirse;
-10. **invariante de migración de identidad** — `RELEASE_CHECKLIST_v0.3.md` §0
-    prohíbe publicar `8615ba6` en un build sin `gc.legacy_probe.v1`.
+9. **invariante de migración de identidad** — `RELEASE_CHECKLIST_v0.3.md` §0
+   prohíbe publicar `8615ba6` en un build sin `gc.legacy_probe.v1`.
 
-La validación del 20/08 no cubre ninguno de esos diez puntos y no debe leerse
+La validación del 20/08 no cubre ninguno de esos nueve puntos y no debe leerse
 como si lo hiciera.
+
+> **`GC-DEST-PAUSE-001` salió de esta lista el 2026-08-24**, al completarse su
+> revalidación en hardware. Era el punto 7. No estaba etiquetado como release
+> blocker, así que su cierre no mueve el veredicto: el sistema **sigue
+> `NO APTO PARA RELEASE`** por los nueve motivos de arriba.
 
 ### Baseline técnica histórica (2026-07-30)
 

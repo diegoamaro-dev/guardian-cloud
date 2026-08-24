@@ -34,7 +34,7 @@ exhaustivo**: marca el nivel que se puede acreditar, no el máximo alcanzable.
 | 3 — Cierre forzado | `HARDWARE_VALIDATED` | Vía 2 fase 2.3, 21/08 · `durableBeforeBackend`, `captureWhileDegraded`, `finalize`, `normalize` |
 | 4 — Reinicio del dispositivo | `PROBADO EN TESTS` · **HARDWARE PENDIENTE** | `drainPause`. El recovery autónomo tras reinicio (`I5c`) **no está implementado** |
 | 5 — Permisos denegados | `DEFINIDO` | Sin cobertura automática identificada |
-| 6 — Drive desconectado | `PROBADO EN TESTS` | `drainPause`, `destinationPauseClear`, `authPauseRecovery`. **`GC-DEST-STATUS-001` abierto**: `connected` no prueba que el destino funcione |
+| 6 — Drive desconectado | `HARDWARE_VALIDATED` | Revalidación `GC-DEST-PAUSE-001` del 24/08 (cross-build): pausa `DRIVE_NOT_CONNECTED` sostenida ~20 h, reconexión real por OAuth, retirada de la pausa y drenaje de 10/10 con referencias remotas distintas. Además `drainPause`, `destinationPauseClear`, `authPauseRecovery`. **`GC-DEST-STATUS-001` sigue abierto**: `connected` no prueba que el destino funcione |
 | 7 — Chunk duplicado | `PROBADO EN TESTS` | `normalize` (pasos 2 y 3) · idempotencia de backend por `UNIQUE(session_id, chunk_index)` |
 | 8 — Batería baja | `DEFINIDO` | Sin cobertura automática identificada |
 | 9 — Historial | `DEFINIDO` | Sin cobertura automática identificada |
