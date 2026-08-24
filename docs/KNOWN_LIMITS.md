@@ -964,7 +964,7 @@ dispositivo.**
 D2-B = IMPLEMENTED / VALIDATED IN TEST BENCH   upgrade a @supabase/supabase-js 2.112.3
 D2-C = IMPLEMENTED / VALIDATED IN TEST BENCH   clasificador de rate limit del refresh
 GC-AUTH-SESSION-RECOVERY-001 = OPEN
-GC-START-LATENCY-001         = OPEN
+GC-START-LATENCY-001         = FIXED IN CODE / HARDWARE VALIDATED   (2026-08-24, §6)
 ```
 
 No se declara `HARDWARE_VALIDATED`. No se declara cerrado ningún release
@@ -1177,11 +1177,14 @@ destruir la credencial.
 - **Validación en hardware.** Nada de esto se ha ejecutado en dispositivo. El
   banco prueba la mecánica de `auth-js` y de nuestro clasificador; no prueba el
   comportamiento del producto bajo estrés real.
-- **`GC-START-LATENCY-001`**, abierto y ahora cuantificado: el camino de
-  `auth-js` puede consumir **~25,4 s de backoff**, y `startRecording` espera a
-  `getOwnershipAccessToken()`. Esa exposición **la introdujo D2-B** al hacer
-  reintentable el `500`; D2-C no la agrava ni la corrige, y su cierre pertenece
-  a ese finding.
+- **`GC-START-LATENCY-001`** — **cerrado el 2026-08-24**, ver §6. Cuando se
+  escribió esta línea el camino de `auth-js` podía consumir **~25,4 s de
+  backoff** y `startRecording` esperaba a `getOwnershipAccessToken()`. Esa
+  exposición **la introdujo D2-B** al hacer reintentable el `500`; D2-C no la
+  agravó ni la corrigió. Lo que la cerró fue sacar esa espera del camino
+  crítico, no acelerar `auth-js`: **el backoff sigue existiendo y sigue
+  tardando** — en hardware se midieron 25,76 s — pero ya no retiene al
+  productor.
 - **Rate limit sostenido.** El dispositivo conservaría la credencial sin poder
   usarla. Es evidencia preservada, no recuperación.
 - **La causa histórica del 22/08 sigue sin demostrar**, y ninguna prueba futura
@@ -1201,3 +1204,151 @@ destruir la credencial.
 - **No vetar el borrado desde el adaptador de storage.** `_removeSession` limpia
   `lastRefreshFailure` **antes** de tocar storage, así que el veto desactivaría
   el cooldown de 60 s que es justo la protección anti-storm que trajo D2-B.
+
+---
+
+# 6. GC-START-LATENCY-001 — el arranque de la captura esperaba a la red
+
+## Estado
+
+**FIXED IN CODE / HARDWARE VALIDATED.**
+
+Corregido en `e643b01`; guardas de test alineadas en `3c10994`. Validado en
+hardware el **2026-08-24** sobre OnePlus A6000 / Android 11, en dos escenarios
+independientes, con APK release
+`1cb80feae1e7991b08d3293e5172423c5e4c5e712ded3157213f34a2f7da06a9` construido
+desde producto puro.
+
+---
+
+## El defecto
+
+`startRecording` hacía `await getOwnershipAccessToken()` **antes** de abrir la
+grabadora. Esa llamada pasa por `supabase.auth.getSession()`, que renueva por
+red en cuanto el access token ha caducado, y **nada en ese camino lleva
+timeout**: ni `auth-js`, ni el wrapper de fetch. El cliente de nuestro propio
+backend sí lo tiene —10 s por defecto en `src/api/client.ts`—, y esa asimetría
+era el defecto.
+
+Con el remoto inalcanzable, el usuario pulsaba GRABAR y no se capturaba nada
+mientras la petición seguía viva. Invierte la promesa del producto: el backend
+es a dónde **va** la evidencia, no el permiso para recogerla.
+
+> El valor esperado nunca hizo falta ahí. Sus únicos consumidores viven dentro
+> de `sessionCreatePromise`, que deliberadamente **no** se espera antes del
+> productor.
+
+---
+
+## La corrección
+
+Mover esa lectura al interior de `sessionCreatePromise`. Nada más: la misma
+llamada, el mismo log, la misma rama `!token` hacia
+`schedulePendingSessionRegistration`. R5 no se toca — el gate de ownership
+protege el `POST /sessions`, no la captura, y sigue delante del POST.
+
+---
+
+## Evidencia en hardware — 2026-08-24
+
+### H2 · remoto vivo
+
+```
+tap → productor vivo      531 ms
+  − SO / permisos         130 ms   (automático, sin diálogo humano)
+  − hardware              238 ms   (abrir la grabadora)
+  = lógica Guardian Cloud 163 ms
+
+28 de 29 fragmentos confirmados remotamente ANTES de pulsar PARAR
+primer remote_reference 104 s antes del cierre
+```
+
+**El fix no compró velocidad de arranque a costa de la subida durante la
+grabación.** Ésa era la forma de fallo que habría invalidado el cambio aunque
+el arranque fuera instantáneo.
+
+### H1 · token caducado + modo avión
+
+```
+tap → productor vivo      243 ms
+  − SO / permisos          79 ms
+  − hardware               62 ms
+  = lógica Guardian Cloud 102 ms
+
+auth resolvió (a null)    10,72 s DESPUÉS de que el productor ya grababa
+```
+
+Condiciones reales, sin fabricar nada: el token caducó **solo**, con el
+dispositivo ya en modo avión; ni se tocó el reloj, ni el almacenamiento, ni la
+sesión. El refresh proactivo falló a los 25,76 s con `AuthRetryableFetchError`
+—lo que confirma en hardware el techo de backoff de `auth-js`— y la sesión
+sobrevivió: `removeItem` 0, `SIGNED_OUT` 0, `GC_ANON_SIGNIN` 0.
+
+> **Redacción que importa: auth no se volvió rápida.** Siguió tardando 10,72 s
+> en resolver, y su backoff sigue midiendo decenas de segundos. Lo que cambió
+> es que **dejó de bloquear el arranque**. Cualquier lectura futura que
+> convierta esto en «auth ahora es rápida» es falsa.
+
+### Recuperación tras restaurar la red
+
+```
+mismo localSessionId      eb6c456b-7156-48e2-b232-79795d6e9c5f
+POST /sessions            1        (una sola sesión remota)
+chunks confirmados        77 / 77
+remote_reference          77 únicas
+completion gate           77 / 77 · missingUploadedIndexes []
+cleanup                   posterior a la autorización http_200
+identidad                 08c0875e, estable en toda la corrida
+```
+
+Once segundos desde que vuelve la red hasta que hay token; 37 ms más hasta
+retirar la pausa `client_auth: NO_TOKEN`. Un `404` en el primer fragmento
+—salió 83 ms antes de que existiera la fila remota— se clasificó **transitorio**
+y se reintentó con éxito: es el comportamiento diseñado, no un defecto.
+
+---
+
+## Durabilidad de la cola: las dos ramas NO son iguales
+
+Esto se documenta aquí porque el primer intento de proteger la corrección con
+tests impuso a audio una propiedad que sólo es cierta en vídeo.
+
+```
+native segmented video    GC_QUEUE durable  →  productor
+
+audio / legacy            productor (es lo que produce el cacheUri)
+                          →  GC_QUEUE durable
+                          →  primer chunk
+```
+
+Audio **no puede** escribir la entrada primero: la entrada lleva `cacheUri`, y
+esa ruta no existe hasta que la grabadora ha abierto el fichero. La propiedad
+que protege la evidencia en esa rama no es «durable antes del productor» sino
+**«durable antes de que exista ningún fragmento»**. Medida dos veces ese día:
+5,04 s de margen con el remoto vivo, 12,28 s con el remoto inalcanzable. La
+ventana productor→persistencia fue de 13 ms y 9 ms respectivamente, con cero
+bytes producidos.
+
+No generalizar una rama a la otra. `devResetGuard.test.ts` ya lo decía —«audio
+y vídeo legacy abren la grabadora primero; el vídeo segmentado nativo escribe
+4A primero»— y `startLatencyDecoupling.test.ts` lo protege desde `3c10994` con
+aserciones acotadas por rama.
+
+---
+
+## Residuales
+
+- **La ruta de auth de Supabase sigue sin timeout.** Este finding la sacó del
+  camino crítico del arranque; **no la acotó**. Cualquier otro llamante —el
+  drain, por ejemplo— sigue expuesto a una petición que sólo la plataforma
+  decide cuándo abandonar. Es un defecto por derecho propio y no se cierra
+  aquí.
+- **La cifra «~4 min 30 s» del 22/08 nunca se reprodujo ni se explicó.** No hay
+  ninguna constante en el código que la produzca: el bucle de reintentos de
+  `auth-js` está acotado a 30 s. Lo que quedó demostrado es la clase de fallo,
+  no aquella duración concreta, cuya medición nunca se capturó.
+- **Sin `run-as`**: el APK es release y no `debuggable`, así que no se leyó
+  ningún estado privado posterior a la corrida. El veredicto se apoya en
+  logcat, en las respuestas del backend y en la baseline preservada.
+- **Un solo dispositivo.** OnePlus A6000 / Android 11 / API 30. No implica
+  cobertura multi-dispositivo ni Android 13+.

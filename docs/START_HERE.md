@@ -1,6 +1,6 @@
 # Guardian Cloud — START HERE
 
-⛔ NO APTO PARA RELEASE — por cifrado local, recovery `I5c`, export `.mp4`, cobertura de dispositivos **y cuatro findings de identidad/destino abiertos**. **Ya no por `GC-AUD-001`.**
+⛔ NO APTO PARA RELEASE — por cifrado local, recovery `I5c`, export `.mp4`, cobertura de dispositivos **y findings de identidad/destino todavía no cerrados**. **Ya no por `GC-AUD-001`.**
 
 Este documento contiene referencias históricas que deben leerse con la fecha y
 el alcance de su evidencia. El estado vigente se reconstruye desde:
@@ -13,9 +13,11 @@ el alcance de su evidencia. El estado vigente se reconstruye desde:
 * [validación física del vídeo nativo con durable cleanup del 20/08](./audits/GUARDIAN_CLOUD_NATIVE_SEGMENTED_DURABLE_CLEANUP_VALIDATION_2026-08-20.md);
 * [validación física de la integración nativa segmentada del 13/08](./audits/GUARDIAN_CLOUD_NATIVE_SEGMENTED_INTEGRATION_VALIDATION_2026-08-13.md).
 
-> **Lee esto antes que nada.** Entre el 21/08 y el 23/08 aparecieron ocho
-> findings de identidad, destino y herramientas de desarrollo. **Uno solo está
-> cerrado en hardware**; cuatro siguen abiertos. Todo lo que este documento
+> **Lee esto antes que nada.** Entre el 21/08 y el 24/08 aparecieron ocho
+> findings de identidad, destino y herramientas de desarrollo. **Uno está
+> `CLOSED IN HARDWARE`**; los demás permanecen corregidos o abiertos con
+> distintos niveles de validación, y **la tabla canónica define el estado
+> exacto de cada uno**. Todo lo que este documento
 > describe como validado el 20/08 sigue siendo cierto, pero **no cubre nada de
 > ese bloque**. La tabla completa está en
 > [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md#findings-abiertos-de-identidad-destino-y-herramientas).
@@ -48,25 +50,26 @@ baseline `v0.3.0-rc.1`, no la rama actual.
 * **Validación automática de aquel corte:** 360/360 tests. *(Cifra histórica del
   20/08. La vigente está más abajo.)*
 
-### Validación automática vigente (2026-08-23, sobre `34412a0`)
+### Validación automática vigente (2026-08-24, tras `3c10994`)
 
 | Comprobación | Resultado |
 |---|---|
-| Suite completa | **781/781**, en **40 ficheros** |
+| Suite completa | **792/792**, en **41 ficheros** |
 | Typecheck | **12 errores históricos, cero nuevos** — **NO** verde |
 | `git diff --check` | Limpio |
 
-La cifra vigente es la de la tabla: **781 tests en 40 ficheros**, sobre
-`34412a0`. **De dónde procede cada incremento no está documentado**, y esta
-guía no se lo atribuye a nada. `compileDebugKotlin` no se ha reejecutado desde
-el 20/08.
+La cifra vigente es la de la tabla: **792 tests en 41 ficheros**, sobre el
+árbol posterior a `3c10994`. El fichero 41 es
+`startLatencyDecoupling.test.ts`, que aportó 11 de esos tests; **del resto de
+incrementos históricos no hay recuento documentado**, y esta guía no se los
+atribuye a nada. `compileDebugKotlin` no se ha reejecutado desde el 20/08.
 
 > Esta línea decía «el salto de 360 a 738 son los ficheros que trajeron los
 > findings del bloque de identidad, no una ampliación de cobertura del vídeo».
 > Retirada el 2026-08-24: las dos cifras contradecían la tabla inmediatamente
 > superior y la atribución no tenía un recuento detrás.
 
-### Findings del 21/08 al 23/08
+### Findings del 21/08 al 24/08
 
 | Finding | Estado |
 |---|---|
@@ -75,13 +78,13 @@ el 20/08.
 | GC-DEST-PAUSE-001 | `FIXED IN CODE` / **`HARDWARE REVALIDATED`** — cross-build, 24/08 |
 | GC-AUTH-001 | `FIXED IN CODE`; identidad PASS en hardware, flujo completo **no alcanzado** |
 | GC-AUTH-SESSION-RECOVERY-001 | **`OPEN`** — mitigado por D2-B y D2-C, **validado en banco, NO en dispositivo** |
-| GC-START-LATENCY-001 | **`OPEN`** |
+| GC-START-LATENCY-001 | `FIXED IN CODE` / **`HARDWARE VALIDATED`** — 24/08; auth dejó de bloquear el arranque, no se volvió rápida |
 | GC-DEST-STATUS-001 | **`OPEN`** — backend |
 | GC-AUTH-RETRY-CLASSIFICATION-001 | causa **suficiente** demostrada; causalidad con el 22/08 **no** probada |
 
 Detalle y alcance exacto de cada uno en
 [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md#findings-abiertos-de-identidad-destino-y-herramientas)
-y en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §1–§5.
+y en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §1–§6.
 
 ### Por qué sigue `NO APTO PARA RELEASE`
 

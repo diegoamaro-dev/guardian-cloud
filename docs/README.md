@@ -42,15 +42,16 @@ captura. `GC-AUD-001` deja de ser un defecto vigente.
 ## ⚙️ Estado actual
 
 ⛔ **Veredicto vigente: `NO APTO PARA RELEASE`** — por cifrado local, recovery
-`I5c`, export `.mp4`, cobertura de dispositivos **y cuatro findings de
-identidad/destino abiertos**. **Ya no por `GC-AUD-001`.**
+`I5c`, export `.mp4`, cobertura de dispositivos **y findings de
+identidad/destino todavía no cerrados**. **Ya no por `GC-AUD-001`.**
 Empezar por [`START_HERE.md`](./START_HERE.md).
 
 > **Bloque de identidad (21/08 – 24/08).** Ocho findings registrados; **uno
 > cerrado en hardware** (`GC-AUTH-MIGRATION-001`) y **otro revalidado en
 > hardware** el 24/08 (`GC-DEST-PAUSE-001`, `FIXED IN CODE` /
 > `HARDWARE REVALIDATED`). Un release blocker corregido en código
-> (`GC-DEV-RESET-001`) y cuatro abiertos, el más grave
+> (`GC-DEV-RESET-001`). Los demás permanecen corregidos o abiertos con
+> distintos niveles de validación; el más grave de los que siguen `OPEN` es
 > `GC-AUTH-SESSION-RECOVERY-001`. Tabla completa en
 > [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md#findings-abiertos-de-identidad-destino-y-herramientas)
 > y detalle en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md).
@@ -90,8 +91,10 @@ El sistema actualmente:
 * ❌ un solo dispositivo validado: sin cobertura multi-dispositivo ni Android 13+
 * ❌ **la sesión de Supabase puede desaparecer tras una ventana offline
   prolongada y dejar la evidencia sin poder subirse** (`GC-AUTH-SESSION-RECOVERY-001`, abierto)
-* ❌ **el inicio de captura se bloquea ~4½ min con la red remota muerta**
-  (`GC-START-LATENCY-001`, abierto)
+* ✅ `GC-START-LATENCY-001` = **`FIXED IN CODE` / `HARDWARE VALIDATED`** (24/08).
+  Aquí decía que «el inicio de captura se bloquea ~4½ min con la red remota
+  muerta». Ya no: **auth puede seguir tardando, pero ya no bloquea START**.
+  Detalle en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §6
 * ❌ **un destino Drive revocado sigue reportándose `connected`**
   (`GC-DEST-STATUS-001`, abierto, backend)
 
@@ -128,7 +131,7 @@ Leer en este orden:
 
 1. docs/START_HERE.md
 2. **docs/IMPLEMENTATION_STATUS.md** — referencia canónica de qué está implementado y qué validado
-3. **docs/KNOWN_LIMITS.md** — límites vigentes y findings §1–§5
+3. **docs/KNOWN_LIMITS.md** — límites vigentes y findings §1–§6
 4. **docs/RELEASE_CHECKLIST_v0.3.md** — §0 es un invariante **bloqueante** de release
 5. **docs/releases/v0.3.0-rc.1.md** — baseline técnica vigente
 6. **docs/DEVELOPMENT_WORKFLOW.md** — cómo se avanza sobre la baseline
@@ -156,8 +159,8 @@ se fija aquí ninguna cifra como objetivo: quedaría obsoleta al añadir pruebas
 empujaría a «arreglar» el documento en vez del código. Registrar el total
 observado al ejecutarla.
 
-Última ejecución registrada: **781/781 en 40 ficheros**, el 2026-08-23 sobre
-`34412a0`.
+Última ejecución registrada: **792/792 en 41 ficheros**, el 2026-08-24, tras
+`3c10994`.
 
 **12 errores TypeScript heredados** (typecheck **NO** verde) · sin CI.
 

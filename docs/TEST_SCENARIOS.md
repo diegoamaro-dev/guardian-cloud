@@ -24,13 +24,16 @@ validación del repositorio, y se mantiene explícita para no repetirlo.
 
 ### Estado por escenario
 
-Mapeo por asunto de los ficheros de prueba, sobre `34412a0`. **No es
-exhaustivo**: marca el nivel que se puede acreditar, no el máximo alcanzable.
+Mapeo por asunto de los ficheros de prueba, sobre la **evidencia vigente**.
+**No corresponde a un único commit ni a un único artefacto**: la tabla mezcla
+validaciones de hardware, corridas de la suite y findings fechados en momentos
+distintos, y cada fila declara su propia procedencia. **No es exhaustivo**:
+marca el nivel que se puede acreditar, no el máximo alcanzable.
 
 | Escenario | Nivel | Acreditación |
 |---|---|---|
 | 1 — Grabación corta | `HARDWARE_VALIDATED` | Validación 20/08 (vídeo) · `durableBeforeBackend`, `queue` |
-| 2 — Pérdida de conexión | `PROBADO EN TESTS` · **HARDWARE PENDIENTE** | `drainPause`, `errorPolicy`, `classifyError`, `deferredRegistration`, `captureWhileDegraded`. **`GC-START-LATENCY-001` está abierto en esta condición exacta** |
+| 2 — Pérdida de conexión | `HARDWARE_VALIDATED` | Escenario H1 de `GC-START-LATENCY-001`, 24/08: con el token caducado y el dispositivo en modo avión, la captura arrancó en 243 ms, encoló 77 fragmentos de forma durable y, al restaurar la red, el registro diferido convergió con el **mismo** `localSessionId` y drenó 77/77. Además `drainPause`, `errorPolicy`, `classifyError`, `deferredRegistration`, `captureWhileDegraded`. **La ruta de auth de Supabase sigue sin timeout** — ver [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §6, residuales |
 | 3 — Cierre forzado | `HARDWARE_VALIDATED` | Vía 2 fase 2.3, 21/08 · `durableBeforeBackend`, `captureWhileDegraded`, `finalize`, `normalize` |
 | 4 — Reinicio del dispositivo | `PROBADO EN TESTS` · **HARDWARE PENDIENTE** | `drainPause`. El recovery autónomo tras reinicio (`I5c`) **no está implementado** |
 | 5 — Permisos denegados | `DEFINIDO` | Sin cobertura automática identificada |
@@ -64,11 +67,13 @@ documento, pero sí cobertura automática densa: `legacyProbeSeal` (52),
   [validación del 20/08](./audits/GUARDIAN_CLOUD_NATIVE_SEGMENTED_DURABLE_CLEANUP_VALIDATION_2026-08-20.md).
 * También está `HARDWARE_VALIDATED` el recovery real de una sesión pendiente
   tras restaurar la autorización de Drive.
-* Validación automática vigente, ejecutada el 2026-08-23 sobre `34412a0`:
-  **781/781 tests en 40 ficheros**; 12 errores TypeScript históricos y cero
-  nuevos; `git diff --check` limpio. `compileDebugKotlin` dio
-  `BUILD SUCCESSFUL` el 20/08 y **no se ha reejecutado desde entonces**.
-  *(La cifra 360/360 que figuraba aquí era del corte del 20/08.)*
+* Validación automática vigente, ejecutada el 2026-08-24 sobre el árbol
+  posterior a `3c10994`: **792/792 tests en 41 ficheros**; 12 errores
+  TypeScript históricos y cero nuevos; `git diff --check` limpio.
+  `compileDebugKotlin` dio `BUILD SUCCESSFUL` el 20/08 y **no se ha reejecutado
+  desde entonces**.
+  *(Cifras anteriores de esta línea: 360/360 en el corte del 20/08 y 781/781 en
+  el del 23/08 sobre `34412a0`.)*
 * **No** se declaran validados: recovery completo de vídeo, export final
   `.mp4`, cobertura multi-dispositivo, Android 13+ ni las rutas artificiales de
   fallo del scheduler.

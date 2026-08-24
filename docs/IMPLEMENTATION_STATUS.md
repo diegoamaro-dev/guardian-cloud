@@ -1,17 +1,18 @@
 # IMPLEMENTATION_STATUS.md
 
-⛔ NO APTO PARA RELEASE — por cifrado local, recovery `I5c`, export `.mp4`, cobertura de dispositivos **y cuatro findings de identidad/destino abiertos**. **Ya no por `GC-AUD-001`.**
+⛔ NO APTO PARA RELEASE — por cifrado local, recovery `I5c`, export `.mp4`, cobertura de dispositivos **y findings de identidad/destino todavía no cerrados**. **Ya no por `GC-AUD-001`.**
 
 | Qué | Cuándo / sobre qué |
 |---|---|
 | Estado documental vigente | **2026-08-24** |
 | Producto usado para la revalidación de `GC-DEST-PAUSE-001` | **`22a9b26`** (APK release `2b3be062…`) |
-| Última suite automática registrada | **2026-08-23**, sobre **`34412a0`** — 781/781 en 40 ficheros |
+| Producto usado para la validación de `GC-START-LATENCY-001` | **`e643b01`** (APK release `1cb80fea…`) |
+| Última suite automática registrada | **2026-08-24**, tras **`3c10994`** — 792/792 en 41 ficheros · typecheck 12, sin drift |
 
-> Las tres fechas son distintas a propósito. **781/781 NO se ejecutaron sobre
-> `22a9b26`**: esa cifra es del corte del 23/08 sobre `34412a0` y no se ha
-> vuelto a medir. La revalidación del 24/08 fue en hardware, no una corrida de
-> la suite.
+> Las fechas y los commits son distintos a propósito, y no deben fundirse. La
+> suite se midió sobre el árbol posterior a `3c10994`; las dos validaciones de
+> hardware se hicieron en dispositivo, no corriendo la suite, y cada una sobre
+> su propio APK. **Ninguna cifra de tests describe un APK.**
 
 > **Corte anterior: 2026-08-20.** Entre el 20/08 y el 23/08 la rama
 > `fix/gc-auth-001-main-integration` incorporó seis commits que este documento
@@ -21,7 +22,7 @@
 
 Fuentes de continuidad y evidencia:
 
-* [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) — límites vigentes y findings §1–§5;
+* [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) — límites vigentes y findings §1–§6;
 * [`RELEASE_CHECKLIST_v0.3.md`](./RELEASE_CHECKLIST_v0.3.md) §0 — invariante de migración de identidad, bloqueante;
 * [validación física del vídeo nativo con durable cleanup del 20/08](./audits/GUARDIAN_CLOUD_NATIVE_SEGMENTED_DURABLE_CLEANUP_VALIDATION_2026-08-20.md);
 * [validación física de la integración nativa segmentada del 13/08](./audits/GUARDIAN_CLOUD_NATIVE_SEGMENTED_INTEGRATION_VALIDATION_2026-08-13.md);
@@ -131,11 +132,11 @@ Demostrado **sólo por pruebas automáticas**, pendiente de hardware:
 
 ## Findings abiertos de identidad, destino y herramientas
 
-Ocho findings registrados entre el 20/08 y el 23/08. **Ninguno está CLOSED
-salvo donde se indica explícitamente.** Los estados de §1–§5 son los de
-[`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md); `GC-START-LATENCY-001` y
-`GC-DEST-STATUS-001` provienen de sus fichas de evidencia congeladas fuera del
-repositorio y **no tienen registro propio en `docs/`**.
+Ocho findings registrados entre el 20/08 y el 24/08. **Ninguno está CLOSED
+salvo donde se indica explícitamente.** Los estados de §1–§6 son los de
+[`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md). `GC-START-LATENCY-001` **ya tiene
+registro propio** desde el 24/08 —§6—; sólo `GC-DEST-STATUS-001` sigue
+proviniendo de una ficha de evidencia congelada fuera del repositorio.
 
 ### Vocabulario de estado
 
@@ -163,7 +164,7 @@ repositorio y **no tienen registro propio en `docs/`**.
 | **GC-DEST-PAUSE-001** | `FIXED IN CODE` / **`HARDWARE REVALIDATED`** | `3fae4f6` | Revalidado el 24/08 como **cross-build durable-state recovery validation**: la pausa la escribió el build `34412a0`-era y la retiró producto `22a9b26`. Reconexión real por OAuth → pausa retirada → 10/10 chunks con referencias remotas distintas → `/complete` → cleanup, en ese orden. Identidad estable (`08c0875e`). La corrida del 21/08 había quedado **anulada** por GC-DEV-RESET-001. Detalle en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §3 |
 | **GC-AUTH-001** | `FIXED IN CODE` · ruta de identidad **PASS en hardware** · flujo extremo a extremo **no alcanzado** | `ad8756b`…`8615ba6`, integrados en `e215e5c` | La Vía 2 del 21/08 dio `Identity PASS` y `Registration PASS`, pero `Upload BLOCKED`, `Completion NOT REACHED` y `Cleanup NOT EXECUTED`. **No es un cierre** |
 | **GC-AUTH-SESSION-RECOVERY-001** | **`OPEN`** · mitigado, **validado en banco, NO en dispositivo** | D0 `02551a1`+`34412a0` · D2-B `08e3cd2` · D2-C `22a9b26` | Tras una ventana offline prolongada la sesión de Supabase desaparecía y 87 chunks quedaron sin poder subirse (22/08). **D2-B** (upgrade a 2.112.3) corrige la destrucción ante `500` / `502` / `525-529` y añade proactive-preserve y un cooldown de 60 s. **D2-C** clasifica `429` en el refresh como reintentable; todo lo demás hace pass-through fail-closed. Detalle en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §5 |
-| **GC-START-LATENCY-001** | **`OPEN`** | — | Con la red remota muerta, `startRecording` se bloquea ~4 min 30 s en `getOwnershipAccessToken()`. No aparece el diálogo de micrófono y la app parece colgada (22/08) |
+| **GC-START-LATENCY-001** | `FIXED IN CODE` / **`HARDWARE VALIDATED`** | producto `e643b01` · guardas de test `3c10994` | `startRecording` esperaba a `getOwnershipAccessToken()` antes de abrir la grabadora, y esa ruta de auth **no lleva timeout en ninguna capa**. La lectura se movió dentro de `sessionCreatePromise`, que no se espera antes del productor. Validado en hardware el 24/08 en dos escenarios: **remoto vivo** — 531 ms tap→productor, 163 ms de lógica propia, 28/29 fragmentos confirmados **antes** de PARAR — y **token caducado + modo avión** — 243 ms tap→productor, 102 ms de lógica propia, con auth resolviendo **10,72 s después** de que el productor ya grababa. **auth no se volvió rápida: dejó de bloquear START.** Recuperación tras restaurar red: mismo `localSessionId`, 1 `POST /sessions`, 77/77 confirmados, cleanup posterior a `http_200`. Detalle en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §6 |
 | **GC-DEST-STATUS-001** | **`OPEN`** · defecto de **backend** | — | Ningún camino de código escribe `revoked` ni `error`. Un destino Drive con refresh token revocado sigue reportándose `connected`. Ver [`API_SPEC.md`](./API_SPEC.md#estado-de-los-destinos--defecto-abierto) |
 | **GC-AUTH-RETRY-CLASSIFICATION-001** | **causa suficiente demostrada** · relación causal con el 22/08 **no probada** | banco `9d682bc` · D2-B `08e3cd2` · D2-C `22a9b26` | Dejó de ser estático: el banco reproduce de forma determinista que un `429` / `500` en el refresh destruye una credencial **intacta** (`refresh_present: true`). Corregido para `500` por D2-B y para `429` por D2-C. **Sigue sin demostrarse** que el incidente del 22/08 fuera uno de esos dos: la respuesta nunca se capturó |
 
@@ -184,27 +185,31 @@ distinta y todavía sin corregir.
 tienen registro en el repositorio**: [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §5,
 escrito al cerrar D2-B y D2-C.
 
-Las fichas de `GC-START-LATENCY-001` y `GC-DEST-STATUS-001` siguen **fuera del
-repositorio**, en el archivo de evidencia congelada. No hay ningún documento en
-`docs/` que las contenga. Esa asimetría es deuda documental conocida, no un
-descuido de este documento.
+`GC-START-LATENCY-001` **dejó de ser una ficha externa el 2026-08-24**: su
+registro completo, con la evidencia de las dos corridas de hardware, vive en
+[`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §6.
+
+La ficha de `GC-DEST-STATUS-001` sigue **fuera del repositorio**, en el archivo
+de evidencia congelada. No hay ningún documento en `docs/` que la contenga. Esa
+asimetría es deuda documental conocida, no un descuido de este documento.
 
 ---
 
 ### Validación automática actual
 
-Ejecutada el 2026-08-23 sobre `34412a0`.
+Ejecutada el 2026-08-24 sobre el árbol posterior a `3c10994`.
 
 | Comprobación | Resultado |
 |---|---|
-| Suite completa | **781/781**, en **40 ficheros** |
+| Suite completa | **792/792**, en **41 ficheros** |
 | Typecheck | **12 errores TypeScript históricos, cero nuevos** — typecheck **NO** verde |
 | `git diff --check` | Limpio |
 
-> La cifra **360/360** correspondía al corte del 20/08. La última ejecución
-> automática registrada es **781/781 en 40 ficheros**, ejecutada el
-> **2026-08-23 sobre `34412a0`**. Este documento **no atribuye los incrementos
-> intermedios a cambios concretos** sin un recuento acreditado.
+> Cortes anteriores: **360/360** el 20/08 y **781/781 en 40 ficheros** el 23/08
+> sobre `34412a0`. El fichero 41 es `startLatencyDecoupling.test.ts`, que
+> aportó 11 tests entre `e643b01` y `3c10994`. Del resto de incrementos
+> históricos **no hay recuento acreditado**, y este documento no se los
+> atribuye a ningún cambio concreto.
 
 > **`:gc-segmented-recorder:compileDebugKotlin` no se ha reejecutado.** Su
 > `BUILD SUCCESSFUL` es del 20/08 y ningún commit posterior toca el módulo

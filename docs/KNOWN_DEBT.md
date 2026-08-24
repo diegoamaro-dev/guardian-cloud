@@ -18,9 +18,10 @@ Detalle completo en [`releases/v0.3.0-rc.1.md`](./releases/v0.3.0-rc.1.md) §7.
 - **12 errores heredados**; el typecheck **no** está verde. 6 en `app.config.ts`
   (tipos de `ExpoConfig`/`ManifestService`), 4 en `app/index.tsx` y 2 en
   `src/api/*` (`Uint8Array<ArrayBufferLike>` vs `BufferSource`/`BodyInit`).
-- **No hay CI.** Los tests corren sólo en la máquina del desarrollador — **781
-  el 2026-08-23**, sobre `34412a0`. *(Esta línea decía «los 198 tests»: la
-  cifra era del corte de `v0.3.0-rc.1`; la deuda de CI no ha cambiado.)*
+- **No hay CI.** Los tests corren sólo en la máquina del desarrollador —
+  **792/792 en 41 ficheros el 2026-08-24**, tras `3c10994`. *(Cifras anteriores
+  de esta línea: «los 198 tests» del corte de `v0.3.0-rc.1` y 781 el 2026-08-23
+  sobre `34412a0`. La deuda de CI no ha cambiado.)*
 - `npm ci` **falla** sin `--legacy-peer-deps`: el lockfile no materializa los
   peers `react-dom` y `scheduler`.
 - 29 vulnerabilidades de `npm audit` (1 baja, 17 moderadas, 8 altas, 3
@@ -127,8 +128,9 @@ configuración implicada en [`OAUTH_DRIVE_CONFIGURATION.md`](./OAUTH_DRIVE_CONFI
   > real de `expo-av` con `Audio.Recording` huérfano. **Sigue siendo contexto
   > obligatorio** — describe el motor histórico y el porqué de varias guardas.
 - Existing failing tests need review after the recovery flow is stabilized.
-  **RESOLVED (2026-08-23)** — la suite está en 781/781 sin tests saltados. El
-  typecheck sigue en 12 errores heredados, que es deuda aparte y está arriba.
+  **RESOLVED (2026-08-23)** — la suite **estaba** en 781/781 sin tests saltados
+  en esa fecha; hoy va por 792/792, y la cifra vigente vive arriba. El typecheck
+  sigue en 12 errores heredados, que es deuda aparte y está arriba.
 - Logs should be reduced before release.
 - Export flow has no entry point from the home screen yet (reachable only via direct route `/session/:id`). A Historial brick should list past sessions and link in (see `TODO(export-history)`).
   **RESOLVED** — `mobile/app/history.tsx` existe (382 líneas) y
@@ -141,13 +143,13 @@ configuración implicada en [`OAUTH_DRIVE_CONFIGURATION.md`](./OAUTH_DRIVE_CONFI
 
 ## Lo que NO es deuda y no vive aquí
 
-Los findings del bloque de identidad, destino y herramientas (21/08 – 23/08)
+Los findings del bloque de identidad, destino y herramientas (21/08 – 24/08)
 **no son deuda técnica**: unos son release blockers y otros defectos abiertos.
 Se registran en otro sitio y no deben duplicarse aquí.
 
 | Dónde | Qué contiene |
 |---|---|
-| [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §1–§5 | `GC-AUTH-MIGRATION-001`, `GC-DEST-PAUSE-001`, `GC-DEV-RESET-001`, `GC-AUTH-SESSION-RECOVERY-001` y el límite de `expo-av` |
+| [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §1–§6 | `GC-AUTH-MIGRATION-001`, `GC-DEST-PAUSE-001`, `GC-DEV-RESET-001`, `GC-AUTH-SESSION-RECOVERY-001`, `GC-START-LATENCY-001` y el límite de `expo-av` |
 | [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md#findings-abiertos-de-identidad-destino-y-herramientas) | Tabla de estado de los ocho findings |
 | [`RELEASE_CHECKLIST_v0.3.md`](./RELEASE_CHECKLIST_v0.3.md) §0 | Invariante bloqueante de migración de identidad |
 
@@ -155,6 +157,10 @@ Se registran en otro sitio y no deben duplicarse aquí.
 tener registro propio en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §5 al cerrar
 D2-B y D2-C.
 
-`GC-START-LATENCY-001` y `GC-DEST-STATUS-001` **siguen sin documento propio en
-`docs/`**; sus fichas están congeladas fuera del repositorio. Esa asimetría es
-la deuda documental vigente más relevante.
+`GC-START-LATENCY-001` **tiene registro propio** en
+[`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §6 desde el 2026-08-24, escrito al
+cerrar su validación en hardware.
+
+`GC-DEST-STATUS-001` es el único que **sigue sin ficha propia en `docs/`**; la
+suya está congelada fuera del repositorio. Esa asimetría es la deuda documental
+vigente más relevante.
