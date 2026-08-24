@@ -215,6 +215,13 @@ parte del export validado**. Ya existen segmentos MP4 nativos independientes,
 pero la evidencia disponible no demuestra recovery completo de vídeo ni la
 generación de un export final `.mp4`.
 
+> Desde el 2026-08-24 el vídeo nativo segmentado sí tiene **salvage local
+> validado en hardware** (D3 `LOCAL SEGMENT SALVAGE`): entrega los **MP4
+> originales más un manifest de integridad**. **No** produce una grabación
+> `.mp4` única reconstruida y **no** equivale al export final de vídeo, que
+> sigue sin implementar. La afirmación de arriba —el export reconstruido y
+> usable validado sigue siendo audio `.m4a`— no cambia.
+
 ---
 
 ### Nivel 2 — Forensic Reconstruction (futuro)

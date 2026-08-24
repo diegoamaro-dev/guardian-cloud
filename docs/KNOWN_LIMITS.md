@@ -957,19 +957,25 @@ creado ninguna tercera superficie destructiva dentro de Guardian Cloud.**
 
 ## Estado
 
-**OPEN.** Mitigado en dos entregas, **validado en banco de pruebas, NO en
-dispositivo.**
+**OPEN.** Mitigado en tres entregas de **dos naturalezas distintas**, que no
+deben confundirse: D2-B y D2-C **previenen** que la credencial se destruya; D3
+**no previene nada**, da salida local a la evidencia que ya quedó varada.
 
 ```
 D2-B = IMPLEMENTED / VALIDATED IN TEST BENCH   upgrade a @supabase/supabase-js 2.112.3
 D2-C = IMPLEMENTED / VALIDATED IN TEST BENCH   clasificador de rate limit del refresh
+D3   = IMPLEMENTED / HARDWARE FUNCTIONAL PASS  salvage local de segmentos (2026-08-24)
 GC-AUTH-SESSION-RECOVERY-001 = OPEN
 GC-START-LATENCY-001         = FIXED IN CODE / HARDWARE VALIDATED   (2026-08-24, §6)
 ```
 
-No se declara `HARDWARE_VALIDATED`. No se declara cerrado ningún release
-blocker. **No se declara demostrada la causa histórica del incidente del
-2026-08-22.**
+La prevención (D2-B, D2-C) **no** se declara `HARDWARE_VALIDATED`. No se declara
+cerrado ningún release blocker. **No se declara demostrada la causa histórica
+del incidente del 2026-08-22.**
+
+**D3 no cierra este finding**, ni siquiera habiendo pasado en hardware: no
+recupera la identidad, no restaura ownership, no reanuda la subida y no produce
+un `.mp4` final reconstruido.
 
 ---
 
@@ -1172,11 +1178,125 @@ destruir la credencial.
 
 ---
 
+## D3 — `LOCAL SEGMENT SALVAGE`
+
+Implementado en `cb59c7e`. **`HARDWARE FUNCTIONAL PASS` el 2026-08-24.**
+
+### El hueco que cubre, que es más estrecho de lo que parece
+
+Un dispositivo cuya sesión de Supabase fue destruida no puede subir —la pausa
+`client_auth` exige `access_token` real— ni exportar —`src/api/export.ts` es una
+ruta de **descarga** y también necesita token—.
+
+**Audio y legacy ya tenían salida local**: su entrada de cola lleva
+`uri: cacheUri` y `findLocalRecordingUri` la sirve desde la pantalla de sesión.
+**Vídeo nativo segmentado no la tenía**: escribe `uri: ''`, esa búsqueda devuelve
+`null` y la captura quedaba sin ninguna salida. Ése es el hueco exacto, y el
+único, que D3 cubre.
+
+### Qué produce y qué NO produce
+
+Copia los **segmentos MP4 originales** del sandbox a una carpeta que elige el
+usuario por Storage Access Framework, con nombres de seis dígitos y un manifest
+que se relee y valida antes de acreditar nada:
+
+```
+segment_000000.mp4 … segment_NNNNNN.mp4
+guardian-export-manifest.json          escrito AL FINAL
+```
+
+Cada segmento es un contenedor MP4 independiente y reproducible. **No se
+concatenan**: unir contenedores MP4 byte a byte no produce un MP4 válido.
+
+```
+NO recupera la identidad
+NO reanuda ownership ni subida
+NO es el export final .mp4  (sigue NO IMPLEMENTADO)
+NO produce «vídeo reconstruido», «MP4 final» ni «grabación completa»
+```
+
+### La validación en hardware
+
+OnePlus A6000 · Android 11 / API 30 · `arm64-v8a` · APK release
+`8151c338…` desde `cb59c7e`.
+
+Precondición construida a propósito: captura de vídeo nativo segmentado con el
+dispositivo en **modo avión**, sin ruta por defecto y con DNS fallando para
+backend y para Drive.
+
+```
+productor         vídeo nativo segmentado · rotación 6 s
+outcome           closed
+segments_observed 12 · índices 0–11 contiguos · next_chunk_index 12
+remote_reference  0        uploaded  0
+
+D3   status = complete · written = 12 · manifest = true
+     12/12 segmentos exportados
+     tamaños y sha256 coincidentes: manifest == bytes en dispositivo == copia
+     manifest JSON válido, export_completed = true
+     MP4 independientes decodificables (ffprobe + decodificación completa)
+```
+
+Invariantes verificados durante y después de la ejecución:
+
+```
+D3 no produjo tráfico propio        las únicas llamadas en su ventana fueron
+                                    reintentos del worker, con su cadencia de
+                                    ~5,05 s inalterada
+D3 no mutó GC_QUEUE                 la cola siguió en pending 12 · entries 1
+D3 no ejecutó cleanup               cero eventos sobre la sesión bajo prueba
+D3 no borró ni modificó las fuentes el worker seguía leyendo el chunk 0 con
+                                    size 200040 cinco minutos después
+```
+
+Evidencia congelada fuera del repositorio, con `26/26` hashes verificados y
+barrido de secretos limpio:
+`2026-08-24-d3-local-segment-salvage-hardware/PROVENANCE.md`.
+
+### `GC-SEGMENT-CONTINUITY-001` — observación temporal abierta
+
+```
+GC-SEGMENT-CONTINUITY-001 = OBSERVATION / INVESTIGATION OPEN
+```
+
+**No es un defecto confirmado. No es un release blocker.** El identificador
+existe para que la observación sea rastreable, no para afirmar que haya algo
+roto.
+
+Hecho observado, en la corrida de D3 del 2026-08-24:
+
+```
+capture_ms del grabador                72,551 s
+suma ffprobe de los 12 segmentos       66,765 s
+diferencia                              5,786 s
+```
+
+Eso es todo lo que se afirma: dos magnitudes medidas y su resta. **No se
+atribuye causa.** No se afirma pérdida de evidencia. No se afirma que la
+rotación de segmentos sea responsable. No se ha modificado código ni tests por
+esta observación.
+
+Lo que sí está establecido, y acota el alcance de la investigación: los 12
+índices son contiguos desde 0 (`observed_contiguous_from_zero: true`), los bytes
+exportados son idénticos a los que el grabador produjo, y **D3 no interviene**
+—copia los ficheros que existen y no puede inventar tiempo de reloj que el
+grabador no capturó—.
+
+Investigar exigirá su propio escenario reproducible y su propia
+instrumentación; hasta entonces este documento no va más allá de las tres
+cifras de arriba.
+
+---
+
 ## Lo que sigue abierto
 
-- **Validación en hardware.** Nada de esto se ha ejecutado en dispositivo. El
-  banco prueba la mecánica de `auth-js` y de nuestro clasificador; no prueba el
-  comportamiento del producto bajo estrés real.
+- **Validación en hardware de la prevención.** Ni D2-B ni D2-C se han ejecutado
+  en dispositivo. El banco prueba la mecánica de `auth-js` y de nuestro
+  clasificador; no prueba el comportamiento del producto bajo estrés real. El
+  `HARDWARE FUNCTIONAL PASS` del 24/08 es de **D3**, que es supervivencia, y no
+  acredita nada sobre la prevención.
+- **La subida sigue sin reanudarse.** D3 saca los bytes del sandbox; no los pone
+  en la nube. Una sesión varada sigue varada.
 - **`GC-START-LATENCY-001`** — **cerrado el 2026-08-24**, ver §6. Cuando se
   escribió esta línea el camino de `auth-js` podía consumir **~25,4 s de
   backoff** y `startRecording` esperaba a `getOwnershipAccessToken()`. Esa

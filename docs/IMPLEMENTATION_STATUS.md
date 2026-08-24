@@ -7,12 +7,15 @@
 | Estado documental vigente | **2026-08-24** |
 | Producto usado para la revalidación de `GC-DEST-PAUSE-001` | **`22a9b26`** (APK release `2b3be062…`) |
 | Producto usado para la validación de `GC-START-LATENCY-001` | **`e643b01`** (APK release `1cb80fea…`) |
-| Última suite automática registrada | **2026-08-24**, tras **`3c10994`** — 792/792 en 41 ficheros · typecheck 12, sin drift |
+| Producto usado para la validación de **D3 local segment salvage** | **`cb59c7e`** (APK release `8151c338…`) |
+| Última suite automática registrada | **2026-08-24**, tras **`cb59c7e`** — 900/900 en 42 ficheros · typecheck 12, sin drift |
 
 > Las fechas y los commits son distintos a propósito, y no deben fundirse. La
-> suite se midió sobre el árbol posterior a `3c10994`; las dos validaciones de
-> hardware se hicieron en dispositivo, no corriendo la suite, y cada una sobre
-> su propio APK. **Ninguna cifra de tests describe un APK.**
+> suite vigente —900/900 en 42 ficheros— se midió sobre el árbol posterior a
+> `cb59c7e`; las tres validaciones de hardware se hicieron en dispositivo, no
+> corriendo la suite, y cada una sobre **su propio APK**:
+> `GC-DEST-PAUSE-001` sobre `22a9b26`, `GC-START-LATENCY-001` sobre `e643b01` y
+> **D3** sobre `cb59c7e`. **Ninguna cifra de tests describe un APK.**
 
 > **Corte anterior: 2026-08-20.** Entre el 20/08 y el 23/08 la rama
 > `fix/gc-auth-001-main-integration` incorporó seis commits que este documento
@@ -80,6 +83,28 @@ contradiga es incorrecta.
 |---|---|
 | Recuperación completa del vídeo nativo | No consta validación integrada; no se declara implementada o validada por la evidencia actual |
 | Exportación `.mp4` | No implementada ni validada |
+
+> **D3 `LOCAL SEGMENT SALVAGE` no pertenece a este nivel y no es un export
+> `.mp4`.** Es una capacidad distinta, implementada en `cb59c7e` y con
+> **`HARDWARE FUNCTIONAL PASS`** el 2026-08-24: cuando una captura de vídeo
+> nativo segmentado queda sin salida cloud, permite copiar del sandbox los
+> **segmentos MP4 originales**, ordenados y verificados por `sha256` en destino,
+> a una carpeta que elige el usuario vía Storage Access Framework.
+>
+> Los segmentos son contenedores MP4 **independientes**; no se concatenan,
+> porque unir contenedores MP4 byte a byte no produce un MP4 válido. D3 **no
+> produce** vídeo reconstruido, MP4 final ni grabación completa. El export final
+> `.mp4` sigue **no implementado**, exactamente como dice la fila de arriba.
+>
+> Alcance y evidencia en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §5.
+
+> **`GC-SEGMENT-CONTINUITY-001` = `OBSERVATION / INVESTIGATION OPEN`.** De esa
+> misma corrida salió una observación temporal —`capture_ms` 72,551 s frente a
+> 66,765 s de suma `ffprobe` de los 12 segmentos, 5,786 s de diferencia— que
+> **no es un defecto confirmado ni un release blocker**, no tiene causa
+> atribuida y no afirma pérdida de evidencia. Deliberadamente **no** figura en
+> la tabla de findings de este documento. Registro único en
+> [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §5.
 
 > **Criterio de incompatibilidad.** Cualquier propuesta de «vídeo post-stop»
 > —fragmentar y encolar **después** de detener la captura— es **incompatible
@@ -163,7 +188,7 @@ proviniendo de una ficha de evidencia congelada fuera del repositorio.
 | **GC-DEV-RESET-001** | RELEASE BLOCKER · `FIXED IN CODE` / revalidación hardware **no requerida** | `e289dcb` | El defecto es de política de borrado, demostrable en pruebas. 62 tests en `devResetGuard.test.ts` |
 | **GC-DEST-PAUSE-001** | `FIXED IN CODE` / **`HARDWARE REVALIDATED`** | `3fae4f6` | Revalidado el 24/08 como **cross-build durable-state recovery validation**: la pausa la escribió el build `34412a0`-era y la retiró producto `22a9b26`. Reconexión real por OAuth → pausa retirada → 10/10 chunks con referencias remotas distintas → `/complete` → cleanup, en ese orden. Identidad estable (`08c0875e`). La corrida del 21/08 había quedado **anulada** por GC-DEV-RESET-001. Detalle en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §3 |
 | **GC-AUTH-001** | `FIXED IN CODE` · ruta de identidad **PASS en hardware** · flujo extremo a extremo **no alcanzado** | `ad8756b`…`8615ba6`, integrados en `e215e5c` | La Vía 2 del 21/08 dio `Identity PASS` y `Registration PASS`, pero `Upload BLOCKED`, `Completion NOT REACHED` y `Cleanup NOT EXECUTED`. **No es un cierre** |
-| **GC-AUTH-SESSION-RECOVERY-001** | **`OPEN`** · mitigado, **validado en banco, NO en dispositivo** | D0 `02551a1`+`34412a0` · D2-B `08e3cd2` · D2-C `22a9b26` | Tras una ventana offline prolongada la sesión de Supabase desaparecía y 87 chunks quedaron sin poder subirse (22/08). **D2-B** (upgrade a 2.112.3) corrige la destrucción ante `500` / `502` / `525-529` y añade proactive-preserve y un cooldown de 60 s. **D2-C** clasifica `429` en el refresh como reintentable; todo lo demás hace pass-through fail-closed. Detalle en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §5 |
+| **GC-AUTH-SESSION-RECOVERY-001** | **`OPEN`** · prevención **validada en banco, NO en dispositivo**; supervivencia (D3) **`HARDWARE FUNCTIONAL PASS`** | D0 `02551a1`+`34412a0` · D2-B `08e3cd2` · D2-C `22a9b26` · D3 `cb59c7e` | Tras una ventana offline prolongada la sesión de Supabase desaparecía y 87 chunks quedaron sin poder subirse (22/08). **D2-B** (upgrade a 2.112.3) corrige la destrucción ante `500` / `502` / `525-529` y añade proactive-preserve y un cooldown de 60 s. **D2-C** clasifica `429` en el refresh como reintentable; todo lo demás hace pass-through fail-closed. **D3** es de otra naturaleza: no previene nada, da **salida local** a la evidencia de vídeo nativo segmentado que ya quedó varada. Validado en hardware el 24/08 (OnePlus A6000, modo avión, 12/12 segmentos, `status: complete`). **Ninguna de las tres cierra el finding**: la identidad sigue sin recuperarse, la subida sigue sin reanudarse y el ownership sigue sin restaurarse. Detalle en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §5 |
 | **GC-START-LATENCY-001** | `FIXED IN CODE` / **`HARDWARE VALIDATED`** | producto `e643b01` · guardas de test `3c10994` | `startRecording` esperaba a `getOwnershipAccessToken()` antes de abrir la grabadora, y esa ruta de auth **no lleva timeout en ninguna capa**. La lectura se movió dentro de `sessionCreatePromise`, que no se espera antes del productor. Validado en hardware el 24/08 en dos escenarios: **remoto vivo** — 531 ms tap→productor, 163 ms de lógica propia, 28/29 fragmentos confirmados **antes** de PARAR — y **token caducado + modo avión** — 243 ms tap→productor, 102 ms de lógica propia, con auth resolviendo **10,72 s después** de que el productor ya grababa. **auth no se volvió rápida: dejó de bloquear START.** Recuperación tras restaurar red: mismo `localSessionId`, 1 `POST /sessions`, 77/77 confirmados, cleanup posterior a `http_200`. Detalle en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §6 |
 | **GC-DEST-STATUS-001** | **`OPEN`** · defecto de **backend** | — | Ningún camino de código escribe `revoked` ni `error`. Un destino Drive con refresh token revocado sigue reportándose `connected`. Ver [`API_SPEC.md`](./API_SPEC.md#estado-de-los-destinos--defecto-abierto) |
 | **GC-AUTH-RETRY-CLASSIFICATION-001** | **causa suficiente demostrada** · relación causal con el 22/08 **no probada** | banco `9d682bc` · D2-B `08e3cd2` · D2-C `22a9b26` | Dejó de ser estático: el banco reproduce de forma determinista que un `429` / `500` en el refresh destruye una credencial **intacta** (`refresh_present: true`). Corregido para `500` por D2-B y para `429` por D2-C. **Sigue sin demostrarse** que el incidente del 22/08 fuera uno de esos dos: la respuesta nunca se capturó |
@@ -178,6 +203,12 @@ etiqueta en §3 y este documento no se la añade; su revalidación física, que 
 es el más grave de los abiertos: reproduce el modo de fallo que da nombre a
 `GC-AUTH-001` —evidencia que no puede salir del dispositivo— por una causa
 distinta y todavía sin corregir.
+
+Desde el 2026-08-24 ese modo de fallo tiene una **salida parcial**, no una
+corrección: D3 permite sacar del sandbox los segmentos MP4 de una captura de
+vídeo nativo segmentado varada. La evidencia puede llegar a manos del usuario;
+**no puede llegar a la nube**, y la identidad sigue sin recuperarse. El finding
+continúa `OPEN` y sigue siendo el más grave del bloque.
 
 ### Dónde vive la evidencia
 
@@ -197,19 +228,21 @@ asimetría es deuda documental conocida, no un descuido de este documento.
 
 ### Validación automática actual
 
-Ejecutada el 2026-08-24 sobre el árbol posterior a `3c10994`.
+Ejecutada el 2026-08-24 sobre el árbol posterior a `cb59c7e`.
 
 | Comprobación | Resultado |
 |---|---|
-| Suite completa | **792/792**, en **41 ficheros** |
+| Suite completa | **900/900**, en **42 ficheros** |
 | Typecheck | **12 errores TypeScript históricos, cero nuevos** — typecheck **NO** verde |
 | `git diff --check` | Limpio |
 
-> Cortes anteriores: **360/360** el 20/08 y **781/781 en 40 ficheros** el 23/08
-> sobre `34412a0`. El fichero 41 es `startLatencyDecoupling.test.ts`, que
-> aportó 11 tests entre `e643b01` y `3c10994`. Del resto de incrementos
-> históricos **no hay recuento acreditado**, y este documento no se los
-> atribuye a ningún cambio concreto.
+> Cortes anteriores: **360/360** el 20/08, **781/781 en 40 ficheros** el 23/08
+> sobre `34412a0` y **792/792 en 41 ficheros** el 24/08 tras `3c10994`. El
+> fichero 41 es `startLatencyDecoupling.test.ts`, que aportó 11 tests entre
+> `e643b01` y `3c10994`. El fichero 42 es `localAssembly.test.ts`, que aportó
+> los 108 tests de D3 en `cb59c7e`. Del resto de incrementos históricos **no hay
+> recuento acreditado**, y este documento no se los atribuye a ningún cambio
+> concreto.
 
 > **`:gc-segmented-recorder:compileDebugKotlin` no se ha reejecutado.** Su
 > `BUILD SUCCESSFUL` es del 20/08 y ningún commit posterior toca el módulo

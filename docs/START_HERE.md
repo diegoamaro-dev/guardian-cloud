@@ -50,17 +50,19 @@ baseline `v0.3.0-rc.1`, no la rama actual.
 * **Validación automática de aquel corte:** 360/360 tests. *(Cifra histórica del
   20/08. La vigente está más abajo.)*
 
-### Validación automática vigente (2026-08-24, tras `3c10994`)
+### Validación automática vigente (2026-08-24, tras `cb59c7e`)
 
 | Comprobación | Resultado |
 |---|---|
-| Suite completa | **792/792**, en **41 ficheros** |
+| Suite completa | **900/900**, en **42 ficheros** |
 | Typecheck | **12 errores históricos, cero nuevos** — **NO** verde |
 | `git diff --check` | Limpio |
 
-La cifra vigente es la de la tabla: **792 tests en 41 ficheros**, sobre el
-árbol posterior a `3c10994`. El fichero 41 es
-`startLatencyDecoupling.test.ts`, que aportó 11 de esos tests; **del resto de
+La cifra vigente es la de la tabla: **900 tests en 42 ficheros**, sobre el
+árbol posterior a `cb59c7e`. El **corte histórico anterior** fue 792/792 en 41
+ficheros, tras `3c10994`, y ya no describe la suite actual. El fichero 41 era
+`startLatencyDecoupling.test.ts`, que aportó 11 tests; el fichero 42 es
+`localAssembly.test.ts`, que aporta los 108 tests de D3. **Del resto de
 incrementos históricos no hay recuento documentado**, y esta guía no se los
 atribuye a nada. `compileDebugKotlin` no se ha reejecutado desde el 20/08.
 
@@ -77,7 +79,7 @@ atribuye a nada. `compileDebugKotlin` no se ha reejecutado desde el 20/08.
 | GC-DEV-RESET-001 | RELEASE BLOCKER · `FIXED IN CODE`, revalidación no requerida |
 | GC-DEST-PAUSE-001 | `FIXED IN CODE` / **`HARDWARE REVALIDATED`** — cross-build, 24/08 |
 | GC-AUTH-001 | `FIXED IN CODE`; identidad PASS en hardware, flujo completo **no alcanzado** |
-| GC-AUTH-SESSION-RECOVERY-001 | **`OPEN`** — mitigado por D2-B y D2-C, **validado en banco, NO en dispositivo** |
+| GC-AUTH-SESSION-RECOVERY-001 | **`OPEN`** — prevención (D2-B, D2-C) **validada en banco, NO en dispositivo**; supervivencia (D3, salvage local de segmentos) `HARDWARE FUNCTIONAL PASS` el 24/08. **Ninguna cierra el finding** |
 | GC-START-LATENCY-001 | `FIXED IN CODE` / **`HARDWARE VALIDATED`** — 24/08; auth dejó de bloquear el arranque, no se volvió rápida |
 | GC-DEST-STATUS-001 | **`OPEN`** — backend |
 | GC-AUTH-RETRY-CLASSIFICATION-001 | causa **suficiente** demostrada; causalidad con el 22/08 **no** probada |
@@ -101,7 +103,9 @@ Los motivos son ahora otros, y ninguno es la captura de vídeo:
 7. **`GC-DEV-RESET-001`** — corregido en código;
 8. **`GC-AUTH-SESSION-RECOVERY-001`** — abierto: la sesión de Supabase
    desaparece tras una ventana offline prolongada y la evidencia queda sin
-   poder subirse;
+   poder subirse. Desde el 24/08 el vídeo nativo segmentado tiene **salida
+   local** por D3 (`HARDWARE FUNCTIONAL PASS`), pero eso es supervivencia, no
+   corrección: la identidad no se recupera y la subida no se reanuda;
 9. **invariante de migración de identidad** — `RELEASE_CHECKLIST_v0.3.md` §0
    prohíbe publicar `8615ba6` en un build sin `gc.legacy_probe.v1`.
 

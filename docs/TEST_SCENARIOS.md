@@ -67,13 +67,21 @@ documento, pero sí cobertura automática densa: `legacyProbeSeal` (52),
   [validación del 20/08](./audits/GUARDIAN_CLOUD_NATIVE_SEGMENTED_DURABLE_CLEANUP_VALIDATION_2026-08-20.md).
 * También está `HARDWARE_VALIDATED` el recovery real de una sesión pendiente
   tras restaurar la autorización de Drive.
+* **D3 `LOCAL SEGMENT SALVAGE`** está `HARDWARE FUNCTIONAL PASS` desde el 24/08
+  en el mismo dispositivo, sobre `cb59c7e` (APK `8151c338…`): con el teléfono en
+  modo avión y sin ruta de red, una captura de vídeo nativo segmentado cerrada
+  (12 segmentos, índices 0–11, `remote_reference = 0`) se exportó a una carpeta
+  SAF con `status: complete`, 12/12 segmentos, manifest válido y `sha256`
+  coincidente en los doce. Es **supervivencia, no recuperación**: no cierra
+  `GC-AUTH-SESSION-RECOVERY-001` ni implementa el export `.mp4`.
 * Validación automática vigente, ejecutada el 2026-08-24 sobre el árbol
-  posterior a `3c10994`: **792/792 tests en 41 ficheros**; 12 errores
+  posterior a `cb59c7e`: **900/900 tests en 42 ficheros**; 12 errores
   TypeScript históricos y cero nuevos; `git diff --check` limpio.
   `compileDebugKotlin` dio `BUILD SUCCESSFUL` el 20/08 y **no se ha reejecutado
   desde entonces**.
-  *(Cifras anteriores de esta línea: 360/360 en el corte del 20/08 y 781/781 en
-  el del 23/08 sobre `34412a0`.)*
+  *(Cifras anteriores de esta línea: 360/360 en el corte del 20/08, 781/781 en
+  el del 23/08 sobre `34412a0` y 792/792 en 41 ficheros el 24/08 tras
+  `3c10994`.)*
 * **No** se declaran validados: recovery completo de vídeo, export final
   `.mp4`, cobertura multi-dispositivo, Android 13+ ni las rutas artificiales de
   fallo del scheduler.

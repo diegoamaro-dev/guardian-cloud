@@ -90,7 +90,11 @@ El sistema actualmente:
 * ❌ export final `.mp4` no implementado
 * ❌ un solo dispositivo validado: sin cobertura multi-dispositivo ni Android 13+
 * ❌ **la sesión de Supabase puede desaparecer tras una ventana offline
-  prolongada y dejar la evidencia sin poder subirse** (`GC-AUTH-SESSION-RECOVERY-001`, abierto)
+  prolongada y dejar la evidencia sin poder subirse** (`GC-AUTH-SESSION-RECOVERY-001`, abierto).
+  Desde el 24/08 esa evidencia sí tiene **salida local** si es vídeo nativo
+  segmentado: D3 `LOCAL SEGMENT SALVAGE` copia los segmentos MP4 originales
+  fuera del sandbox (`HARDWARE FUNCTIONAL PASS`). **No es una corrección**: la
+  identidad no se recupera, la subida no se reanuda y no es un `.mp4` final
 * ✅ `GC-START-LATENCY-001` = **`FIXED IN CODE` / `HARDWARE VALIDATED`** (24/08).
   Aquí decía que «el inicio de captura se bloquea ~4½ min con la red remota
   muerta». Ya no: **auth puede seguir tardando, pero ya no bloquea START**.
@@ -159,8 +163,8 @@ se fija aquí ninguna cifra como objetivo: quedaría obsoleta al añadir pruebas
 empujaría a «arreglar» el documento en vez del código. Registrar el total
 observado al ejecutarla.
 
-Última ejecución registrada: **792/792 en 41 ficheros**, el 2026-08-24, tras
-`3c10994`.
+Última ejecución registrada: **900/900 en 42 ficheros**, el 2026-08-24, tras
+`cb59c7e`.
 
 **12 errores TypeScript heredados** (typecheck **NO** verde) · sin CI.
 
