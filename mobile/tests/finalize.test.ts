@@ -545,127 +545,113 @@ describe('TEST_ZERO_CHUNK_ENTRY_IS_NEVER_COMPLETED_OR_REAPED', () => {
 });
 
 /**
- * G1 — invariance of terminality under `evidence_closed`.
+ * G1's terminality-invariance block (I1 / I2 / I2b) lived here and has
+ * been SUPERSEDED by the `canAdvanceToTerminality` suite below.
  *
- * This is the tooth that DEFINES gate G1: the durable field exists, is
- * persisted and hydrated, and governs absolutely nothing. If any of
- * these ever fail, someone wired `evidence_closed` into an operational
- * decision ahead of G2.
+ * Those tests pinned `evidence_closed` as inert for the /complete
+ * decision — correct while G1 only introduced the durable field. G2'
+ * deliberately makes it operational for that ONE decision, so I2b
+ * ("evidence_closed=true CANNOT unblock a session with
+ * recording_closed=false") now asserts the exact opposite of T4. They
+ * cannot both hold; T1–T6 are the stricter, current contract.
  *
- * `recording_closed` remains the sole authority. Absence of
- * `evidence_closed` means only "metadata unavailable" — it must not be
- * read as closed OR as open.
+ * What survives unchanged is the OTHER half of G1's invariance, and it
+ * still lives in `queue.test.ts`: `evidence_closed` remains invisible to
+ * `pickNext`, the worker, retry and reap (I3). This gate narrowed the
+ * field's authority to a single decision; it did not widen it.
  */
-describe('G1 — evidence_closed is inert: terminality invariance', () => {
-  const variants: { label: string; patch: Partial<PendingQueueEntry> }[] = [
-    { label: 'true', patch: { evidence_closed: true } },
-    { label: 'false', patch: { evidence_closed: false } },
-    { label: 'absent', patch: {} },
-  ];
 
-  it('I1 — a READY session finalises identically for true / false / absent', async () => {
-    const outcomes: { finalized: boolean; calls: number; left: number }[] = [];
-    for (const v of variants) {
-      // Reset storage and call counts, then RE-ESTABLISH what the
-      // suite's `beforeEach` installs — `clearAllMocks` alone would strip
-      // the token resolvers and every variant would bail identically for
-      // the wrong reason, making the comparison vacuous.
-      await AsyncStorage.clear();
-      vi.clearAllMocks();
-      vi.mocked(getFreshAccessToken).mockResolvedValue('test-token');
-      vi.mocked(getOwnershipAccessToken).mockResolvedValue(
-        'test-token' as OwnershipToken,
-      );
-      vi.stubGlobal(
-        'fetch',
-        vi.fn(async () => ({
-          ok: true,
-          status: 200,
-          json: async () => ({ session_id: SID, status: 'completed' }),
-        })),
-      );
-      await queueAppendNewSession(
-        entry({
-          recording_closed: true,
-          next_chunk_index: 1,
-          chunks: [uploadedChunk(0)],
-          ...v.patch,
-        }),
-      );
-      const finalized = await tryFinalizeReadySessions();
-      outcomes.push({
-        finalized,
-        calls: (global.fetch as unknown as { mock: { calls: unknown[] } }).mock
-          .calls.length,
-        left: (await queueRead()).length,
-      });
+/**
+ * G2' — the compatibility authority for `/complete`.
+ *
+ * `canAdvanceToTerminality(entry) = evidence_closed ?? recording_closed`
+ * decides ONE thing: whether `tryFinalizeReadySessions` may advance a
+ * Protection Session towards `POST /complete`. It is not the system's
+ * reader of terminality — `recording_closed` keeps other readers with
+ * other, still-valid semantics, none of which this gate touches.
+ *
+ * T1/T2 pin legacy compatibility: entries written before G1 and by
+ * `migrateLegacyPendingState` carry no key and MUST keep behaving
+ * exactly as they do today. T3/T4 pin the semantics a later gate will
+ * rely on; no product writer produces those states yet.
+ */
+describe("G2' — canAdvanceToTerminality", () => {
+  async function seedAndFinalize(
+    patch: Partial<PendingQueueEntry>,
+  ): Promise<{ finalized: boolean; left: number }> {
+    const e = entry({ next_chunk_index: 1, chunks: [uploadedChunk(0)], ...patch });
+    // Absence must be a MISSING KEY, not `undefined` — the round-trip
+    // through JSON is what a real persisted entry goes through.
+    if (patch.evidence_closed === undefined) {
+      delete (e as Partial<PendingQueueEntry>).evidence_closed;
     }
-    // Every variant must agree — with each other AND with the pre-G1
-    // behaviour: a ready session completes and is reaped.
-    expect(outcomes[0]).toEqual(outcomes[1]);
-    expect(outcomes[1]).toEqual(outcomes[2]);
-    expect(outcomes[0]!.finalized).toBe(true);
-  });
-
-  it('I2 — a BLOCKED session stays blocked for true / false / absent', async () => {
-    const outcomes: { finalized: boolean; calls: number; left: number }[] = [];
-    for (const v of variants) {
-      // Reset storage and call counts, then RE-ESTABLISH what the
-      // suite's `beforeEach` installs — `clearAllMocks` alone would strip
-      // the token resolvers and every variant would bail identically for
-      // the wrong reason, making the comparison vacuous.
-      await AsyncStorage.clear();
-      vi.clearAllMocks();
-      vi.mocked(getFreshAccessToken).mockResolvedValue('test-token');
-      vi.mocked(getOwnershipAccessToken).mockResolvedValue(
-        'test-token' as OwnershipToken,
-      );
-      vi.stubGlobal(
-        'fetch',
-        vi.fn(async () => ({
-          ok: true,
-          status: 200,
-          json: async () => ({ session_id: SID, status: 'completed' }),
-        })),
-      );
-      await queueAppendNewSession(
-        entry({
-          // recording_closed is the authority: false must block, no
-          // matter what evidence_closed says.
-          recording_closed: false,
-          next_chunk_index: 1,
-          chunks: [uploadedChunk(0)],
-          ...v.patch,
-        }),
-      );
-      const finalized = await tryFinalizeReadySessions();
-      outcomes.push({
-        finalized,
-        calls: (global.fetch as unknown as { mock: { calls: unknown[] } }).mock
-          .calls.length,
-        left: (await queueRead()).length,
-      });
-    }
-    expect(outcomes[0]).toEqual(outcomes[1]);
-    expect(outcomes[1]).toEqual(outcomes[2]);
-    expect(outcomes[0]!.finalized).toBe(false);
-    expect(outcomes[0]!.left).toBe(1);
-  });
-
-  it('I2b — evidence_closed=true CANNOT unblock a session recording_closed=false', async () => {
-    // The sharpest form of the invariant: the new field claiming
-    // terminality must not authorise /complete while the operational
-    // authority says the session is still open.
-    await queueAppendNewSession(
-      entry({
-        recording_closed: false,
-        evidence_closed: true,
-        next_chunk_index: 1,
-        chunks: [uploadedChunk(0)],
-      }),
+    // A successful /complete, so the branches that SHOULD advance can
+    // actually reach the end. Without it every variant would stall on a
+    // failed request and the comparison would be vacuous.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ session_id: SID, status: 'completed' }),
+      })),
     );
-    expect(await tryFinalizeReadySessions()).toBe(false);
+    await AsyncStorage.setItem(PENDING_RETRY_KEY, JSON.stringify([e]));
+    const finalized = await tryFinalizeReadySessions();
+    return { finalized, left: (await queueRead()).length };
+  }
+
+  it('T1 — legacy (key absent, recording_closed=true) FINALISES', async () => {
+    // The reachable-today case that a naive "read only evidence_closed"
+    // would strand forever: uploaded evidence, never declared complete.
+    const r = await seedAndFinalize({ recording_closed: true });
+    expect(r.finalized).toBe(true);
+    expect(r.left).toBe(0);
+  });
+
+  it('T2 — legacy (key absent, recording_closed=false) does NOT finalise', async () => {
+    const r = await seedAndFinalize({ recording_closed: false });
+    expect(r.finalized).toBe(false);
     expect(global.fetch).not.toHaveBeenCalled();
-    expect(await queueRead()).toHaveLength(1);
+    expect(r.left).toBe(1);
+  });
+
+  it('T3 — evidence_closed=false BLOCKS even with recording_closed=true', async () => {
+    // The case that distinguishes `??` from `||`. A later gate will
+    // write exactly this: producer closed, Protection Session open.
+    const r = await seedAndFinalize({
+      recording_closed: true,
+      evidence_closed: false,
+    });
+    expect(r.finalized).toBe(false);
+    expect(global.fetch).not.toHaveBeenCalled();
+    expect(r.left).toBe(1);
+  });
+
+  it('T4 — evidence_closed=true may advance even with recording_closed=false', async () => {
+    const r = await seedAndFinalize({
+      recording_closed: false,
+      evidence_closed: true,
+    });
+    expect(r.finalized).toBe(true);
+    expect(r.left).toBe(0);
+  });
+
+  it('T5 — G1 false/false stays open', async () => {
+    const r = await seedAndFinalize({
+      recording_closed: false,
+      evidence_closed: false,
+    });
+    expect(r.finalized).toBe(false);
+    expect(r.left).toBe(1);
+  });
+
+  it('T6 — G1 true/true behaves exactly as today', async () => {
+    const r = await seedAndFinalize({
+      recording_closed: true,
+      evidence_closed: true,
+    });
+    expect(r.finalized).toBe(true);
+    expect(r.left).toBe(0);
   });
 });

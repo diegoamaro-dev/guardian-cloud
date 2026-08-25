@@ -379,3 +379,74 @@ describe('G1 — evidence_closed merge on duplicate collapse', () => {
     expect('evidence_closed' in persisted[0]!).toBe(false);
   });
 });
+
+/**
+ * G2' — the merge must combine EFFECTIVE terminality, not the raw field.
+ *
+ * Precondition of the new read path. Under G1's rule (three-valued OR
+ * over `evidence_closed` alone) collapsing a legacy entry with a G1 open
+ * one produced `evidence_closed=false` alongside `recording_closed=true`
+ * — a divergence no writer can produce, which the new
+ * `canAdvanceToTerminality` would read as BLOCKED on a session that
+ * completes today.
+ */
+describe("G2' — effective-value merge on duplicate collapse", () => {
+  it('T7 — legacy(absent/true) + G1 open(false/false) → true, matching recording_closed', async () => {
+    const legacy = entry({ recording_closed: true });
+    delete (legacy as Partial<PendingQueueEntry>).evidence_closed;
+    await seed([legacy, entry({ recording_closed: false, evidence_closed: false })]);
+
+    await normalizeQueueOnRecovery();
+
+    const [merged] = await queueRead();
+    // `recording_closed` merges to true (OR). The effective merge must
+    // agree, or the entry would stop finalising after G2'.
+    expect(merged!.recording_closed).toBe(true);
+    expect(merged!.evidence_closed).toBe(true);
+  });
+
+  it('T7b — each side falls back to its OWN recording_closed', async () => {
+    // target: absent / false  → effective false
+    // dup:    absent / true   → effective true
+    // Using the already-combined `recording_closed` for both operands
+    // would give the same answer here, so the discriminating part is
+    // that the target's own `false` is not overwritten before use.
+    const a = entry({ recording_closed: false, evidence_closed: false });
+    const b = entry({ recording_closed: true });
+    delete (b as Partial<PendingQueueEntry>).evidence_closed;
+    await seed([a, b]);
+
+    await normalizeQueueOnRecovery();
+
+    const [merged] = await queueRead();
+    expect(merged!.evidence_closed).toBe(true);
+    expect(merged!.recording_closed).toBe(true);
+  });
+
+  it('T7c — two open G1 entries stay open', async () => {
+    await seed([
+      entry({ recording_closed: false, evidence_closed: false }),
+      entry({ recording_closed: false, evidence_closed: false }),
+    ]);
+    await normalizeQueueOnRecovery();
+    const [merged] = await queueRead();
+    expect(merged!.evidence_closed).toBe(false);
+    expect(merged!.recording_closed).toBe(false);
+  });
+
+  it('T8 — both keys absent → key STAYS absent, recording_closed still authoritative', async () => {
+    const a = entry({ recording_closed: true });
+    const b = entry({ recording_closed: false });
+    delete (a as Partial<PendingQueueEntry>).evidence_closed;
+    delete (b as Partial<PendingQueueEntry>).evidence_closed;
+    await seed([a, b]);
+
+    await normalizeQueueOnRecovery();
+
+    const raw = await AsyncStorage.getItem(PENDING_RETRY_KEY);
+    const persisted = JSON.parse(raw as string) as Record<string, unknown>[];
+    expect(persisted).toHaveLength(1);
+    expect('evidence_closed' in persisted[0]!).toBe(false);
+    expect(persisted[0]!.recording_closed).toBe(true);
+  });
+});

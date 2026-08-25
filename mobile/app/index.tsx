@@ -1295,21 +1295,36 @@ export async function normalizeQueueOnRecovery(): Promise<NormalizationReport> {
         target.next_chunk_index,
         dup.next_chunk_index,
       );
+      // G2' — capture each side's OWN `recording_closed` BEFORE the merge
+      // below overwrites the target's. Each operand must fall back to its
+      // own standing contract; using the already-combined value as the
+      // fallback for both would let one side's closure leak into the
+      // other's effective value.
+      const targetRecordingClosed = target.recording_closed;
+      const dupRecordingClosed = dup.recording_closed;
       target.recording_closed =
         target.recording_closed || dup.recording_closed;
-      // G1 — three-valued OR, mirroring the direction of the boolean
-      // merge above (`true` wins) while treating absence as the neutral
-      // element. A plain `||` would turn `undefined || false` into
-      // `false`, materialising the key on an entry that never had it and
-      // asserting knowledge we do not have. Two absences stay absent.
-      target.evidence_closed =
-        target.evidence_closed === true || dup.evidence_closed === true
-          ? true
-          : target.evidence_closed === false || dup.evidence_closed === false
-            ? false
-            : undefined;
-      if (target.evidence_closed === undefined) {
+      // G2' — merge the EFFECTIVE terminality of each side, not the raw
+      // field. The G1 rule (three-valued OR over `evidence_closed` alone)
+      // was safe only while the field was inert: collapsing a legacy
+      // entry (key absent, `recording_closed = true`) with a G1 open one
+      // (`false`/`false`) produced `evidence_closed = false` alongside
+      // `recording_closed = true` — a divergence no writer can produce,
+      // and one that `canAdvanceToTerminality` would now read as BLOCKED
+      // on a session that completes today.
+      //
+      // Two absences still stay absent: with no new metadata on either
+      // side, `recording_closed` remains the authority and materialising
+      // the key would assert knowledge we do not have.
+      if (
+        target.evidence_closed === undefined &&
+        dup.evidence_closed === undefined
+      ) {
         delete target.evidence_closed;
+      } else {
+        target.evidence_closed =
+          (target.evidence_closed ?? targetRecordingClosed) ||
+          (dup.evidence_closed ?? dupRecordingClosed);
       }
       target.session_completed =
         target.session_completed || dup.session_completed;
@@ -3135,11 +3150,51 @@ async function finalizeAndAuthorizeCleanup(
     : { kind: 'already_completed' };
 }
 
+/**
+ * G2' — compatibility authority for ONE decision, and only one:
+ * whether `tryFinalizeReadySessions` may advance a Protection Session
+ * towards `POST /complete`.
+ *
+ * ── SCOPE ──────────────────────────────────────────────────────────
+ * This is NOT "the reader of terminality" for the system. Other places
+ * read `recording_closed` under DIFFERENT, still-valid semantics —
+ * "the evidence set is final" for D3 and the protection banner, "the
+ * session is still open, keep spinning" for the drain loop. G2' does
+ * not reinterpret, own, or modify any of them.
+ *
+ * ── SEMANTICS ──────────────────────────────────────────────────────
+ *   `evidence_closed === true`   → may advance
+ *   `evidence_closed === false`  → BLOCKED, whatever `recording_closed`
+ *                                  says. In an entry written by a later
+ *                                  gate this means "Protection Session
+ *                                  still open" even though the producer
+ *                                  is closed — the whole point of the
+ *                                  decoupling.
+ *   `evidence_closed` absent     → metadata unavailable, neither open
+ *                                  nor closed; defer to the standing
+ *                                  contract, `recording_closed`.
+ *
+ * `??` and not `||`: only ABSENCE delegates. A `||` would let a stale
+ * `recording_closed = true` override an explicit `false` and complete a
+ * session that is still accepting evidence.
+ *
+ * Behaviour today is unchanged: every product writer stamps
+ * `evidence_closed === recording_closed`, so this returns exactly what
+ * the previous `!entry.recording_closed` test returned for every entry
+ * reachable at 8983bad — including pre-G1 and migrated entries, which
+ * carry no key and fall through to `recording_closed`.
+ */
+export function canAdvanceToTerminality(
+  entry: Pick<PendingQueueEntry, 'evidence_closed' | 'recording_closed'>,
+): boolean {
+  return entry.evidence_closed ?? entry.recording_closed;
+}
+
 export async function tryFinalizeReadySessions(): Promise<boolean> {
   const queue = await queueRead();
   let anyFinalized = false;
   for (const entry of queue) {
-    if (!entry.recording_closed) continue;
+    if (!canAdvanceToTerminality(entry)) continue;
 
     // Skip if anything is still in motion — the worker will process
     // those and we will re-evaluate on the next drain pass.
