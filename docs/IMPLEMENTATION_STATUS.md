@@ -83,7 +83,7 @@ contradiga es incorrecta.
 |---|---|
 | Recuperación completa del vídeo nativo | No consta validación integrada; no se declara implementada o validada por la evidencia actual |
 | Exportación `.mp4` | No implementada ni validada |
-| Continuous Protection — continuidad `VIDEO_AUDIO → AUDIO_ONLY` al perder el primer plano | Contrato de producto aceptado el 2026-08-25; **no implementado ni validado**. Decide [`decisions/ADR-CONTINUOUS-PROTECTION.md`](./decisions/ADR-CONTINUOUS-PROTECTION.md); su criterio de prueba es el escenario 18 de [`TEST_SCENARIOS.md`](./TEST_SCENARIOS.md) |
+| Continuous Protection — continuidad `VIDEO_AUDIO → AUDIO_ONLY` al perder el primer plano | **Capacidad: no implementada ni validada.** Contrato aceptado el 2026-08-25. **Infraestructura parcial ya publicada**, sin cambio de comportamiento observable: `8983bad` añadió la metadata durable `evidence_closed` y `6c6489c` desacopló el camino de **lectura** de terminalidad hacia `/complete`. La **escritura** sigue acoplada y la transición no existe: minimizar durante vídeo cierra la sesión igual que antes. Decide [`decisions/ADR-CONTINUOUS-PROTECTION.md`](./decisions/ADR-CONTINUOUS-PROTECTION.md); su criterio de prueba es el escenario 18 de [`TEST_SCENARIOS.md`](./TEST_SCENARIOS.md) |
 
 > **D3 `LOCAL SEGMENT SALVAGE` no pertenece a este nivel y no es un export
 > `.mp4`.** Es una capacidad distinta, implementada en `cb59c7e` y con

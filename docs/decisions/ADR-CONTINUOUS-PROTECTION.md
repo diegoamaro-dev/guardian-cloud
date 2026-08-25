@@ -7,7 +7,7 @@
 | **Decide** | Propietario del producto |
 | **Refina a** | [`ADR-VIDEO-NATIVE-SEGMENTATION`](./ADR-VIDEO-NATIVE-SEGMENTATION.md) |
 | **Afecta a** | `PRODUCT_PRINCIPLES`, `MVP_SCOPE`, `ARCHITECTURE`, `APP_STATES`, `UI_SCREENS`, `TEST_SCENARIOS`; D3; export final; contrato de sesión del backend |
-| **Implementado por** | — |
+| **Implementado por** | **Infraestructura parcial, no la capacidad**: `8983bad` (metadata durable `evidence_closed`) y `6c6489c` (desacople del camino de **lectura** de terminalidad). La capacidad —`VIDEO_AUDIO → AUDIO_ONLY`— sigue **sin implementar** |
 
 > **Este documento decide; no describe el sistema actual.** Ninguna de sus
 > secciones acredita capacidad implementada ni validada. El estado real por
@@ -302,6 +302,27 @@ Diferir la terminalidad hasta PARAR alarga la ventana durante la cual una sesió
 permanece abierta. Una Protection Session larga interrumpida de forma anómala
 permanece no terminada durante más tiempo del que hoy es posible. El contrato de
 recovery deberá cubrirlo (§6).
+
+### `DEUDA ARQUITECTÓNICA · EL ARRANQUE FUERZA TERMINALIDAD` — reservada a G7
+
+El arranque en frío cierra hoy **toda** entrada persistida que encuentre abierta,
+sin condición. Es comportamiento **vigente y preexistente**, anterior a este ADR,
+y **no se modifica en esta reconciliación**.
+
+Es coherente con el modelo actual —tras un arranque en frío ninguna entrada
+persistida sigue capturando— pero **no constituye todavía el recovery que
+Continuous Protection requiere**: §2 exige que una terminación anómala no se
+interprete automáticamente como un PARAR del usuario, y esa ruta hace
+exactamente eso.
+
+```
+NO es un defecto corregido.
+NO es una capacidad implementada.
+Queda reservada al gate G7 — recovery de Protection Session multifase.
+```
+
+La referencia operativa vive **en el código**, junto a la escritura afectada.
+Aquí sólo consta la deuda arquitectónica y cuál es su gate propietario.
 
 ### `RIESGO ABIERTO · SEÑAL DE VISIBILIDAD`
 

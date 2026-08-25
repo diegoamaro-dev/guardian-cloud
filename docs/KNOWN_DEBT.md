@@ -139,6 +139,20 @@ configuración implicada en [`OAUTH_DRIVE_CONFIGURATION.md`](./OAUTH_DRIVE_CONFI
   auditoría de trazabilidad ya lo había marcado obsoleto como defecto `D14`.
 - Export accumulates the full session bytes in memory before writing. Acceptable for MVP-size recordings but will OOM on large files — switch to an incremental append (see `TODO(export-large)`).
 - A partial export missing the last chunk loses the MP4 `moov` atom and the resulting .m4a is generally unplayable. File is still produced as forensic output; moov-patching is out of scope (see `TODO(export-headerless-partial)`).
+- `GC-COMPAT-DOWNGRADE-001` — **una versión antigua no respeta
+  `evidence_closed`.** Desde `6c6489c` la autorización de `/complete` se decide
+  con `evidence_closed ?? recording_closed`. Una entrada que un gate posterior
+  escriba como `evidence_closed=false` junto a `recording_closed=true`
+  —productor cerrado, Protection Session abierta— sería leída por un binario
+  anterior a `8983bad`, o por uno de G1, como terminable, y podría completarse
+  antes de tiempo.
+  **No es resoluble con metadata aditiva**: una versión antigua no puede
+  respetar un campo que no conoce. Se registra como limitación conocida y **no
+  se propone solución**. Hoy es inalcanzable —ningún escritor de producto
+  produce `evidence_closed ≠ recording_closed`— y sólo pasa a ser relevante
+  cuando el gate atómico de `VIDEO_AUDIO → AUDIO_ONLY` empiece a producir esos
+  estados. Ver
+  [`decisions/ADR-CONTINUOUS-PROTECTION.md`](./decisions/ADR-CONTINUOUS-PROTECTION.md).
 
 ---
 

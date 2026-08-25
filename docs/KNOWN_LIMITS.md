@@ -1539,3 +1539,62 @@ aserciones acotadas por rama.
   logcat, en las respuestas del backend y en la baseline preservada.
 - **Un solo dispositivo.** OnePlus A6000 / Android 11 / API 30. No implica
   cobertura multi-dispositivo ni Android 13+.
+
+---
+
+## `GC-QUEUE-PARSE-WIPE-001` — un JSON ilegible sustituye la cola por un array vacío
+
+**Estado: `OPEN`. Sin remediation propuesta.** Descubierto por lectura estática
+durante el preflight de G1 (2026-08-25).
+
+### Ruta exacta
+
+`mobile/app/index.tsx`, dentro de `queueMutate`:
+
+```
+try  { const parsed: unknown = JSON.parse(raw); … }
+catch { queue = []; }
+```
+
+seguido, en el mismo cuerpo y sin condición intermedia, de:
+
+```
+await AsyncStorage.setItem(PENDING_RETRY_KEY, JSON.stringify(queue));
+```
+
+### Condición de activación
+
+El valor almacenado bajo la clave de la cola no es JSON parseable en el momento
+de una invocación de `queueMutate`.
+
+### Consecuencia
+
+La cola en memoria pasa a ser un array vacío y ese array vacío **se persiste**,
+reemplazando el valor anterior. Toda entrada que contuviera —incluidas sesiones
+con chunks aún no confirmados fuera del dispositivo— deja de estar referenciada
+por la fuente de verdad.
+
+### Invariante afectado
+
+`cola persistente` y `GC_QUEUE como fuente de verdad`, y por dependencia
+`recovery automático`.
+
+### La asimetría que lo hace visible
+
+La rama vecina —fallo de `getItem`, unas líneas antes— **re-lanza
+deliberadamente**, con un comentario que documenta que una versión anterior
+borraba la cola ahí y que eso destruía evidencia a mitad de emisión. La rama de
+`parse` nunca recibió el mismo tratamiento.
+
+### Grado de certeza
+
+**Lectura estática del código.** No se ha observado la activación en ningún
+dispositivo, no se ha reproducido, y **no se afirma probabilidad, frecuencia ni
+impacto real**. Lo verificado es la estructura del código, no que haya ocurrido.
+
+### Por qué sigue abierto
+
+Corregirlo cambia comportamiento observable en una ruta de recuperación de datos
+y exige decidir qué hacer con un valor ilegible —conservarlo, aislarlo, o fallar
+cerrado—, lo que es una decisión de producto con su propio criterio de
+validación. Requiere gate propio.

@@ -135,7 +135,23 @@ Destinos futuros (NO en MVP):
 > son fases dentro de ella, y `producer closed ≠ Protection Session closed`.
 > Bajo ese contrato sólo la acción explícita PARAR termina una sesión, y
 > `/complete` corresponde a esa terminalidad, no al cierre de un productor.
-> Nada de esto está implementado. Decide
+>
+> **Qué hay construido a fecha de `6c6489c`, y qué no:**
+>
+> * **lectura de terminalidad — PARCIALMENTE IMPLEMENTADA.** La decisión de
+>   avanzar hacia `/complete` ya no consulta `recording_closed` directamente:
+>   pasa por una autoridad de compatibilidad que lee la metadata durable
+>   `evidence_closed` y delega en `recording_closed` cuando está ausente. Es
+>   sólo esa decisión; el transporte, la selección de chunks, el reap y el
+>   cleanup siguen sin depender de la metadata nueva, y otros lectores de
+>   `recording_closed` conservan sus propias semánticas.
+> * **escritura desacoplada — NO IMPLEMENTADA.** Todo escritor sigue
+>   produciendo ambos valores iguales, así que ninguna sesión queda con el
+>   productor cerrado y la sesión abierta.
+> * **`VIDEO_AUDIO → AUDIO_ONLY` — NO IMPLEMENTADO.**
+>
+> El paso 7 sigue describiendo el comportamiento vigente sin excepción:
+> minimizar durante vídeo cierra la sesión igual que antes. Decide
 > [`decisions/ADR-CONTINUOUS-PROTECTION.md`](./decisions/ADR-CONTINUOUS-PROTECTION.md);
 > el estado por capacidad, [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md).
 
