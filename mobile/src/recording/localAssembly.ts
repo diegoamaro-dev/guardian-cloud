@@ -143,7 +143,16 @@ export type LocalSegmentRejection =
   | 'bad_emission_counter'
   | 'inconsistent_queue'
   | 'no_segments'
-  | 'busy';
+  | 'busy'
+  // ---- G3' media-classification refusals ---------------------------------
+  /** At least one chunk carries a `media` value this build does not know. */
+  | 'unknown_media_metadata'
+  /** Some chunks carry `media`, others do not: provenance is not decidable. */
+  | 'inconsistent_media_metadata'
+  /** At least one chunk is audio. D3 salvages video segments, not sessions. */
+  | 'mixed_session'
+  /** No chunk carries `media`, and at least one fails the segment signature. */
+  | 'unverifiable_legacy_media';
 
 export interface LocalSegmentSource {
   chunk_index: number;
@@ -374,6 +383,109 @@ interface RawChunk {
   hash?: unknown;
   size?: unknown;
   local_uri?: unknown;
+  media?: unknown;
+}
+
+/**
+ * G3' — does this `local_uri` carry the unambiguous signature of a native
+ * segment belonging to THIS session?
+ *
+ * `media: 'video'` is not enough on its own. `videoChunkSink` writes
+ * `media: 'video'` for legacy post-stop base64 slices that live under
+ * `chunks/<sid>/N.b64`; those are not segments and must never be exported
+ * as `segment_NNNNNN.mp4`. Only the adopter's own layout qualifies:
+ *
+ *   <anything>/segments/<session_id>/segment_NNNNNN.mp4
+ *
+ * Deliberately NOT a substring or `endsWith` test. The session id is
+ * matched literally between its own separators, and the basename must be
+ * exactly `segment_` + six digits + `.mp4` — so a path for a different
+ * session, a nested directory, a lookalike name (`segment_00001.mp4`,
+ * `segment_000001.mp4.tmp`, `xsegment_000001.mp4`) or a traversal segment
+ * all fail.
+ *
+ * `stableSegmentDir` is NOT imported from `src/video/segmentAdopter`: D3
+ * must not take a dependency on the video module to state what it will
+ * refuse. The shape is asserted here, and the adopter's tests assert the
+ * shape it produces; the pair is what keeps them in agreement.
+ */
+function hasNativeSegmentSignature(
+  localUri: unknown,
+  sessionId: string,
+): boolean {
+  if (typeof localUri !== 'string' || localUri.length === 0) return false;
+  // Reject traversal and Windows-style separators outright rather than
+  // trying to normalise them.
+  if (localUri.includes('..') || localUri.includes('\\')) return false;
+  const parts = localUri.split('/');
+  if (parts.length < 3) return false;
+  const file = parts[parts.length - 1] as string;
+  const sid = parts[parts.length - 2] as string;
+  const dir = parts[parts.length - 3] as string;
+  if (dir !== 'segments') return false;
+  if (sid !== sessionId) return false;
+  return /^segment_\d{6}\.mp4$/.test(file);
+}
+
+/** Outcome of classifying a queue entry's chunks by medium. */
+type MediaVerdict = { ok: true } | { ok: false; rejected: LocalSegmentRejection };
+
+/**
+ * G3' — decide whether every chunk of this entry may be treated as a
+ * native video segment. Fails CLOSED on every ambiguity.
+ *
+ *   video + valid signature        → continue
+ *   video + invalid signature      → reject   (the real `videoChunkSink` case)
+ *   audio                          → reject
+ *   unknown value                  → reject
+ *   some with, some without        → reject
+ *   none, all signatures valid     → continue (pre-G3' entries)
+ *   none, any signature invalid    → reject
+ *
+ * No branch infers "video" from `entry.uri === ''` alone.
+ */
+function classifyChunkMedia(
+  sources: readonly { chunk_index: number; local_uri: string }[],
+  mediaByIndex: ReadonlyMap<number, unknown>,
+  sessionId: string,
+): MediaVerdict {
+  let withMedia = 0;
+  let withoutMedia = 0;
+
+  for (const s of sources) {
+    const media = mediaByIndex.get(s.chunk_index);
+    if (media === undefined) {
+      withoutMedia += 1;
+      continue;
+    }
+    if (media !== 'video' && media !== 'audio') {
+      return { ok: false, rejected: 'unknown_media_metadata' };
+    }
+    if (media === 'audio') {
+      return { ok: false, rejected: 'mixed_session' };
+    }
+    withMedia += 1;
+  }
+
+  if (withMedia > 0 && withoutMedia > 0) {
+    return { ok: false, rejected: 'inconsistent_media_metadata' };
+  }
+
+  // Whether the metadata is present or absent, EVERY surviving row must
+  // still carry the structural signature. This is the check that stops a
+  // `media: 'video'` legacy slice — and any future producer that forgets
+  // the field — from being exported as a segment.
+  for (const s of sources) {
+    if (!hasNativeSegmentSignature(s.local_uri, sessionId)) {
+      return {
+        ok: false,
+        rejected:
+          withMedia > 0 ? 'not_segmented_video' : 'unverifiable_legacy_media',
+      };
+    }
+  }
+
+  return { ok: true };
 }
 
 /**
@@ -446,6 +558,25 @@ export async function planLocalSegmentExport(
     : [];
 
   /**
+   * G3' — media classification gate.
+   *
+   * Deliberately runs AFTER the structural refusals below, not before:
+   * every rejection this module already emits keeps its precedence, so a
+   * queue that was `inconsistent_queue` yesterday is still
+   * `inconsistent_queue` today. The gate only ever ADDS refusals, and it
+   * still runs before a single byte is written or a SAF handle is asked
+   * for — which is all that safety requires.
+   *
+   * `entry.uri === ''` above proves the ENTRY belongs to the native
+   * segmented path; it does NOT prove that every chunk inside it is a
+   * segment, and once a Protection Session can carry two producers it
+   * stops proving anything about individual chunks. This is that gap.
+   *
+   * Nothing downstream changes: positional manifest validation, the
+   * re-read, the final verification and the packaging are untouched.
+   */
+
+  /**
    * A structurally inconsistent queue forbids `complete` — and here it
    * forbids everything, which is the stronger and simpler answer.
    *
@@ -469,6 +600,8 @@ export async function planLocalSegmentExport(
    * pick.
    */
   const uriOwner = new Map<string, number>();
+  /** G3' — declared medium per surviving index. See the classification gate. */
+  const mediaByIndex = new Map<number, unknown>();
   const corrupt = new Set<number>();
   for (const c of chunks) {
     const idx = c?.chunk_index;
@@ -537,7 +670,21 @@ export async function planLocalSegmentExport(
       size: c.size as number,
       local_uri: uri,
     });
+    // G3' — remember the declared medium of the row that WON this index.
+    // Kept beside `byIndex` rather than inside `LocalSegmentSource` so
+    // the exported plan shape stays untouched.
+    mediaByIndex.set(idx, c.media);
   }
+
+  // G3' — media classification. See the note above the gate's helper.
+  // Placed here so every pre-existing structural refusal keeps its
+  // precedence, and still before the first disk read or SAF handle.
+  const mediaVerdict = classifyChunkMedia(
+    [...byIndex.values()],
+    mediaByIndex,
+    sessionId,
+  );
+  if (!mediaVerdict.ok) return { rejected: mediaVerdict.rejected };
 
   const usable: LocalSegmentSource[] = [];
   // One segment in memory at a time; released before the next.

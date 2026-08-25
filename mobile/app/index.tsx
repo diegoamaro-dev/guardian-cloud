@@ -707,6 +707,35 @@ export interface QueueChunk {
   /** Set when the upload to Drive returned a file_id we should use as remote_reference on /chunks. */
   remote_reference?: string | null | undefined;
   last_error?: { status: number; code?: string; message: string } | undefined;
+  /**
+   * G3' — medium of THIS chunk's bytes.
+   *
+   * A property of the unit of evidence, never of the session: a
+   * Protection Session will eventually carry chunks of both media, and
+   * a session-level `mode` cannot describe that without lying.
+   *
+   * Written by exactly three producers, each medium-specific BY
+   * CONSTRUCTION — no parameter, no derivation, no heuristic:
+   *   · `segmentAdopter`  → 'video'  native segmented MP4 segments
+   *   · `videoChunkSink`  → 'video'  legacy post-stop video slices
+   *   · `emitChunk`       → 'audio'  called only by runAudioChunkerTick
+   *
+   * ── WHAT IT DOES NOT GUARANTEE ─────────────────────────────────────
+   * `'video'` does NOT mean "self-contained MP4 segment exportable by
+   * D3". `videoChunkSink` writes `'video'` for base64 slices living
+   * under `chunks/<sid>/N.b64`, which are NOT segments. Any consumer
+   * that wants to treat a chunk as a native segment must ALSO verify the
+   * structural signature `segments/<sid>/segment_NNNNNN.mp4`.
+   *
+   * Absence means "metadata unavailable" — never "video", never "audio".
+   * Entries written before G3' carry no key; the D3 fallback treats them
+   * by structural evidence alone and fails closed on any ambiguity.
+   *
+   * Optional and additive, like `destination_type`, `paused` and
+   * `evidence_closed`: making it required would break every inline chunk
+   * literal across the test suite.
+   */
+  media?: 'video' | 'audio' | undefined;
 }
 
 export interface PendingQueueEntry {
@@ -3914,7 +3943,10 @@ async function runVideoChunkerTick(
   }
 }
 
-async function emitChunk(
+// Exported for tests only — G3' pins that this writer, and only this
+// writer, stamps `media: 'audio'`. Follows the same convention as
+// `queueMutate` / `pickNext` / `tryFinalizeReadySessions`.
+export async function emitChunk(
   sessionId: string,
   base64Slice: string,
   chunk_index: number,
@@ -3981,6 +4013,10 @@ async function emitChunk(
     status: 'pending',
     attempts: 0,
     local_uri,
+    // G3' — `emitChunk` is called only from `runAudioChunkerTick`; the
+    // video tick delegates to `videoChunkSink` and never reaches here.
+    // The medium is therefore known statically. Literal, not derived.
+    media: 'audio',
   };
   await queueAppendChunk(sessionId, chunk, emittedAfter, chunk_index + 1);
   if (DEBUG_QUEUE) {
@@ -4146,7 +4182,10 @@ function videoChunkLocalUri(sessionId: string, chunk_index: number): string {
  * `emittedBase64Length` is passed as `null`: the video path tracks
  * progress by `chunks[*]` count, not by the audio-only resume cursor.
  */
-async function videoChunkSink(payload: ChunkPayload): Promise<void> {
+// Exported for tests only — G3' pins that this writer stamps
+// `media: 'video'` while producing NON-segment paths, which is exactly
+// why D3 cannot trust the medium alone.
+export async function videoChunkSink(payload: ChunkPayload): Promise<void> {
   const bytes = sliceToBytes(payload.base64Slice);
   const hash = bytesDigestToHex(
     await Crypto.digest(Crypto.CryptoDigestAlgorithm.SHA256, bytes),
@@ -4174,6 +4213,11 @@ async function videoChunkSink(payload: ChunkPayload): Promise<void> {
     status: 'pending',
     attempts: 0,
     local_uri,
+    // G3' — this sink is wired only to `VideoFileChunkProducer` (legacy
+    // post-stop video), so the medium is known statically. NOTE: these
+    // are base64 slices under `chunks/<sid>/`, NOT native MP4 segments —
+    // `media: 'video'` alone must never let them into D3.
+    media: 'video',
   };
   await queueAppendChunk(
     payload.sessionId,

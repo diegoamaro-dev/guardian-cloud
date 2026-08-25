@@ -119,6 +119,10 @@ function makeWorld(
     transformManifestText?: ((text: string) => string) | undefined;
     /** rows declaring `size: 0` with the genuine sha256 of zero bytes */
     emptyRows?: number[];
+    /** G3' — per-index `media` value. A missing key means metadata absent. */
+    media?: Record<number, unknown>;
+    /** G3' — per-index override of the declared `local_uri`. */
+    uriOverride?: Record<number, string>;
     /** these indexes all declare the FIRST listed index's `local_uri` */
     sharedUri?: number[];
     /** rows whose `local_uri` is the empty string */
@@ -147,7 +151,13 @@ function makeWorld(
   const rows = opts.rows ?? [0, 1, 2];
   const files = new Map<string, string>();
   const sizes = new Map<string, number>();
-  const uriOf = (i: number) => `file:///chunks/${SID}/seg${i}.mp4`;
+  // G3' — the fixtures now model the REAL adopter layout,
+  // `<docDir>segments/<sid>/segment_NNNNNN.mp4`. The previous synthetic
+  // shape (`chunks/<sid>/seg0.mp4`) is one production never emits, and
+  // D3 now refuses it on purpose: the path IS the signature that a chunk
+  // is a native segment.
+  const uriOf = (i: number) =>
+    `file:///docs/segments/${SID}/segment_${String(i).padStart(6, '0')}.mp4`;
 
   const chunks = rows.map(i => {
     // `segment(i, 0)` is a genuinely empty file with the genuine sha256
@@ -156,14 +166,16 @@ function makeWorld(
     // A row may deliberately point at another index's file, or at none.
     const declaredUri = opts.emptyUriRows?.includes(i)
       ? ''
-      : opts.sharedUri?.includes(i)
-        ? uriOf(opts.sharedUri[0]!)
-        : uriOf(i);
+      : opts.uriOverride?.[i] !== undefined
+        ? (opts.uriOverride[i] as string)
+        : opts.sharedUri?.includes(i)
+          ? uriOf(opts.sharedUri[0]!)
+          : uriOf(i);
     if (!opts.absent?.includes(i)) {
       files.set(uriOf(i), s.b64);
       sizes.set(uriOf(i), s.bytes.length);
     }
-    return {
+    const row: Record<string, unknown> = {
       chunk_index: i,
       hash: opts.badHash?.includes(i) ? 'f'.repeat(64) : s.hash,
       size: opts.badSize?.includes(i) ? s.bytes.length + 7 : s.bytes.length,
@@ -171,6 +183,10 @@ function makeWorld(
       attempts: 0,
       local_uri: declaredUri,
     };
+    // G3' — the key is set ONLY when the fixture asks for it, so "absent"
+    // means a genuinely missing key and never an explicit `undefined`.
+    if (opts.media && i in opts.media) row.media = opts.media[i];
+    return row;
   });
 
   const dupOf = (i: number, over: Partial<Record<string, unknown>>) => {
@@ -218,8 +234,12 @@ function makeWorld(
   const readBackCounts = new Map<string, number>();
   let copyPass = false;
 
+  // G3' — sources now use the real adopter naming, so this matches the
+  // same shape as `idxFromTarget`. The two stay distinct because they are
+  // applied to different maps (sources vs SAF destinations), not because
+  // their filenames differ.
   const idxFromUri = (uri: string) =>
-    Number(uri.match(/seg(\d+)\.mp4$/)?.[1] ?? -1);
+    Number(uri.match(/segment_(\d+)\.mp4$/)?.[1] ?? -1);
   const idxFromTarget = (uri: string) =>
     Number(uri.match(/segment_(\d+)\.mp4$/)?.[1] ?? -1);
 
@@ -1393,5 +1413,131 @@ describe('D3 — teeth', () => {
         ).toBe(true);
       }
     }
+  });
+});
+
+/**
+ * G3' — media classification.
+ *
+ * `media` says what a chunk's bytes ARE. It does not say the chunk is a
+ * native segment: `videoChunkSink` writes `media: 'video'` for legacy
+ * post-stop base64 slices under `chunks/<sid>/N.b64`, which are not
+ * segments. So D3 requires BOTH the medium and the structural signature
+ * `segments/<sid>/segment_NNNNNN.mp4`, and fails closed on any ambiguity.
+ */
+describe("D3 — G3' media classification", () => {
+  const legacyVideoUri = (i: number) => `file:///docs/chunks/${SID}/${i}.b64`;
+
+  it('M1 — video + valid signature continues (the current production shape)', async () => {
+    const p = await planOf(
+      makeWorld({ rows: [0, 1], nextChunkIndex: 2, media: { 0: 'video', 1: 'video' } }),
+    );
+    expect(p.status).toBe('complete');
+  });
+
+  it("M2 — ★ media:'video' on a chunks/<sid>/N.b64 path NEVER enters D3", async () => {
+    // The real `videoChunkSink` shape. Without this refusal, legacy video
+    // slices would be written out as `segment_NNNNNN.mp4` and certified.
+    const w = makeWorld({
+      rows: [0, 1],
+      nextChunkIndex: 2,
+      media: { 0: 'video', 1: 'video' },
+      uriOverride: { 1: legacyVideoUri(1) },
+    });
+    expect(await planLocalSegmentExport(SID, w.deps)).toEqual({
+      rejected: 'not_segmented_video',
+    });
+  });
+
+  it('M3 — a single audio chunk refuses the whole export', async () => {
+    const w = makeWorld({
+      rows: [0, 1],
+      nextChunkIndex: 2,
+      media: { 0: 'video', 1: 'audio' },
+    });
+    expect(await planLocalSegmentExport(SID, w.deps)).toEqual({
+      rejected: 'mixed_session',
+    });
+  });
+
+  it('M4 — an unrecognised media value fails closed', async () => {
+    for (const bad of ['vídeo', 'VIDEO', 42, null, {}]) {
+      const w = makeWorld({
+        rows: [0, 1],
+        nextChunkIndex: 2,
+        media: { 0: 'video', 1: bad },
+      });
+      expect(await planLocalSegmentExport(SID, w.deps)).toEqual({
+        rejected: 'unknown_media_metadata',
+      });
+    }
+  });
+
+  it('M5 — mixed provenance (some rows with metadata, some without) fails closed', async () => {
+    const w = makeWorld({ rows: [0, 1], nextChunkIndex: 2, media: { 0: 'video' } });
+    expect(await planLocalSegmentExport(SID, w.deps)).toEqual({
+      rejected: 'inconsistent_media_metadata',
+    });
+  });
+
+  it('M6 — legacy (no metadata anywhere) continues on the signature alone', async () => {
+    // Every entry that exists on a device today. Verdict must be
+    // bit-for-bit what it was before G3'.
+    const p = await planOf(makeWorld({ rows: [0, 1, 2], nextChunkIndex: 3 }));
+    expect(p.status).toBe('complete');
+    expect(p.usable.map(u => u.chunk_index)).toEqual([0, 1, 2]);
+  });
+
+  it('M7 — legacy with ANY non-segment path fails closed, not "probably video"', async () => {
+    // The case the fallback must not wave through: no metadata, and a
+    // path that is not a native segment. `entry.uri === ''` alone must
+    // never be enough to call these bytes video.
+    const w = makeWorld({
+      rows: [0, 1],
+      nextChunkIndex: 2,
+      uriOverride: { 1: legacyVideoUri(1) },
+    });
+    expect(await planLocalSegmentExport(SID, w.deps)).toEqual({
+      rejected: 'unverifiable_legacy_media',
+    });
+  });
+
+  it('M8 — the signature is not a weak textual match', async () => {
+    const lookalikes = [
+      `file:///docs/segments/${SID}/segment_00001.mp4`, // five digits
+      `file:///docs/segments/${SID}/segment_000001.mp4.tmp`, // suffix
+      `file:///docs/segments/${SID}/xsegment_000001.mp4`, // prefix
+      `file:///docs/segments/${SID}/nested/segment_000001.mp4`, // deeper
+      `file:///docs/xsegments/${SID}/segment_000001.mp4`, // dir lookalike
+      `file:///docs/segments/${SID}x/segment_000001.mp4`, // sid lookalike
+      `file:///docs/segments/other-session/segment_000001.mp4`, // other sid
+      `file:///docs/segments/${SID}/../segments/${SID}/segment_000001.mp4`,
+    ];
+    for (const uri of lookalikes) {
+      const w = makeWorld({
+        rows: [0, 1],
+        nextChunkIndex: 2,
+        media: { 0: 'video', 1: 'video' },
+        uriOverride: { 1: uri },
+      });
+      expect(await planLocalSegmentExport(SID, w.deps)).toEqual({
+        rejected: 'not_segmented_video',
+      });
+    }
+  });
+
+  it('M9 — pre-existing refusals keep precedence over the media gate', async () => {
+    // The gate only ADDS refusals. A queue that was `inconsistent_queue`
+    // before G3' must still report `inconsistent_queue`, not a media
+    // verdict, even when the media metadata is also wrong.
+    const w = makeWorld({
+      rows: [0, 1],
+      nextChunkIndex: 2,
+      media: { 0: 'audio', 1: 'audio' },
+      dupWithDifferentHash: 0,
+    });
+    expect(await planLocalSegmentExport(SID, w.deps)).toEqual({
+      rejected: 'inconsistent_queue',
+    });
   });
 });

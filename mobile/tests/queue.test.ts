@@ -55,6 +55,8 @@ import {
   queueMarkSessionCompleted,
   queueBumpCompleteAttempts,
   pickNext,
+  emitChunk,
+  videoChunkSink,
   type PendingQueueEntry,
   type QueueChunk,
 } from '../app/index';
@@ -536,5 +538,53 @@ describe('G1 — pickNext is agnostic to evidence_closed', () => {
     expect(picks[0]).toBe(`${SID}#0`);
     expect(picks[0]).toBe(picks[1]);
     expect(picks[1]).toBe(picks[2]);
+  });
+});
+
+/**
+ * G3' — the three chunk writers, and the fact that each is
+ * medium-specific BY CONSTRUCTION.
+ *
+ * No parameter, no derivation, no heuristic on extension, path, UI or
+ * external state: each function can only ever be reached from one
+ * producer, so the literal it writes is the truth. These tests are what
+ * protect that property from drifting.
+ *
+ * Writer 1 (`segmentAdopter` → 'video') is pinned in
+ * `segmentAdopter.test.ts`, next to its own contract assertion.
+ */
+describe("G3' — chunk writers stamp their medium", () => {
+  it("W2 — emitChunk (audio chunker) stamps media:'audio'", async () => {
+    await queueAppendNewSession(emptyEntry());
+    await emitChunk(SID, 'QUJDRA==', 0, 8);
+    const [e] = await queueRead();
+    expect(e!.chunks).toHaveLength(1);
+    expect(e!.chunks[0]!.media).toBe('audio');
+  });
+
+  it("W3 — videoChunkSink (legacy post-stop video) stamps media:'video'", async () => {
+    await queueAppendNewSession(emptyEntry());
+    await videoChunkSink({ sessionId: SID, base64Slice: 'QUJDRA==', chunk_index: 0 });
+    const [e] = await queueRead();
+    expect(e!.chunks).toHaveLength(1);
+    expect(e!.chunks[0]!.media).toBe('video');
+  });
+
+  it('W4 — a legacy video chunk is video, yet its path is NOT a segment', async () => {
+    // The pair that proves `media` alone cannot authorise a D3 export:
+    // this row is genuinely video and genuinely not a native segment.
+    await queueAppendNewSession(emptyEntry());
+    await videoChunkSink({ sessionId: SID, base64Slice: 'QUJDRA==', chunk_index: 0 });
+    const [e] = await queueRead();
+    expect(e!.chunks[0]!.media).toBe('video');
+    expect(e!.chunks[0]!.local_uri).toContain(`chunks/${SID}/`);
+    expect(e!.chunks[0]!.local_uri).not.toContain('segments/');
+  });
+
+  it('W5 — media survives the persist/hydrate round-trip', async () => {
+    await queueAppendNewSession(emptyEntry());
+    await emitChunk(SID, 'QUJDRA==', 0, 8);
+    const raw = await AsyncStorage.getItem(PENDING_RETRY_KEY);
+    expect(JSON.parse(raw as string)[0].chunks[0].media).toBe('audio');
   });
 });

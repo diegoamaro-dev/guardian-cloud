@@ -282,6 +282,9 @@ function makeAdopt(): AdoptDouble {
             status: 'pending',
             attempts: 0,
             local_uri: record.stableUri,
+            // G3' — the real adopter stamps this literally; the double
+            // mirrors it so the two cannot drift apart silently.
+            media: 'video',
           },
           null,
           ev.segmentIndex + 1,
