@@ -326,3 +326,56 @@ describe('normalizeQueueOnRecovery — combined scenarios', () => {
     expect(q[0]?.chunks).toHaveLength(2);
   });
 });
+
+/**
+ * G1 — `evidence_closed` merge under duplicate collapse.
+ *
+ * Three-valued OR, mirroring the direction the existing boolean merge
+ * already uses (`true` wins) while treating absence as the neutral
+ * element. A plain `||` would collapse `undefined || false` into
+ * `false`, materialising the key on an entry that never carried it —
+ * which would hand G2 a queue full of synthetic `false` values
+ * indistinguishable from genuinely open sessions.
+ */
+describe('G1 — evidence_closed merge on duplicate collapse', () => {
+  it('R4a — any true wins', async () => {
+    await seed([
+      entry({ evidence_closed: false }),
+      entry({ evidence_closed: true }),
+    ]);
+    await normalizeQueueOnRecovery();
+    const [merged] = await queueRead();
+    expect(merged!.evidence_closed).toBe(true);
+  });
+
+  it('R4b — true wins even when the other side is absent', async () => {
+    const absent = entry();
+    delete (absent as Partial<PendingQueueEntry>).evidence_closed;
+    await seed([absent, entry({ evidence_closed: true })]);
+    await normalizeQueueOnRecovery();
+    const [merged] = await queueRead();
+    expect(merged!.evidence_closed).toBe(true);
+  });
+
+  it('R4c — no true, one false → false', async () => {
+    const absent = entry();
+    delete (absent as Partial<PendingQueueEntry>).evidence_closed;
+    await seed([absent, entry({ evidence_closed: false })]);
+    await normalizeQueueOnRecovery();
+    const [merged] = await queueRead();
+    expect(merged!.evidence_closed).toBe(false);
+  });
+
+  it('R4d — all absent STAYS absent: the key is never materialised', async () => {
+    const a = entry();
+    const b = entry();
+    delete (a as Partial<PendingQueueEntry>).evidence_closed;
+    delete (b as Partial<PendingQueueEntry>).evidence_closed;
+    await seed([a, b]);
+    await normalizeQueueOnRecovery();
+    const raw = await AsyncStorage.getItem(PENDING_RETRY_KEY);
+    const persisted = JSON.parse(raw as string) as Record<string, unknown>[];
+    expect(persisted).toHaveLength(1);
+    expect('evidence_closed' in persisted[0]!).toBe(false);
+  });
+});

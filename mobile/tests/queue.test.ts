@@ -54,9 +54,11 @@ import {
   queueMarkRecordingClosed,
   queueMarkSessionCompleted,
   queueBumpCompleteAttempts,
+  pickNext,
   type PendingQueueEntry,
   type QueueChunk,
 } from '../app/index';
+import { emptyPauseState } from '@/upload/pauseStore';
 
 const SID = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
 
@@ -238,6 +240,12 @@ describe('boot recovery — stuck `uploading` reset', () => {
       for (const e of q) {
         if (!e.recording_closed) {
           e.recording_closed = true;
+          // G1 — mirrors the product's parallel write. NOTE: this block
+          // is a REPLICA of the bootstrap body, not a call into it, so
+          // it cannot detect the product diverging from it. Real
+          // coverage would require extracting the block behind an
+          // exported helper — deliberately out of scope for G1.
+          e.evidence_closed = true;
           entriesClosed += 1;
         }
         for (const c of e.chunks) {
@@ -367,5 +375,166 @@ describe('persisted shape', () => {
     const parsed = JSON.parse(raw as string);
     expect(Array.isArray(parsed)).toBe(true);
     expect(parsed[0].session_id).toBe(SID);
+  });
+});
+
+/**
+ * G1 — durable representation of `evidence_closed`.
+ *
+ * `evidence_closed: true` means the Protection Session no longer accepts
+ * new evidence and may advance toward terminality. It does NOT encode the
+ * cause of that closure, does NOT mean the user tapped PARAR, and is NOT
+ * equivalent to `session_completed`.
+ *
+ * During G1 the field is INERT: `recording_closed` remains the sole
+ * operational authority, and absence means only "metadata unavailable" —
+ * never "closed" and never "open". These tests pin the representation;
+ * the invariance tests that prove nothing reads it live in
+ * `finalize.test.ts` and `drainPause.test.ts`.
+ */
+describe('G1 — evidence_closed durable representation', () => {
+  it('R1 — survives a full persist → hydrate round-trip', async () => {
+    await queueAppendNewSession(emptyEntry({ evidence_closed: true }));
+
+    // Re-read through the real parse path, not the in-memory object.
+    const raw = await AsyncStorage.getItem(PENDING_RETRY_KEY);
+    expect(JSON.parse(raw as string)[0].evidence_closed).toBe(true);
+
+    const [hydrated] = await queueRead();
+    expect(hydrated!.evidence_closed).toBe(true);
+  });
+
+  it('R1c — the PRODUCT write path stamps it: queueMarkRecordingClosed', async () => {
+    // R1/R1b prove the storage layer carries the field. This proves the
+    // product actually writes it, in parallel with `recording_closed`
+    // and with the same value. Without this, removing the parallel write
+    // from `queueMarkRecordingClosed` would go unnoticed.
+    await queueAppendNewSession(emptyEntry());
+    await queueMarkRecordingClosed(SID, 'file:///doc/final.m4a', 0, 3);
+    const [e] = await queueRead();
+    expect(e!.recording_closed).toBe(true);
+    expect(e!.evidence_closed).toBe(true);
+  });
+
+  it('R1d — the three session constructors stamp it false at creation', async () => {
+    // Mirrors what `queueAppendNewSession` receives from each of the
+    // three real call sites (native segmented, audio/legacy, orphan
+    // adoption). A constructor that forgot the field would leave the
+    // key absent here.
+    await queueAppendNewSession(emptyEntry({ evidence_closed: false }));
+    const [e] = await queueRead();
+    expect(e!.evidence_closed).toBe(false);
+    expect(e!.recording_closed).toBe(false);
+  });
+
+  it('R1b — `false` round-trips as false, distinct from absent', async () => {
+    await queueAppendNewSession(emptyEntry({ evidence_closed: false }));
+    const [hydrated] = await queueRead();
+    expect(hydrated!.evidence_closed).toBe(false);
+    expect('evidence_closed' in hydrated!).toBe(true);
+  });
+
+  it('R2 — an UNDECLARED field survives the round-trip untouched', async () => {
+    // queueMutate reserialises with JSON.stringify and never strips
+    // unknown keys. G2 depends on this: it can add fields without a
+    // migration. If someone introduces schema filtering, this breaks.
+    const store = (AsyncStorage as unknown as { __store__: Map<string, string> })
+      .__store__;
+    store.set(
+      PENDING_RETRY_KEY,
+      JSON.stringify([{ ...emptyEntry(), future_field_from_g2: 'keep-me' }]),
+    );
+
+    // Any mutation forces a full read → write cycle.
+    await queueBumpCompleteAttempts(SID);
+
+    const raw = await AsyncStorage.getItem(PENDING_RETRY_KEY);
+    expect(JSON.parse(raw as string)[0].future_field_from_g2).toBe('keep-me');
+  });
+
+  it('R3 — a legacy entry keeps `recording_closed` semantics and stays absent', async () => {
+    // A pre-G1 entry: no `evidence_closed` key at all.
+    const legacy = emptyEntry({ recording_closed: true });
+    delete (legacy as Partial<PendingQueueEntry>).evidence_closed;
+    const store = (AsyncStorage as unknown as { __store__: Map<string, string> })
+      .__store__;
+    store.set(PENDING_RETRY_KEY, JSON.stringify([legacy]));
+
+    await queueBumpCompleteAttempts(SID);
+
+    const [hydrated] = await queueRead();
+    // Operational authority untouched…
+    expect(hydrated!.recording_closed).toBe(true);
+    // …and the new metadata is NOT materialised out of thin air.
+    expect(hydrated!.evidence_closed).toBeUndefined();
+    const raw = await AsyncStorage.getItem(PENDING_RETRY_KEY);
+    expect('evidence_closed' in JSON.parse(raw as string)[0]).toBe(false);
+  });
+});
+
+/**
+ * G1 — the shared chunk counter must stay media-agnostic.
+ *
+ * `next_chunk_index` is the denominator of the completion gate. Under
+ * Continuous Protection a single Protection Session will carry chunks
+ * produced by different producers, which today already have different
+ * shapes: audio carries `base64Slice`, native segmented video carries
+ * `local_uri`. This pins the property BEFORE phases exist, so any future
+ * change that resets or partitions the counter per producer fails here.
+ */
+describe('G1 — next_chunk_index monotonicity across chunk shapes', () => {
+  it('R5 — stays monotone when interleaving base64Slice and local_uri chunks', async () => {
+    await queueAppendNewSession(emptyEntry());
+
+    const shapes: QueueChunk[] = [
+      { ...pendingChunk(0) },
+      { chunk_index: 1, hash: 'b'.repeat(64), size: 200, status: 'pending', attempts: 0, local_uri: 'file:///seg/1.mp4' },
+      { ...pendingChunk(2) },
+      { chunk_index: 3, hash: 'd'.repeat(64), size: 400, status: 'pending', attempts: 0, local_uri: 'file:///seg/3.mp4' },
+    ];
+
+    const seen: number[] = [];
+    for (const c of shapes) {
+      // `null` for the audio-only base64 bookkeeping — the counter under
+      // test is `nextChunkIndex`, which both producers share.
+      await queueAppendChunk(SID, c, null, c.chunk_index + 1);
+      const [e] = await queueRead();
+      seen.push(e!.next_chunk_index);
+    }
+
+    expect(seen).toEqual([1, 2, 3, 4]);
+    const [final] = await queueRead();
+    expect(final!.chunks.map(c => c.chunk_index)).toEqual([0, 1, 2, 3]);
+  });
+});
+
+/**
+ * G1 — the upload worker must stay blind to `evidence_closed`.
+ *
+ * `pickNext` selects purely on chunk status and index, and rehydrates by
+ * chunk SHAPE (`base64Slice` → `local_uri` → byte range), never by any
+ * session-level attribute. That is the property which will let a single
+ * Protection Session carry several producers without touching transport.
+ */
+describe('G1 — pickNext is agnostic to evidence_closed', () => {
+  it('I3 — selects the same chunk for true / false / absent', async () => {
+    const picks: (string | null)[] = [];
+    const variants: Partial<PendingQueueEntry>[] = [
+      { evidence_closed: true },
+      { evidence_closed: false },
+      {},
+    ];
+    for (const patch of variants) {
+      await AsyncStorage.clear();
+      await queueAppendNewSession(
+        emptyEntry({ recording_closed: true, ...patch }),
+      );
+      await queueAppendChunk(SID, pendingChunk(0), null, 1);
+      const pick = await pickNext(await queueRead(), emptyPauseState());
+      picks.push(pick ? `${pick.sessionId}#${pick.chunk.chunk_index}` : null);
+    }
+    expect(picks[0]).toBe(`${SID}#0`);
+    expect(picks[0]).toBe(picks[1]);
+    expect(picks[1]).toBe(picks[2]);
   });
 });

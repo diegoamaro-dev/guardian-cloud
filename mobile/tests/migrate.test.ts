@@ -184,3 +184,33 @@ describe('migrateLegacyPendingState', () => {
     expect(q[0]?.chunks).toHaveLength(3);
   });
 });
+
+/**
+ * G1 — the legacy migration deliberately does NOT write `evidence_closed`.
+ *
+ * Populating it here would add a write and a failure surface for a value
+ * nobody reads during G1, and would erase the distinction between "this
+ * entry predates G1" and "this session was genuinely open". Absence is
+ * the correct, information-preserving outcome: it means only that the
+ * metadata is unavailable.
+ */
+describe('G1 — migrateLegacyPendingState leaves evidence_closed absent', () => {
+  it('R6 — migrated entries carry recording_closed but no evidence_closed key', async () => {
+    const legacy = {
+      session_id: SID,
+      uri: 'file:///doc/legacy.m4a',
+      remaining: [{ chunk_index: 0, hash: 'h0'.repeat(32), size: 100 }],
+    };
+    await AsyncStorage.setItem(PENDING_RETRY_KEY, JSON.stringify(legacy));
+
+    await migrateLegacyPendingState();
+
+    const raw = await AsyncStorage.getItem(PENDING_RETRY_KEY);
+    const persisted = JSON.parse(raw as string) as Record<string, unknown>[];
+    expect(persisted).toHaveLength(1);
+    // Operational authority is set, exactly as before G1…
+    expect(persisted[0]!.recording_closed).toBe(true);
+    // …and the new metadata is absent, not false.
+    expect('evidence_closed' in persisted[0]!).toBe(false);
+  });
+});

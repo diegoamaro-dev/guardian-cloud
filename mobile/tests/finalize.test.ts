@@ -543,3 +543,129 @@ describe('TEST_ZERO_CHUNK_ENTRY_IS_NEVER_COMPLETED_OR_REAPED', () => {
     expect(await queueRead()).toEqual([]);
   });
 });
+
+/**
+ * G1 — invariance of terminality under `evidence_closed`.
+ *
+ * This is the tooth that DEFINES gate G1: the durable field exists, is
+ * persisted and hydrated, and governs absolutely nothing. If any of
+ * these ever fail, someone wired `evidence_closed` into an operational
+ * decision ahead of G2.
+ *
+ * `recording_closed` remains the sole authority. Absence of
+ * `evidence_closed` means only "metadata unavailable" — it must not be
+ * read as closed OR as open.
+ */
+describe('G1 — evidence_closed is inert: terminality invariance', () => {
+  const variants: { label: string; patch: Partial<PendingQueueEntry> }[] = [
+    { label: 'true', patch: { evidence_closed: true } },
+    { label: 'false', patch: { evidence_closed: false } },
+    { label: 'absent', patch: {} },
+  ];
+
+  it('I1 — a READY session finalises identically for true / false / absent', async () => {
+    const outcomes: { finalized: boolean; calls: number; left: number }[] = [];
+    for (const v of variants) {
+      // Reset storage and call counts, then RE-ESTABLISH what the
+      // suite's `beforeEach` installs — `clearAllMocks` alone would strip
+      // the token resolvers and every variant would bail identically for
+      // the wrong reason, making the comparison vacuous.
+      await AsyncStorage.clear();
+      vi.clearAllMocks();
+      vi.mocked(getFreshAccessToken).mockResolvedValue('test-token');
+      vi.mocked(getOwnershipAccessToken).mockResolvedValue(
+        'test-token' as OwnershipToken,
+      );
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => ({
+          ok: true,
+          status: 200,
+          json: async () => ({ session_id: SID, status: 'completed' }),
+        })),
+      );
+      await queueAppendNewSession(
+        entry({
+          recording_closed: true,
+          next_chunk_index: 1,
+          chunks: [uploadedChunk(0)],
+          ...v.patch,
+        }),
+      );
+      const finalized = await tryFinalizeReadySessions();
+      outcomes.push({
+        finalized,
+        calls: (global.fetch as unknown as { mock: { calls: unknown[] } }).mock
+          .calls.length,
+        left: (await queueRead()).length,
+      });
+    }
+    // Every variant must agree — with each other AND with the pre-G1
+    // behaviour: a ready session completes and is reaped.
+    expect(outcomes[0]).toEqual(outcomes[1]);
+    expect(outcomes[1]).toEqual(outcomes[2]);
+    expect(outcomes[0]!.finalized).toBe(true);
+  });
+
+  it('I2 — a BLOCKED session stays blocked for true / false / absent', async () => {
+    const outcomes: { finalized: boolean; calls: number; left: number }[] = [];
+    for (const v of variants) {
+      // Reset storage and call counts, then RE-ESTABLISH what the
+      // suite's `beforeEach` installs — `clearAllMocks` alone would strip
+      // the token resolvers and every variant would bail identically for
+      // the wrong reason, making the comparison vacuous.
+      await AsyncStorage.clear();
+      vi.clearAllMocks();
+      vi.mocked(getFreshAccessToken).mockResolvedValue('test-token');
+      vi.mocked(getOwnershipAccessToken).mockResolvedValue(
+        'test-token' as OwnershipToken,
+      );
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => ({
+          ok: true,
+          status: 200,
+          json: async () => ({ session_id: SID, status: 'completed' }),
+        })),
+      );
+      await queueAppendNewSession(
+        entry({
+          // recording_closed is the authority: false must block, no
+          // matter what evidence_closed says.
+          recording_closed: false,
+          next_chunk_index: 1,
+          chunks: [uploadedChunk(0)],
+          ...v.patch,
+        }),
+      );
+      const finalized = await tryFinalizeReadySessions();
+      outcomes.push({
+        finalized,
+        calls: (global.fetch as unknown as { mock: { calls: unknown[] } }).mock
+          .calls.length,
+        left: (await queueRead()).length,
+      });
+    }
+    expect(outcomes[0]).toEqual(outcomes[1]);
+    expect(outcomes[1]).toEqual(outcomes[2]);
+    expect(outcomes[0]!.finalized).toBe(false);
+    expect(outcomes[0]!.left).toBe(1);
+  });
+
+  it('I2b — evidence_closed=true CANNOT unblock a session recording_closed=false', async () => {
+    // The sharpest form of the invariant: the new field claiming
+    // terminality must not authorise /complete while the operational
+    // authority says the session is still open.
+    await queueAppendNewSession(
+      entry({
+        recording_closed: false,
+        evidence_closed: true,
+        next_chunk_index: 1,
+        chunks: [uploadedChunk(0)],
+      }),
+    );
+    expect(await tryFinalizeReadySessions()).toBe(false);
+    expect(global.fetch).not.toHaveBeenCalled();
+    expect(await queueRead()).toHaveLength(1);
+  });
+});

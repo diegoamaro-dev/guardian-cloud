@@ -770,6 +770,36 @@ export interface PendingQueueEntry {
         code?: string | undefined;
       }
     | undefined;
+  /**
+   * G1 — durable terminality state of the Protection Session.
+   *
+   * `true` means: this Protection Session no longer accepts new evidence
+   * and may advance toward terminality.
+   *
+   * It does NOT encode the CAUSE of that closure. It does not mean the
+   * user tapped PARAR, it is not equivalent to `session_completed`, and
+   * it does not assert that `/complete` has happened.
+   *
+   * ── INERT DURING G1 ────────────────────────────────────────────────
+   * `recording_closed` remains the SOLE operational authority. Nothing
+   * reads this field: not `tryFinalizeReadySessions`, not `pickNext`,
+   * not cleanup, not recovery. It is written in parallel with
+   * `recording_closed`, carrying the same value, so the schema is on
+   * disk and proven before G2 changes WHO writes it and WHO reads it.
+   *
+   * Absence means ONLY "metadata unavailable" — never "closed", never
+   * "open". Entries written before G1, and those produced by
+   * `migrateLegacyPendingState` (deliberately untouched), have no key at
+   * all. The operational fallback policy for a missing value belongs to
+   * G2, once cross-version compatibility has been audited; defining one
+   * here would decide G2 in advance.
+   *
+   * Optional and additive: the same pattern as `destination_type` and
+   * `paused`. Making it required would break every inline entry literal
+   * across the test suite, which is precisely the destructive migration
+   * this shape avoids.
+   */
+  evidence_closed?: boolean | undefined;
 }
 
 const CHUNK_TICK_MS = 1500;
@@ -1088,6 +1118,10 @@ export async function queueMarkRecordingClosed(
     const e = q.find(x => x.session_id === sessionId);
     if (!e) return;
     e.recording_closed = true;
+    // G1 — parallel write, same value, same moment. `recording_closed`
+    // stays the operational authority; this only records the durable
+    // terminality state of the Protection Session. Inert during G1.
+    e.evidence_closed = true;
     e.uri = finalUri;
     e.emitted_base64_length = emittedBase64Length;
     e.next_chunk_index = nextChunkIndex;
@@ -1263,6 +1297,20 @@ export async function normalizeQueueOnRecovery(): Promise<NormalizationReport> {
       );
       target.recording_closed =
         target.recording_closed || dup.recording_closed;
+      // G1 — three-valued OR, mirroring the direction of the boolean
+      // merge above (`true` wins) while treating absence as the neutral
+      // element. A plain `||` would turn `undefined || false` into
+      // `false`, materialising the key on an entry that never had it and
+      // asserting knowledge we do not have. Two absences stay absent.
+      target.evidence_closed =
+        target.evidence_closed === true || dup.evidence_closed === true
+          ? true
+          : target.evidence_closed === false || dup.evidence_closed === false
+            ? false
+            : undefined;
+      if (target.evidence_closed === undefined) {
+        delete target.evidence_closed;
+      }
       target.session_completed =
         target.session_completed || dup.session_completed;
       target.complete_attempts = Math.max(
@@ -5793,6 +5841,12 @@ export default function Index() {
             for (const e of q) {
               if (!e.recording_closed) {
                 e.recording_closed = true;
+                // G1 — parallel write. This route force-closes every
+                // persisted entry on a cold boot; see finding S2, which
+                // records that ADR-CONTINUOUS-PROTECTION §6 will require
+                // revisiting it in G7. G1 changes neither the condition
+                // nor the behaviour: it only mirrors the value.
+                e.evidence_closed = true;
                 entriesClosed += 1;
               }
               for (const c of e.chunks) {
@@ -6414,6 +6468,9 @@ export default function Index() {
           // `local_uri`.
           uri: '',
           recording_closed: false,
+          // G1 — written in parallel with `recording_closed`, same value.
+          // Inert: nothing reads it. See the field's docblock.
+          evidence_closed: false,
           session_completed: false,
           complete_attempts: 0,
           emitted_base64_length: 0,
@@ -6567,6 +6624,9 @@ export default function Index() {
         session_id: localSessionId,
         uri: cacheUri,
         recording_closed: false,
+        // G1 — written in parallel with `recording_closed`, same value.
+        // Inert: nothing reads it. See the field's docblock.
+        evidence_closed: false,
         session_completed: false,
         complete_attempts: 0,
         emitted_base64_length: 0,
@@ -7276,6 +7336,9 @@ export default function Index() {
       session_id: sessionId,
       uri: orphan.uri,
       recording_closed: false,
+      // G1 — written in parallel with `recording_closed`, same value.
+      // Inert: nothing reads it. See the field's docblock.
+      evidence_closed: false,
       session_completed: false,
       complete_attempts: 0,
       emitted_base64_length: 0,
