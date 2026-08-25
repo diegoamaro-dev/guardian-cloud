@@ -74,6 +74,14 @@ documento, pero sí cobertura automática densa: `legacyProbeSeal` (52),
   SAF con `status: complete`, 12/12 segmentos, manifest válido y `sha256`
   coincidente en los doce. Es **supervivencia, no recuperación**: no cierra
   `GC-AUTH-SESSION-RECOVERY-001` ni implementa el export `.mp4`.
+* **`POST-SALVAGE NETWORK RECOVERY`** es un **gate distinto**, también `PASS` el
+  24/08 y sobre la misma sesión: al restaurar la conectividad después del
+  salvage, la sesión convergió con normalidad —mismo `localSessionId`, 1
+  `POST /sessions`, 12/12 chunks con 12 `remote_reference` únicas, `missing []`,
+  `/complete`, `GC_CLEANUP_AUTHORIZED` con `http_200`, cleanup y `GC_QUEUE`
+  vacía— con el export SAF intacto (13/13 por `sha256`). Demuestra que **D3 es
+  aditivo**: el salvage no interfiere con la convergencia normal posterior. **No
+  reproduce** el escenario del finding, que sigue `OPEN`.
 * Validación automática vigente, ejecutada el 2026-08-24 sobre el árbol
   posterior a `cb59c7e`: **900/900 tests en 42 ficheros**; 12 errores
   TypeScript históricos y cero nuevos; `git diff --check` limpio.

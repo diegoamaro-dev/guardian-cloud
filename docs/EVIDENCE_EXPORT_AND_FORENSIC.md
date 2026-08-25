@@ -79,6 +79,19 @@ Límites que condicionan cualquier afirmación forense futura:
 >
 > Alcance y evidencia en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §5.
 
+> **Las dos copias coexisten, y conviene saberlo antes de peritar.** Un segundo
+> gate del 2026-08-24 —`POST-SALVAGE NETWORK RECOVERY`, `PASS`— demostró en
+> hardware que, si la conectividad vuelve después del salvage, la misma sesión
+> se registra, sube sus fragmentos y completa con normalidad. Al terminar
+> conviven **dos artefactos independientes**: la evidencia remota subida por el
+> pipeline, y el export SAF en poder del usuario. El cleanup borró las fuentes
+> del sandbox **sin tocar** el export SAF, que es almacenamiento distinto y cae
+> fuera del journal de limpieza.
+>
+> Para un peritaje eso significa que ambos deben poder cotejarse, y que **el
+> export SAF no es una copia derivada de lo subido**: son los mismos bytes de
+> origen, verificados por `sha256` por dos caminos distintos.
+
 `GC-AUD-001` —el vídeo no subía durante la captura— **ya no es un límite
 vigente**: la ruta nativa segmentada sube durante la grabación y quedó
 demostrado en hardware el 20/08. Ver la

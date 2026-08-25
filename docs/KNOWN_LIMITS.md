@@ -1253,6 +1253,65 @@ Evidencia congelada fuera del repositorio, con `26/26` hashes verificados y
 barrido de secretos limpio:
 `2026-08-24-d3-local-segment-salvage-hardware/PROVENANCE.md`.
 
+### `POST-SALVAGE NETWORK RECOVERY` — segundo gate, independiente
+
+**`PASS` el 2026-08-24.** Es un gate **distinto** del anterior y no debe fundirse
+con él: aquél probó que el salvage funciona; éste prueba que **no estorba**.
+
+Continuación de la misma corrida, misma sesión
+(`14363043-307e-49c6-815d-90fbb142ade4`), mismo APK `8151c338…`, mismo proceso
+sin reiniciar. Tras el export local se restauró la conectividad y se observó la
+convergencia normal:
+
+```
+D3 export local complete
+→ los 12 chunks originales siguen pendientes en la cola
+→ vuelve la conectividad
+→ se registra el MISMO localSessionId          1 POST /sessions efectivo
+→ 12/12 chunks confirmados, índices 0–11
+→ 12 remote_reference únicas                   mapa 1↔1
+→ missingUploadedIndexes = []
+→ /complete DESPUÉS del 12/12
+→ GC_CLEANUP_AUTHORIZED con http_200
+→ cleanup local DESPUÉS de la autorización
+→ GC_QUEUE queda sin la sesión                 entries 0 · pending 0
+→ el export SAF permanece intacto              13/13 por sha256
+```
+
+Sin índices nuevos, sin chunks duplicados, sin `uploaded` falsos, sin una
+segunda sesión remota y sin `hash mismatch`.
+
+**Lo que autoriza a afirmar:**
+
+> **D3 es aditivo**: el salvage local no impide el registro, la subida, la
+> completion ni el cleanup normales posteriores de la misma sesión cuando
+> vuelve la conectividad.
+
+Consecuencia forense, y no menor: tras converger **coexisten las dos copias**
+—la evidencia remota subida con normalidad y el export SAF independiente del
+usuario—. El cleanup eliminó las fuentes correspondientes del sandbox **sin
+tocar** el export SAF, que es almacenamiento distinto y queda fuera del alcance
+del journal de limpieza.
+
+**Lo que NO autoriza a afirmar.** Esta corrida **no reproduce el escenario del
+finding**: la credencial nunca se destruyó, así que lo que convergió fue una
+sesión offline con token caducado, no una sesión huérfana de identidad.
+`GC-AUTH-SESSION-RECOVERY-001` sigue `OPEN` y su escenario sigue sin
+demostrarse recuperable.
+
+Paquete independiente, `8/8` hashes verificados y barrido de secretos limpio:
+`2026-08-24-d3-post-salvage-network-recovery-hardware/PROVENANCE.md`. El paquete
+anterior **no se modificó**; sus `26/26` hashes siguen intactos.
+
+> **`INCIDENTAL HARDWARE EVIDENCE` — `NOT A DIRECTED D2-B/D2-C VALIDATION`.**
+> Durante el tramo, la credencial sobrevivió ~52 min de fallo de refresh
+> (37 fallos clasificados `retryable_network`; `SIGNED_OUT`, `removeItem`,
+> `_removeSession` y `GC_ANON_SIGNIN` todos a cero) y la pausa `client_auth` se
+> retiró sola al volver la red. **Esto no asciende ningún estado**: la corrida
+> ejercitó un fallo de red, no los casos dirigidos de D2-B (`500` / `502` /
+> `525-529`) ni el de D2-C (`429 over_request_rate_limit`). D2-B y D2-C siguen
+> **validados en banco, con hardware dirigido pendiente**.
+
 ### `GC-SEGMENT-CONTINUITY-001` — observación temporal abierta
 
 ```
@@ -1290,13 +1349,21 @@ cifras de arriba.
 
 ## Lo que sigue abierto
 
-- **Validación en hardware de la prevención.** Ni D2-B ni D2-C se han ejecutado
-  en dispositivo. El banco prueba la mecánica de `auth-js` y de nuestro
-  clasificador; no prueba el comportamiento del producto bajo estrés real. El
-  `HARDWARE FUNCTIONAL PASS` del 24/08 es de **D3**, que es supervivencia, y no
-  acredita nada sobre la prevención.
-- **La subida sigue sin reanudarse.** D3 saca los bytes del sandbox; no los pone
-  en la nube. Una sesión varada sigue varada.
+- **Validación DIRIGIDA en hardware de la prevención.** El banco prueba la
+  mecánica de `auth-js` y de nuestro clasificador; no prueba el comportamiento
+  del producto bajo estrés real. El 24/08, de forma **incidental**, el
+  clasificador sí corrió en dispositivo —37 fallos de refresh, todos
+  `retryable_network`, sin destruir la credencial—, pero eso fue un fallo de
+  **red**: no reproduce los casos que corrige D2-B (`500` / `502` / `525-529`)
+  ni el que corrige D2-C (`429 over_request_rate_limit`). Sigue faltando la
+  corrida dirigida por código de estado. Los dos gates de D3 del 24/08 son de
+  supervivencia y de no-interferencia, y **no acreditan nada sobre la
+  prevención**.
+- **D3 no sube nada.** Saca los bytes del sandbox; no los pone en la nube. Que
+  la sesión de la corrida del 24/08 acabara convergiendo **no lo hizo D3**: lo
+  hizo el pipeline normal cuando volvió la red, con la credencial intacta. En el
+  escenario propio de este finding —identidad destruida— la subida **sigue sin
+  reanudarse**, y eso es justo lo que sigue abierto.
 - **`GC-START-LATENCY-001`** — **cerrado el 2026-08-24**, ver §6. Cuando se
   escribió esta línea el camino de `auth-js` podía consumir **~25,4 s de
   backoff** y `startRecording` esperaba a `getOwnershipAccessToken()`. Esa

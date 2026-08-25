@@ -79,7 +79,7 @@ atribuye a nada. `compileDebugKotlin` no se ha reejecutado desde el 20/08.
 | GC-DEV-RESET-001 | RELEASE BLOCKER · `FIXED IN CODE`, revalidación no requerida |
 | GC-DEST-PAUSE-001 | `FIXED IN CODE` / **`HARDWARE REVALIDATED`** — cross-build, 24/08 |
 | GC-AUTH-001 | `FIXED IN CODE`; identidad PASS en hardware, flujo completo **no alcanzado** |
-| GC-AUTH-SESSION-RECOVERY-001 | **`OPEN`** — prevención (D2-B, D2-C) **validada en banco, NO en dispositivo**; supervivencia (D3, salvage local de segmentos) `HARDWARE FUNCTIONAL PASS` el 24/08. **Ninguna cierra el finding** |
+| GC-AUTH-SESSION-RECOVERY-001 | **`OPEN`** — prevención (D2-B, D2-C) **validada en banco · evidencia incidental en hardware · validación dirigida PENDIENTE**; supervivencia (D3, salvage local de segmentos) `HARDWARE FUNCTIONAL PASS` el 24/08. **Ninguna cierra el finding** |
 | GC-START-LATENCY-001 | `FIXED IN CODE` / **`HARDWARE VALIDATED`** — 24/08; auth dejó de bloquear el arranque, no se volvió rápida |
 | GC-DEST-STATUS-001 | **`OPEN`** — backend |
 | GC-AUTH-RETRY-CLASSIFICATION-001 | causa **suficiente** demostrada; causalidad con el 22/08 **no** probada |

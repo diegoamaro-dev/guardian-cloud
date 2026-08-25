@@ -98,6 +98,22 @@ contradiga es incorrecta.
 >
 > Alcance y evidencia en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §5.
 
+> **`POST-SALVAGE NETWORK RECOVERY` = `PASS`, gate independiente del anterior.**
+> El 2026-08-24, sobre la misma sesión y el mismo APK, se restauró la
+> conectividad después del salvage y la sesión convergió con normalidad: mismo
+> `localSessionId`, 1 `POST /sessions` efectivo, 12/12 chunks con 12
+> `remote_reference` únicas, `missing []`, `/complete` posterior al 12/12,
+> `GC_CLEANUP_AUTHORIZED` con `http_200`, cleanup, y `GC_QUEUE` sin la sesión —
+> con el export SAF **intacto**, 13/13 por `sha256`.
+>
+> Autoriza una sola afirmación nueva: **D3 es aditivo** —el salvage local no
+> impide el registro, la subida, la completion ni el cleanup normales
+> posteriores de la misma sesión—. **No** es el mismo gate que el
+> `HARDWARE FUNCTIONAL PASS` de arriba y no debe fundirse con él: aquél probó
+> que el salvage funciona, éste que no estorba. **No** reproduce el escenario de
+> `GC-AUTH-SESSION-RECOVERY-001`, que sigue `OPEN`. Detalle en
+> [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §5.
+
 > **`GC-SEGMENT-CONTINUITY-001` = `OBSERVATION / INVESTIGATION OPEN`.** De esa
 > misma corrida salió una observación temporal —`capture_ms` 72,551 s frente a
 > 66,765 s de suma `ffprobe` de los 12 segmentos, 5,786 s de diferencia— que
@@ -188,7 +204,7 @@ proviniendo de una ficha de evidencia congelada fuera del repositorio.
 | **GC-DEV-RESET-001** | RELEASE BLOCKER · `FIXED IN CODE` / revalidación hardware **no requerida** | `e289dcb` | El defecto es de política de borrado, demostrable en pruebas. 62 tests en `devResetGuard.test.ts` |
 | **GC-DEST-PAUSE-001** | `FIXED IN CODE` / **`HARDWARE REVALIDATED`** | `3fae4f6` | Revalidado el 24/08 como **cross-build durable-state recovery validation**: la pausa la escribió el build `34412a0`-era y la retiró producto `22a9b26`. Reconexión real por OAuth → pausa retirada → 10/10 chunks con referencias remotas distintas → `/complete` → cleanup, en ese orden. Identidad estable (`08c0875e`). La corrida del 21/08 había quedado **anulada** por GC-DEV-RESET-001. Detalle en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §3 |
 | **GC-AUTH-001** | `FIXED IN CODE` · ruta de identidad **PASS en hardware** · flujo extremo a extremo **no alcanzado** | `ad8756b`…`8615ba6`, integrados en `e215e5c` | La Vía 2 del 21/08 dio `Identity PASS` y `Registration PASS`, pero `Upload BLOCKED`, `Completion NOT REACHED` y `Cleanup NOT EXECUTED`. **No es un cierre** |
-| **GC-AUTH-SESSION-RECOVERY-001** | **`OPEN`** · prevención **validada en banco, NO en dispositivo**; supervivencia (D3) **`HARDWARE FUNCTIONAL PASS`** | D0 `02551a1`+`34412a0` · D2-B `08e3cd2` · D2-C `22a9b26` · D3 `cb59c7e` | Tras una ventana offline prolongada la sesión de Supabase desaparecía y 87 chunks quedaron sin poder subirse (22/08). **D2-B** (upgrade a 2.112.3) corrige la destrucción ante `500` / `502` / `525-529` y añade proactive-preserve y un cooldown de 60 s. **D2-C** clasifica `429` en el refresh como reintentable; todo lo demás hace pass-through fail-closed. **D3** es de otra naturaleza: no previene nada, da **salida local** a la evidencia de vídeo nativo segmentado que ya quedó varada. Validado en hardware el 24/08 (OnePlus A6000, modo avión, 12/12 segmentos, `status: complete`). **Ninguna de las tres cierra el finding**: la identidad sigue sin recuperarse, la subida sigue sin reanudarse y el ownership sigue sin restaurarse. Detalle en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §5 |
+| **GC-AUTH-SESSION-RECOVERY-001** | **`OPEN`** · prevención **validada en banco** · **evidencia incidental en hardware** · **validación dirigida en dispositivo PENDIENTE**; supervivencia (D3) **`HARDWARE FUNCTIONAL PASS`** | D0 `02551a1`+`34412a0` · D2-B `08e3cd2` · D2-C `22a9b26` · D3 `cb59c7e` | Tras una ventana offline prolongada la sesión de Supabase desaparecía y 87 chunks quedaron sin poder subirse (22/08). **D2-B** (upgrade a 2.112.3) corrige la destrucción ante `500` / `502` / `525-529` y añade proactive-preserve y un cooldown de 60 s. **D2-C** clasifica `429` en el refresh como reintentable; todo lo demás hace pass-through fail-closed. **D3** es de otra naturaleza: no previene nada, da **salida local** a la evidencia de vídeo nativo segmentado que ya quedó varada. Validado en hardware el 24/08 (OnePlus A6000, modo avión, 12/12 segmentos, `status: complete`). **Ninguna de las tres cierra el finding**: la identidad sigue sin recuperarse, la subida sigue sin reanudarse y el ownership sigue sin restaurarse. Detalle en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §5 |
 | **GC-START-LATENCY-001** | `FIXED IN CODE` / **`HARDWARE VALIDATED`** | producto `e643b01` · guardas de test `3c10994` | `startRecording` esperaba a `getOwnershipAccessToken()` antes de abrir la grabadora, y esa ruta de auth **no lleva timeout en ninguna capa**. La lectura se movió dentro de `sessionCreatePromise`, que no se espera antes del productor. Validado en hardware el 24/08 en dos escenarios: **remoto vivo** — 531 ms tap→productor, 163 ms de lógica propia, 28/29 fragmentos confirmados **antes** de PARAR — y **token caducado + modo avión** — 243 ms tap→productor, 102 ms de lógica propia, con auth resolviendo **10,72 s después** de que el productor ya grababa. **auth no se volvió rápida: dejó de bloquear START.** Recuperación tras restaurar red: mismo `localSessionId`, 1 `POST /sessions`, 77/77 confirmados, cleanup posterior a `http_200`. Detalle en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §6 |
 | **GC-DEST-STATUS-001** | **`OPEN`** · defecto de **backend** | — | Ningún camino de código escribe `revoked` ni `error`. Un destino Drive con refresh token revocado sigue reportándose `connected`. Ver [`API_SPEC.md`](./API_SPEC.md#estado-de-los-destinos--defecto-abierto) |
 | **GC-AUTH-RETRY-CLASSIFICATION-001** | **causa suficiente demostrada** · relación causal con el 22/08 **no probada** | banco `9d682bc` · D2-B `08e3cd2` · D2-C `22a9b26` | Dejó de ser estático: el banco reproduce de forma determinista que un `429` / `500` en el refresh destruye una credencial **intacta** (`refresh_present: true`). Corregido para `500` por D2-B y para `429` por D2-C. **Sigue sin demostrarse** que el incidente del 22/08 fuera uno de esos dos: la respuesta nunca se capturó |
