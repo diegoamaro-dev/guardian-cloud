@@ -176,68 +176,24 @@ sufijo del cliente                    gqae2dvua9mu52vbrc3hccgmgcb255o5
                                       distinto del de Drive · cliente independiente
 ```
 
-## ⚠️ BARRERA — no crear clientes OAuth **Android** todavía
+## Clientes OAuth **Android** — todavía NO creados
 
-Conviene separar tres cosas que se confunden con facilidad:
+**No existe ninguno.** Cuando se creen, el par al que quedarán asociados es:
 
-**1 · Asociación.** Un cliente OAuth Android queda asociado al par
-`package name + SHA-1`, y Google exige que ese par sea único en todos sus
-proyectos. Ese vínculo no se reapunta: para otro package se crea **otro**
-cliente.
+| | Valor |
+|---|---|
+| package | **`com.guariacloud.app`** |
+| SHA-1 | el del certificado del canal correspondiente (dev / EAS / Play) |
 
-**2 · Coste de recrearlo.** Si el `applicationId` cambia, los clientes Android
-existentes dejan de servir y hay que crear los equivalentes para el package
-nuevo. Es trabajo de configuración y limpieza —credenciales huérfanas, entradas
-que retirar, documentación que rehacer—, **no una pérdida irreversible**. El
-Client ID de un cliente Android es desechable: no es audiencia de nada y no
-aparece en ningún `id_token`.
+El `applicationId` de producción está **decidido y ya implementado en código**;
+el porqué, las alternativas evaluadas y la razón de que `namespace` siga siendo
+`com.guardiancloud.app` viven en su fuente canónica:
+[`decisions/ADR-ANDROID-APPLICATION-ID.md`](./decisions/ADR-ANDROID-APPLICATION-ID.md).
+**Ese ADR es la fuente de verdad; este documento sólo registra configuración
+observada.**
 
-**3 · Dónde está de verdad la irreversibilidad.** No la impone Google OAuth, la
-impone **Google Play**: una vez publicada la aplicación, el `applicationId` es su
-identidad permanente en la tienda y no puede cambiarse — sería otra aplicación,
-con otra ficha y otros usuarios. Antes de ese punto el package sigue siendo
-modificable, al coste conocido de romper la actualización de las instalaciones
-existentes.
-
-**Conclusión operativa, que no cambia**: crear clientes Android antes de decidir
-el naming **no vuelve irreversible el package**, pero añade deuda y superficie de
-migración sin ninguna ganancia. No se crea ninguno hasta completar
-`G-NAMING-SCOPE`.
-
-Y hay una decisión de marca tomada pero **no ejecutada**:
-
-```
-hoy              Guardian Cloud / Guardian Cloud App     ← implementación vigente
-dirección futura marca y ecosistema: Guaria Cloud
-                 esta app, comercialmente: Guaria Cloud App
-                 internamente: Guaria App
-                 «Guaria App» NO se usa como nombre comercial principal:
-                 hay uso previo por terceros
-dominio          guariacloud.com bajo nuestro control
-ecosistema       existen proyectos relacionados, entre ellos Guaria Hub
-cuándo           NO ahora · migración posterior, coordinada y auditable
-```
-
-**Esto no implica que `com.guardiancloud.app` deba cambiar.** Un `applicationId`
-es un identificador técnico, no una marca, y cambiarlo tiene coste real:
-rompe la actualización de instalaciones existentes y, tras publicar en Play, es
-**irreversible**. Un rename cosmético que rompa identidad, recuperación, firma o
-compatibilidad sería un mal negocio.
-
-Antes del primer cliente Android hace falta un análisis que separe qué migra de
-verdad y qué conviene conservar aunque contenga `guardiancloud`:
-
-```
-nombre comercial / display name        ·  applicationId / package Android
-clientes OAuth Android                 ·  este Web Client de identidad
-cliente OAuth de Drive                 ·  Supabase
-EAS                                    ·  Google Play / Play App Signing
-dominios y callbacks                   ·  cualquier identificador persistente
-```
-
-El Web Client de arriba **no participa de esa barrera**: no contiene el nombre,
-no depende del package y no se muestra al usuario. Por eso pudo crearse antes de
-resolver la marca.
+El Web Client de arriba **no depende del package** —no contiene el nombre y no se
+muestra al usuario—, y por eso pudo crearse antes de resolver la marca.
 
 ## Cuestión abierta: `Q-WEBCLIENT-MUTABILITY`
 
