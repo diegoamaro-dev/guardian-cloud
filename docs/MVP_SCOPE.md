@@ -22,6 +22,11 @@
 - integración inicial con Google Drive
 - historial básico
 - estado claro de grabación y subida
+- **continuidad de protección al pasar a segundo plano** — al minimizar la app o
+  bloquear la pantalla, el vídeo se detiene de forma controlada y la protección
+  continúa mediante audio, sin decisión del usuario. *Alcance aprobado, **no
+  implementado**; decide
+  [`decisions/ADR-CONTINUOUS-PROTECTION.md`](./decisions/ADR-CONTINUOUS-PROTECTION.md)*
 
 ## No entra en el MVP
 
@@ -36,6 +41,11 @@
 - cadena de custodia avanzada
 - exportación legal avanzada
 - iOS con automatizaciones agresivas
+- **captura de vídeo en segundo plano** — prohibida por decisión de producto, no
+  diferida
+- **retorno automático a vídeo** al volver la app a primer plano — *diferido, no
+  rechazado*
+- **export final multi-fase** de una sesión con vídeo y audio
 
 ## Métrica de éxito del MVP
 

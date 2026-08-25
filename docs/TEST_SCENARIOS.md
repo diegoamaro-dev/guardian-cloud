@@ -47,6 +47,33 @@ marca el nivel que se puede acreditar, no el máximo alcanzable.
 | 15 — Uso bajo estrés | `DEFINIDO` · **HARDWARE PENDIENTE** | Sin corrida registrada con el artefacto vigente |
 | 16 — Recuperación por usuario | `HARDWARE_VALIDATED` **parcial** | Recovery de una sesión pendiente tras restaurar Drive, 20/08 · `recoveryVerdict`, `exportFromChunkRefs`. Los casos 2–7 de este escenario **no** están validados en hardware |
 | 17 — Vídeo nativo con durable cleanup | `HARDWARE_VALIDATED` en su **ruta normal** | Validación 20/08 · puntos 5–8 en `HARDWARE_HARDENING_PENDING` |
+| 18 — Transición segura a segundo plano | `DEFINIDO` | Sin cobertura. Su criterio es `BACKGROUND TRANSITION SAFETY` y se acreditará en el gate G5 de Continuous Protection |
+
+#### Escenario 18 — Transición segura a segundo plano
+
+Verifica que abandonar el primer plano durante captura de vídeo **no pierde
+evidencia** y **no interrumpe la protección**. Separa tres capacidades que no
+deben confundirse:
+
+| | Capacidad | Régimen |
+|---|---|---|
+| 1 | capturar **vídeo nuevo** en segundo plano | **prohibido por diseño** |
+| 2 | seguir **subiendo** la evidencia ya capturada | exigible |
+| 3 | **preservar y recuperar** la sesión | obligatorio |
+
+Un fallo en 2 o en 3 es un fallo del escenario. La ausencia de 1 **no** lo es:
+es el comportamiento correcto.
+
+Nivel `DEFINIDO`: no existe corrida que lo acredite. La ejecución `H-1A` del
+2026-08-25 observó, en **una sola ejecución y un solo dispositivo**, un cierre
+controlado del productor de vídeo con la evidencia íntegra y subidas que
+continuaron en segundo plano. Es **evidencia provisional**, no congelada, y **no
+acredita este escenario**: en aquella ejecución la sesión terminó al cerrarse el
+vídeo, sin fase de audio posterior.
+
+G5 deberá además medir **por contenido** el hueco entre la última evidencia útil
+de vídeo y la primera de audio. Ver
+[`decisions/ADR-CONTINUOUS-PROTECTION.md`](./decisions/ADR-CONTINUOUS-PROTECTION.md) §9.
 
 ### Escenarios de identidad — sin entrada propia todavía
 

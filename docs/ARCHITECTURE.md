@@ -120,12 +120,24 @@ Destinos futuros (NO en MVP):
 5. los chunks de audio se encolan y los segmentos nativos se adoptan; ambos se
    suben al destino durante la captura
 6. se actualiza estado en backend
-7. al cerrar se completa la sesión
+7. **al cerrarse el productor** la sesión queda marcada como cerrada, y se
+   completa en cuanto toda su evidencia está confirmada fuera del dispositivo
 
 > **El paso 4 no se ejecuta hoy.** El cifrado local está previsto en el diseño
 > —ver `MVP_SCOPE.md` y `SECURITY.md`— pero **no está implementado**: en el
 > código sólo existe un `TODO`. En `v0.3.0-rc.1` los chunks se encolan y se
 > suben **sin cifrado en el cliente**. El transporte sí va sobre TLS.
+
+> **Dirección aprobada · NO implementada — Continuous Protection.** El paso 7
+> describe el sistema **vigente**, en el que cerrar el productor cierra la
+> sesión. El contrato aprobado el 2026-08-25 separa ambas cosas: la unidad
+> lógica pasa a ser la **Protection Session**, los productores de vídeo y audio
+> son fases dentro de ella, y `producer closed ≠ Protection Session closed`.
+> Bajo ese contrato sólo la acción explícita PARAR termina una sesión, y
+> `/complete` corresponde a esa terminalidad, no al cierre de un productor.
+> Nada de esto está implementado. Decide
+> [`decisions/ADR-CONTINUOUS-PROTECTION.md`](./decisions/ADR-CONTINUOUS-PROTECTION.md);
+> el estado por capacidad, [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md).
 
 En vídeo, el productor nativo genera segmentos MP4 H.264/AAC independientes.
 La validación física del 13/08 comprobó su reproducción individual, adopción,
@@ -237,6 +249,16 @@ Archivo `manifest.json` asociado a cada sesión:
 * hash
 * tamaño
 * metadata básica (modo, formato)
+
+> **Dirección aprobada · NO implementada.** Hoy el modo es un atributo **de
+> sesión**: toda la evidencia de una sesión se describe con un único tipo. El
+> contrato de Continuous Protection exige que el tipo y la fase puedan
+> describirse **por unidad de evidencia** y nunca inferirse de un modo global, y
+> **prohíbe** que el manifiesto o el backend describan evidencia mixta como si
+> fuera exclusivamente vídeo. Es condición **bloqueante**: hasta que el contrato
+> de sesión admita fases, no puede producirse evidencia mixta. El cambio
+> correspondiente en el backend requiere gate propio y no está hecho. Ver
+> [`decisions/ADR-CONTINUOUS-PROTECTION.md`](./decisions/ADR-CONTINUOUS-PROTECTION.md) §7.
 
 #### Chunks
 

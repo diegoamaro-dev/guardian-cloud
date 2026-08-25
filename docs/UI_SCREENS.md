@@ -44,6 +44,12 @@ Permitir iniciar grabación inmediatamente.
 - El botón debe dominar la pantalla
 - Nada debe competir con él
 
+> **Dirección aprobada · NO implementada.** Bajo Continuous Protection el
+> selector elige la **fase inicial** de la sesión, no el tipo de toda la sesión:
+> elegir «vídeo» significa *empezar en `VIDEO_AUDIO`*. La sesión puede cambiar de
+> fase después sin que el usuario intervenga. Decide
+> [`decisions/ADR-CONTINUOUS-PROTECTION.md`](./decisions/ADR-CONTINUOUS-PROTECTION.md).
+
 ---
 
 ## 3. PANTALLA: GRABACIÓN ACTIVA
@@ -258,6 +264,14 @@ Comportamiento:
   * chunks
   * sync
   * procesos internos
+
+> **Dirección aprobada · NO implementada — transición de fase.** Cuando la
+> sesión pase de `VIDEO_AUDIO` a `AUDIO_ONLY`, la interfaz debe comunicar
+> **continuidad**, no final: el usuario sigue protegido. La transición ha de ser
+> **legible sin ser una interrupción** —visible si mira, innecesaria de mirar
+> para seguir protegido— y **no puede pedir ninguna decisión**. Está sujeta a la
+> regla de *cero distracciones* de [`DESIGN.md`](./DESIGN.md) §16. Decide
+> [`decisions/ADR-CONTINUOUS-PROTECTION.md`](./decisions/ADR-CONTINUOUS-PROTECTION.md).
 
 ---
 
