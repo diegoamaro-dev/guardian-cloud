@@ -163,8 +163,9 @@ se fija aquí ninguna cifra como objetivo: quedaría obsoleta al añadir pruebas
 empujaría a «arreglar» el documento en vez del código. Registrar el total
 observado al ejecutarla.
 
-Última ejecución registrada: **900/900 en 42 ficheros**, el 2026-08-24, tras
-`cb59c7e`.
+Última ejecución registrada: **936/936 en 42 ficheros**, el 2026-08-26, tras
+`fc9a20e`. *(Corte anterior: 900/900 en 42 ficheros el 2026-08-24, tras
+`cb59c7e`.)*
 
 **12 errores TypeScript heredados** (typecheck **NO** verde) · sin CI.
 

@@ -4,15 +4,15 @@
 
 | Qué | Cuándo / sobre qué |
 |---|---|
-| Estado documental vigente | **2026-08-24** |
+| Estado documental vigente | **2026-08-26** |
 | Producto usado para la revalidación de `GC-DEST-PAUSE-001` | **`22a9b26`** (APK release `2b3be062…`) |
 | Producto usado para la validación de `GC-START-LATENCY-001` | **`e643b01`** (APK release `1cb80fea…`) |
 | Producto usado para la validación de **D3 local segment salvage** | **`cb59c7e`** (APK release `8151c338…`) |
-| Última suite automática registrada | **2026-08-24**, tras **`cb59c7e`** — 900/900 en 42 ficheros · typecheck 12, sin drift |
+| Última suite automática registrada | **2026-08-26**, tras **`fc9a20e`** — 936/936 en 42 ficheros · typecheck 12, sin drift |
 
 > Las fechas y los commits son distintos a propósito, y no deben fundirse. La
-> suite vigente —900/900 en 42 ficheros— se midió sobre el árbol posterior a
-> `cb59c7e`; las tres validaciones de hardware se hicieron en dispositivo, no
+> suite vigente —936/936 en 42 ficheros— se midió sobre el árbol posterior a
+> `fc9a20e`; las tres validaciones de hardware se hicieron en dispositivo, no
 > corriendo la suite, y cada una sobre **su propio APK**:
 > `GC-DEST-PAUSE-001` sobre `22a9b26`, `GC-START-LATENCY-001` sobre `e643b01` y
 > **D3** sobre `cb59c7e`. **Ninguna cifra de tests describe un APK.**
@@ -83,7 +83,19 @@ contradiga es incorrecta.
 |---|---|
 | Recuperación completa del vídeo nativo | No consta validación integrada; no se declara implementada o validada por la evidencia actual |
 | Exportación `.mp4` | No implementada ni validada |
-| Continuous Protection — continuidad `VIDEO_AUDIO → AUDIO_ONLY` al perder el primer plano | **Capacidad: no implementada ni validada.** Contrato aceptado el 2026-08-25. **Infraestructura parcial ya publicada**, sin cambio de comportamiento observable: `8983bad` añadió la metadata durable `evidence_closed` y `6c6489c` desacopló el camino de **lectura** de terminalidad hacia `/complete`. La **escritura** sigue acoplada y la transición no existe: minimizar durante vídeo cierra la sesión igual que antes. Decide [`decisions/ADR-CONTINUOUS-PROTECTION.md`](./decisions/ADR-CONTINUOUS-PROTECTION.md); su criterio de prueba es el escenario 18 de [`TEST_SCENARIOS.md`](./TEST_SCENARIOS.md) |
+| Continuous Protection — continuidad `VIDEO_AUDIO → AUDIO_ONLY` al perder el primer plano | **Capacidad: no implementada ni validada.** Contrato aceptado el 2026-08-25. **Infraestructura parcial y precondiciones ya publicadas**, sin cambio de comportamiento observable: `8983bad` añadió la metadata durable `evidence_closed`, `6c6489c` desacopló el camino de **lectura** de terminalidad hacia `/complete`, y `fc9a20e` añadió `media` por chunk y la clasificación **fail-closed** de D3. La **escritura** sigue acoplada y la transición no existe: minimizar durante vídeo cierra la sesión igual que antes. Decide [`decisions/ADR-CONTINUOUS-PROTECTION.md`](./decisions/ADR-CONTINUOUS-PROTECTION.md); su criterio de prueba es el escenario 18 de [`TEST_SCENARIOS.md`](./TEST_SCENARIOS.md), que sigue `DEFINIDO` |
+
+> **`fc9a20e` es una precondición de INTEGRIDAD, no Continuous Protection
+> funcionando.** Retira un modo de fallo de D3 —habría podido copiar bytes de
+> audio como `segment_NNNNNN.mp4` y acreditarlos por `sha256`— haciendo que la
+> elegibilidad se decida **por chunk** y exigiendo la firma estructural
+> `segments/<session_id>/segment_NNNNNN.mp4`. **D3 no soporta sesiones mixtas:
+> las rechaza.** Detalle en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §D3.
+>
+> `G3''` —descripción de la evidencia en backend y manifiesto— **sigue
+> pendiente**: el contrato declara el medio a nivel de **sesión** y todavía no
+> puede representar evidencia mixta sin declarar un tipo falso. Mientras siga
+> así, el gate atómico `VIDEO_AUDIO → AUDIO_ONLY` permanece **bloqueado**.
 
 > **D3 `LOCAL SEGMENT SALVAGE` no pertenece a este nivel y no es un export
 > `.mp4`.** Es una capacidad distinta, implementada en `cb59c7e` y con
@@ -245,11 +257,11 @@ asimetría es deuda documental conocida, no un descuido de este documento.
 
 ### Validación automática actual
 
-Ejecutada el 2026-08-24 sobre el árbol posterior a `cb59c7e`.
+Ejecutada el 2026-08-26 sobre el árbol posterior a `fc9a20e`.
 
 | Comprobación | Resultado |
 |---|---|
-| Suite completa | **900/900**, en **42 ficheros** |
+| Suite completa | **936/936**, en **42 ficheros** |
 | Typecheck | **12 errores TypeScript históricos, cero nuevos** — typecheck **NO** verde |
 | `git diff --check` | Limpio |
 

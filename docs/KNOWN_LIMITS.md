@@ -1215,6 +1215,50 @@ NO es el export final .mp4  (sigue NO IMPLEMENTADO)
 NO produce «vídeo reconstruido», «MP4 final» ni «grabación completa»
 ```
 
+### Qué se NIEGA a exportar — restricción publicada en `fc9a20e`
+
+Esto **no amplía** lo que D3 hace: acota lo que acepta. Antes de `fc9a20e`, D3
+decidía la elegibilidad **por entrada** —`uri === ''` probaba que la sesión venía
+del vídeo nativo segmentado— y escribía como segmento **cualquier** chunk con
+`local_uri`. Eso era suficiente sólo mientras cada sesión tuviera un único medio.
+Desde `fc9a20e` la elegibilidad se decide **por chunk**:
+
+```
+video  + firma estructural válida    → puede continuar
+video  + firma inválida              → RECHAZA
+audio  (uno solo basta)              → RECHAZA
+valor de `media` desconocido         → RECHAZA
+unos chunks con `media`, otros sin    → RECHAZA
+ninguno con `media` + TODAS las firmas válidas   → continúa (entradas legacy)
+ninguno con `media` + cualquier firma inválida   → RECHAZA
+```
+
+Un chunk que vaya a tratarse como segmento nativo debe corresponder **exactamente**
+a `segments/<session_id>/segment_NNNNNN.mp4`: directorio `segments`, el
+`session_id` literal de la sesión que se exporta, y nombre `segment_` más seis
+dígitos y `.mp4`. No es coincidencia textual —rechaza travesía, separadores
+duplicados, otra sesión, nombres parciales o temporales— y **se exige tanto a los
+chunks con `media: 'video'` como a los que no la llevan**.
+
+```
+★ `media: 'video'` por sí solo NO basta.
+```
+
+La razón es concreta: el vídeo **legacy** post-stop escribe `media: 'video'` sobre
+fragmentos base64 alojados en `chunks/<sid>/N.b64`, que no son segmentos. Sin la
+firma, esos bytes se habrían copiado como `segment_NNNNNN.mp4` y el manifest los
+habría acreditado por `sha256`. Verificados, y falsos.
+
+**La ausencia de `media` significa «metadata no disponible», nunca «vídeo».** Las
+entradas escritas antes de `fc9a20e` no llevan la clave, y sólo continúan porque
+cada uno de sus chunks acredita la firma nativa — nunca por deducirlo de la
+entrada.
+
+> **D3 no soporta ni exporta sesiones mixtas: las rechaza.** Esta restricción es
+> una precondición de integridad, no una capacidad nueva. Cuando una Protection
+> Session pueda contener vídeo y audio, D3 necesitará su propio gate; hasta
+> entonces prefiere no exportar nada antes que exportar bytes con un tipo falso.
+
 ### La validación en hardware
 
 OnePlus A6000 · Android 11 / API 30 · `arm64-v8a` · APK release

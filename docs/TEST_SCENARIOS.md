@@ -109,14 +109,14 @@ documento, pero sí cobertura automática densa: `legacyProbeSeal` (52),
   vacía— con el export SAF intacto (13/13 por `sha256`). Demuestra que **D3 es
   aditivo**: el salvage no interfiere con la convergencia normal posterior. **No
   reproduce** el escenario del finding, que sigue `OPEN`.
-* Validación automática vigente, ejecutada el 2026-08-24 sobre el árbol
-  posterior a `cb59c7e`: **900/900 tests en 42 ficheros**; 12 errores
+* Validación automática vigente, ejecutada el 2026-08-26 sobre el árbol
+  posterior a `fc9a20e`: **936/936 tests en 42 ficheros**; 12 errores
   TypeScript históricos y cero nuevos; `git diff --check` limpio.
   `compileDebugKotlin` dio `BUILD SUCCESSFUL` el 20/08 y **no se ha reejecutado
   desde entonces**.
   *(Cifras anteriores de esta línea: 360/360 en el corte del 20/08, 781/781 en
-  el del 23/08 sobre `34412a0` y 792/792 en 41 ficheros el 24/08 tras
-  `3c10994`.)*
+  el del 23/08 sobre `34412a0`, 792/792 en 41 ficheros el 24/08 tras `3c10994`
+  y 900/900 en 42 ficheros el 24/08 tras `cb59c7e`.)*
 * **No** se declaran validados: recovery completo de vídeo, export final
   `.mp4`, cobertura multi-dispositivo, Android 13+ ni las rutas artificiales de
   fallo del scheduler.

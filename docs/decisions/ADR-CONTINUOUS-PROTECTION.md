@@ -7,7 +7,7 @@
 | **Decide** | Propietario del producto |
 | **Refina a** | [`ADR-VIDEO-NATIVE-SEGMENTATION`](./ADR-VIDEO-NATIVE-SEGMENTATION.md) |
 | **Afecta a** | `PRODUCT_PRINCIPLES`, `MVP_SCOPE`, `ARCHITECTURE`, `APP_STATES`, `UI_SCREENS`, `TEST_SCENARIOS`; D3; export final; contrato de sesión del backend |
-| **Implementado por** | **Infraestructura parcial, no la capacidad**: `8983bad` (metadata durable `evidence_closed`) y `6c6489c` (desacople del camino de **lectura** de terminalidad). La capacidad —`VIDEO_AUDIO → AUDIO_ONLY`— sigue **sin implementar** |
+| **Implementado por** | **Infraestructura parcial y precondiciones, no la capacidad**: `8983bad` (metadata durable `evidence_closed`), `6c6489c` (desacople del camino de **lectura** de terminalidad) y `fc9a20e` (`media` por chunk + clasificación fail-closed de D3). La capacidad —`VIDEO_AUDIO → AUDIO_ONLY`— sigue **sin implementar** |
 
 > **Este documento decide; no describe el sistema actual.** Ninguna de sus
 > secciones acredita capacidad implementada ni validada. El estado real por
@@ -247,6 +247,33 @@ D3 deberá evolucionar a multi-fase SIN perder integridad:
 
 **Requiere gate independiente.** D3 no se toca en el mismo gate que Continuous
 Protection.
+
+#### Estado a fecha de `fc9a20e`
+
+La primera de esas tres condiciones —nunca escribir evidencia de un tipo con el
+nombre de otro— **está implementada**, y sólo ésa:
+
+```
+seguridad de clasificación de D3 ante chunks de distintos medios
+                                                    IMPLEMENTADA (fc9a20e)
+    decide por chunk · exige la firma `segments/<sid>/segment_NNNNNN.mp4`
+    falla cerrado ante metadata desconocida, inconsistente, audio o
+    legacy no verificable
+
+soporte y export de evidencia MIXTA                 NO IMPLEMENTADO
+    D3 rechaza una sesión mixta; no la exporta parcialmente ni la describe
+
+VIDEO_AUDIO → AUDIO_ONLY                            NO IMPLEMENTADO
+
+G3'' — descripción de la evidencia en backend/manifiesto   PENDIENTE
+    el contrato sigue declarando el medio a nivel de SESIÓN, así que §7
+    continúa bloqueando la producción de evidencia mixta
+```
+
+`fc9a20e` es por tanto una **precondición de integridad**, no un avance de la
+capacidad: retira un modo de fallo que habría permitido certificar bytes de audio
+como segmentos de vídeo, y deja a D3 preparado para negarse con seguridad el día
+que existan sesiones mixtas. No las habilita.
 
 ### Export final
 

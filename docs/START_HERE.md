@@ -50,17 +50,18 @@ baseline `v0.3.0-rc.1`, no la rama actual.
 * **Validación automática de aquel corte:** 360/360 tests. *(Cifra histórica del
   20/08. La vigente está más abajo.)*
 
-### Validación automática vigente (2026-08-24, tras `cb59c7e`)
+### Validación automática vigente (2026-08-26, tras `fc9a20e`)
 
 | Comprobación | Resultado |
 |---|---|
-| Suite completa | **900/900**, en **42 ficheros** |
+| Suite completa | **936/936**, en **42 ficheros** |
 | Typecheck | **12 errores históricos, cero nuevos** — **NO** verde |
 | `git diff --check` | Limpio |
 
-La cifra vigente es la de la tabla: **900 tests en 42 ficheros**, sobre el
-árbol posterior a `cb59c7e`. El **corte histórico anterior** fue 792/792 en 41
-ficheros, tras `3c10994`, y ya no describe la suite actual. El fichero 41 era
+La cifra vigente es la de la tabla: **936 tests en 42 ficheros**, sobre el
+árbol posterior a `fc9a20e`. Los **cortes históricos anteriores** fueron 900/900
+en 42 ficheros tras `cb59c7e` y 792/792 en 41 ficheros tras `3c10994`, y ninguno
+describe ya la suite actual. El fichero 41 era
 `startLatencyDecoupling.test.ts`, que aportó 11 tests; el fichero 42 es
 `localAssembly.test.ts`, que aporta los 108 tests de D3. **Del resto de
 incrementos históricos no hay recuento documentado**, y esta guía no se los

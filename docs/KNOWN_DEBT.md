@@ -19,10 +19,10 @@ Detalle completo en [`releases/v0.3.0-rc.1.md`](./releases/v0.3.0-rc.1.md) §7.
   (tipos de `ExpoConfig`/`ManifestService`), 4 en `app/index.tsx` y 2 en
   `src/api/*` (`Uint8Array<ArrayBufferLike>` vs `BufferSource`/`BodyInit`).
 - **No hay CI.** Los tests corren sólo en la máquina del desarrollador —
-  **900/900 en 42 ficheros el 2026-08-24**, tras `cb59c7e`. *(Cifras anteriores
+  **936/936 en 42 ficheros el 2026-08-26**, tras `fc9a20e`. *(Cifras anteriores
   de esta línea: «los 198 tests» del corte de `v0.3.0-rc.1`, 781 el 2026-08-23
-  sobre `34412a0` y 792/792 en 41 ficheros tras `3c10994`. La deuda de CI no ha
-  cambiado.)*
+  sobre `34412a0`, 792/792 en 41 ficheros tras `3c10994` y 900/900 en 42
+  ficheros tras `cb59c7e`. La deuda de CI no ha cambiado.)*
 - `npm ci` **falla** sin `--legacy-peer-deps`: el lockfile no materializa los
   peers `react-dom` y `scheduler`.
 - 29 vulnerabilidades de `npm audit` (1 baja, 17 moderadas, 8 altas, 3
@@ -130,7 +130,7 @@ configuración implicada en [`OAUTH_DRIVE_CONFIGURATION.md`](./OAUTH_DRIVE_CONFI
   > obligatorio** — describe el motor histórico y el porqué de varias guardas.
 - Existing failing tests need review after the recovery flow is stabilized.
   **RESOLVED (2026-08-23)** — la suite **estaba** en 781/781 sin tests saltados
-  en esa fecha; hoy va por 900/900, y la cifra vigente vive arriba. El typecheck
+  en esa fecha; hoy va por 936/936, y la cifra vigente vive arriba. El typecheck
   sigue en 12 errores heredados, que es deuda aparte y está arriba.
 - Logs should be reduced before release.
 - Export flow has no entry point from the home screen yet (reachable only via direct route `/session/:id`). A Historial brick should list past sessions and link in (see `TODO(export-history)`).
