@@ -286,7 +286,7 @@ describe('sessionCleanupRunner — execution', () => {
   it('leaks nothing from a thrown error into the log', async () => {
     // A real filesystem or bridge failure looks like this: an absolute path,
     // the full session id and a filename, all inside the message.
-    const leakyPath = `/data/user/0/com.guardiancloud.app/cache/gc-segmented-recorder/${SID}/seg_000.mp4`;
+    const leakyPath = `/data/user/0/com.guariacloud.app/cache/gc-segmented-recorder/${SID}/seg_000.mp4`;
     h.native.mockRejectedValueOnce(
       new Error(`ENOENT: failed to delete ${leakyPath} (uuid ${SID})`),
     );

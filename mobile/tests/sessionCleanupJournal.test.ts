@@ -325,7 +325,7 @@ describe('sessionCleanupJournal', () => {
   });
 
   it('never logs anything derived from stored content', async () => {
-    const leaky = `/data/user/0/com.guardiancloud.app/cache/${SID_B}/seg_000.mp4`;
+    const leaky = `/data/user/0/com.guariacloud.app/cache/${SID_B}/seg_000.mp4`;
     storage.map.set(
       SESSION_CLEANUP_KEY,
       JSON.stringify({ version: 1, entries: [{ session_id: SID_B, path: leaky }] }),

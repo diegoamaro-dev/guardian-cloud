@@ -315,7 +315,7 @@ const DEBUG_DUPLICATE_SUBMISSION = false;
  * completeSession"). When > 0, Phase 1 multi-chunk waits this many ms
  * after the final chunk uploads and BEFORE calling completeSession.
  * That opens a deterministic window for an external `adb shell am
- * force-stop com.guardiancloud.app` to hit the exact state the test
+ * force-stop com.guariacloud.app` to hit the exact state the test
  * wants to cover: all chunks server-side, session still `active`,
  * client killed before completion. Phase 2 recovery on relaunch must
  * then see `remaining: []` and run completeSession alone.
