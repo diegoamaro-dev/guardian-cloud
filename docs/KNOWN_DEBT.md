@@ -23,6 +23,25 @@ Detalle completo en [`releases/v0.3.0-rc.1.md`](./releases/v0.3.0-rc.1.md) §7.
   de esta línea: «los 198 tests» del corte de `v0.3.0-rc.1`, 781 el 2026-08-23
   sobre `34412a0`, 792/792 en 41 ficheros tras `3c10994` y 900/900 en 42
   ficheros tras `cb59c7e`. La deuda de CI no ha cambiado.)*
+- **La suite del backend NO está verde.** Cuatro fallos de integración,
+  **preexistentes en `HEAD`** y medidos por primera vez el 2026-08-26:
+
+  ```
+  HEAD          4 fallos · 102 passing (106)
+  árbol de G3'' 4 fallos · 114 passing (118)   ← los MISMOS cuatro
+
+  tests/integration/auth.test.ts      ×1
+  tests/integration/chunks.test.ts    ×1
+  tests/integration/sessions.test.ts  ×2
+  ```
+
+  **`G3''` introduce cero fallos nuevos**; los cuatro son anteriores y **no se
+  le atribuyen**. Su causa, su alcance y su impacto **no han sido
+  investigados**, así que esto se registra como **baseline conocida**, no como
+  finding: sin causa raíz no hay nada que un identificador pudiera identificar.
+  Sin remediation propuesta. Su investigación es un gate propio, previo al
+  release. Hasta entonces, cualquier afirmación de que el backend pasa sus
+  pruebas es incorrecta.
 - `npm ci` **falla** sin `--legacy-peer-deps`: el lockfile no materializa los
   peers `react-dom` y `scheduler`.
 - 29 vulnerabilidades de `npm audit` (1 baja, 17 moderadas, 8 altas, 3

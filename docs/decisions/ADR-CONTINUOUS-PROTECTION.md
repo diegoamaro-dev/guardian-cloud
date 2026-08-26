@@ -7,7 +7,7 @@
 | **Decide** | Propietario del producto |
 | **Refina a** | [`ADR-VIDEO-NATIVE-SEGMENTATION`](./ADR-VIDEO-NATIVE-SEGMENTATION.md) |
 | **Afecta a** | `PRODUCT_PRINCIPLES`, `MVP_SCOPE`, `ARCHITECTURE`, `APP_STATES`, `UI_SCREENS`, `TEST_SCENARIOS`; D3; export final; contrato de sesión del backend |
-| **Implementado por** | **Infraestructura parcial y precondiciones, no la capacidad**: `8983bad` (metadata durable `evidence_closed`), `6c6489c` (desacople del camino de **lectura** de terminalidad) y `fc9a20e` (`media` por chunk + clasificación fail-closed de D3). La capacidad —`VIDEO_AUDIO → AUDIO_ONLY`— sigue **sin implementar** |
+| **Implementado por** | **Infraestructura parcial y precondiciones, no la capacidad**: `8983bad` (metadata durable `evidence_closed`), `6c6489c` (desacople del camino de **lectura** de terminalidad) y `fc9a20e` (`media` por chunk + clasificación fail-closed de D3). **`G3''` — descripción de la evidencia en backend y manifiesto — está implementado y validado EN EL ÁRBOL DE TRABAJO, pendiente de versionado y sin desplegar; no tiene commit y no debe citarse como si lo tuviera.** La capacidad —`VIDEO_AUDIO → AUDIO_ONLY`— sigue **sin implementar** |
 
 > **Este documento decide; no describe el sistema actual.** Ninguna de sus
 > secciones acredita capacidad implementada ni validada. El estado real por
@@ -221,11 +221,43 @@ exclusivamente vídeo**, ni exclusivamente audio. Un manifiesto que declare un
 tipo que su contenido no tiene es evidencia mal descrita, y una evidencia mal
 descrita es un defecto de integridad —no un defecto cosmético.
 
-Esta prohibición es **bloqueante**: hasta que el contrato de sesión admita
-describir fases, no puede producirse evidencia mixta.
+Esta prohibición es **bloqueante**: hasta que el contrato admita describir el
+medio por unidad de evidencia, no puede producirse evidencia mixta.
 
 El cambio correspondiente en el contrato del backend queda fuera de este ADR y
 requiere gate propio.
+
+#### Estado del gate `G3''`
+
+`G3'' — BACKEND / SESSION EVIDENCE DESCRIPTION` está **implementado y validado
+en el árbol de trabajo**. **No** versionado, **no** publicado, **no** desplegado:
+el mini servidor sigue con el backend anterior, la migración `0005` no se ha
+aplicado y no existe ningún manifiesto v2 en producción.
+
+```
+en el ÁRBOL          `media` por chunk en POST /chunks · persistencia nullable
+                     manifest v2 sin `mode` ni `format` de sesión
+                     v1 read-only, su `mode` propagado a los chunks
+                     recovery deriva el medio de los chunks
+                     evidencia heterogénea → 409, nunca un artefacto falso
+
+NO versionado · NO publicado · NO desplegado
+```
+
+Lo que **corrige** es la incapacidad descrita arriba: el backend dejaba de poder
+describir el medio porque **no recibía el dato**. Ahora lo recibe y lo conserva.
+
+Lo que **no** hace, y conviene no confundir:
+
+```
+NO habilita evidencia mixta        el productor sigue sin poder crearla
+NO implementa VIDEO_AUDIO → AUDIO_ONLY
+NO implementa el export heterogéneo   una sesión mixta se RECHAZA, no se exporta
+NO toca D3, /complete, terminalidad, background, worker ni cleanup
+NO cambia el veredicto de release
+```
+
+Mientras `G3''` no esté versionado y desplegado, **`G4` sigue bloqueado**.
 
 ---
 
@@ -265,9 +297,14 @@ soporte y export de evidencia MIXTA                 NO IMPLEMENTADO
 
 VIDEO_AUDIO → AUDIO_ONLY                            NO IMPLEMENTADO
 
-G3'' — descripción de la evidencia en backend/manifiesto   PENDIENTE
-    el contrato sigue declarando el medio a nivel de SESIÓN, así que §7
-    continúa bloqueando la producción de evidencia mixta
+G3'' — descripción de la evidencia en backend/manifiesto   PENDIENTE A ESA FECHA
+    A ESA FECHA: el contrato declaraba el medio a nivel de SESIÓN, así que
+    §7 bloqueaba la producción de evidencia mixta.
+    RESUELTO DESPUÉS EN EL ÁRBOL DE TRABAJO — ver §7 «Estado del gate G3''»:
+      · NO versionado · NO publicado · NO desplegado
+      · el backend DESPLEGADO sigue declarando el medio a nivel de SESIÓN
+      · G4 sigue BLOQUEADO y VIDEO_AUDIO → AUDIO_ONLY sigue sin implementar,
+        así que §7 continúa bloqueando la producción de evidencia mixta
 ```
 
 `fc9a20e` es por tanto una **precondición de integridad**, no un avance de la
@@ -400,7 +437,11 @@ complejidad ni huecos de captura.
 · retorno automático a vídeo al volver al foreground   DEFERRED (§10)
 · ausencia de gap entre fases                          RIESGO ABIERTO (§9)
 · export final multi-fase                              NO IMPLEMENTADO (§8)
-· evidencia mixta descrita por el backend              BLOQUEADA (§7)
+· evidencia mixta descrita por el backend    RESUELTO EN EL ÁRBOL (§7)
+    NO versionado · NO publicado · NO desplegado; el backend DESPLEGADO
+    todavía describe el medio a nivel de SESIÓN
+· producción de evidencia mixta                        NO IMPLEMENTADA
+    VIDEO_AUDIO → AUDIO_ONLY no existe; G4 sigue BLOQUEADO
 ```
 
 ---

@@ -56,7 +56,21 @@ import {
  */
 export interface RecoverableSession {
   session_id: string;
-  mode: 'audio' | 'video';
+  /**
+   * G3'' — optional because it is now DERIVED, not restated.
+   *
+   * v1 manifests state it; v2 manifests have it computed from their
+   * chunks. It is absent only when a v2 session's chunks disagree, and
+   * on this listing the medium drives nothing but an icon. Dropping the
+   * session instead would hide evidence whose bytes exist, which is the
+   * one outcome that must never happen here. The hard refusal lives in
+   * `getManifestByFileId`, where a wrong medium would name a false
+   * artifact rather than draw the wrong glyph.
+   *
+   * No observable change today: every session holds one producer, so
+   * the value is always derivable and always present.
+   */
+  mode?: 'audio' | 'video';
   created_at: string;
   /**
    * Completion timestamp. ISO string for fully-completed sessions
@@ -87,7 +101,52 @@ export interface DiscoveryResult {
   manifests: RecoverableSession[];
 }
 
-const MANIFEST_SCHEMA = 'guardian-cloud.manifest.v1';
+const MANIFEST_SCHEMA_V1 = 'guardian-cloud.manifest.v1';
+const MANIFEST_SCHEMA_V2 = 'guardian-cloud.manifest.v2';
+
+/**
+ * G3II - which contract a manifest document declares.
+ *
+ * v1 states one `mode` for the whole session and says nothing per chunk.
+ * That was accurate while a session could only ever hold one producer,
+ * and it stays accurate for every v1 document ever written: no client
+ * able to mix media in one session has existed. So v1 is parsed
+ * READ-ONLY and its `mode` is PROPAGATED to each chunk.
+ *
+ * v2 carries no session-level medium at all. Each chunk declares its
+ * own, and nothing may infer it from the session.
+ */
+function manifestVersion(schema: unknown): 1 | 2 | null {
+  if (schema === MANIFEST_SCHEMA_V1) return 1;
+  if (schema === MANIFEST_SCHEMA_V2) return 2;
+  return null;
+}
+
+/**
+ * G3'' — the single medium of a chunk list, or `undefined` when there
+ * isn't one.
+ *
+ * `undefined` covers three distinct situations on purpose, because all
+ * three mean the same thing to a caller: no medium may be attributed to
+ * the session as a whole. The list is empty, a chunk fails to declare
+ * one, or the chunks disagree.
+ *
+ * Never falls back to `session.mode`. That is the whole point.
+ */
+function deriveHomogeneousMedia(
+  rawChunks: unknown,
+): 'audio' | 'video' | undefined {
+  if (!Array.isArray(rawChunks) || rawChunks.length === 0) return undefined;
+  let seen: 'audio' | 'video' | undefined;
+  for (const c of rawChunks) {
+    if (!c || typeof c !== 'object') return undefined;
+    const media = (c as Record<string, unknown>).media;
+    if (media !== 'audio' && media !== 'video') return undefined;
+    if (seen === undefined) seen = media;
+    else if (seen !== media) return undefined;
+  }
+  return seen;
+}
 /**
  * Strict UUID v4-ish guard — the same shape Supabase issues for
  * `sessions.id`. Used both to filter manifest filenames in Drive and to
@@ -129,7 +188,12 @@ const HEX_SHA256_REGEX = /^[a-f0-9]{64}$/i;
  */
 interface ParsedManifest {
   session_id: string;
-  mode: 'audio' | 'video';
+  /**
+   * G3'' — v1 states it at session level; v2 has it derived from the
+   * chunks. `undefined` when v2 chunks disagree or fail to declare one:
+   * the session still lists, it just carries no medium.
+   */
+  mode?: 'audio' | 'video';
   created_at: string;
   completed_at: string | null;
   chunk_count: number;
@@ -152,11 +216,27 @@ export function parseManifest(raw: unknown): ParsedManifest | null {
   if (!raw || typeof raw !== 'object') return null;
   const m = raw as Record<string, unknown>;
 
-  if (m.schema !== MANIFEST_SCHEMA) return null;
+  const version = manifestVersion(m.schema);
+  if (version === null) return null;
   if (typeof m.session_id !== 'string' || !UUID_REGEX.test(m.session_id)) {
     return null;
   }
-  if (m.mode !== 'audio' && m.mode !== 'video') return null;
+  // G3'' — the medium of a DISCOVERY row is cosmetic: it drives an icon.
+  //
+  // v1 states it at session level and it is authoritative there.
+  // v2 does not state it at all, so it is DERIVED from the chunks — and
+  // when the chunks disagree it is simply left undefined. Refusing to
+  // parse would drop the session from the listing, and a session whose
+  // bytes exist must stay discoverable. The hard refusal belongs where a
+  // wrong answer would produce a false ARTIFACT, not a wrong icon: see
+  // `getManifestByFileId`.
+  let mode: 'audio' | 'video' | undefined;
+  if (version === 1) {
+    if (m.mode !== 'audio' && m.mode !== 'video') return null;
+    mode = m.mode;
+  } else {
+    mode = deriveHomogeneousMedia(m.chunks);
+  }
   if (!isIsoLike(m.created_at)) return null;
   // completed_at: either an ISO-like string (complete manifest) or null
   // (partial manifest written during recording). Anything else rejects.
@@ -191,7 +271,7 @@ export function parseManifest(raw: unknown): ParsedManifest | null {
 
   const parsed: ParsedManifest = {
     session_id: m.session_id,
-    mode: m.mode,
+    ...(mode !== undefined ? { mode } : {}),
     created_at: m.created_at,
     completed_at: m.completed_at as string | null,
     chunk_count: m.chunk_count,
@@ -265,7 +345,7 @@ export function dedupAndSort(
   for (const cand of bySession.values()) {
     out.push({
       session_id: cand.parsed.session_id,
-      mode: cand.parsed.mode,
+      ...(cand.parsed.mode !== undefined ? { mode: cand.parsed.mode } : {}),
       created_at: cand.parsed.created_at,
       completed_at: cand.parsed.completed_at,
       chunk_count: cand.parsed.chunk_count,
@@ -478,12 +558,23 @@ export interface ManifestChunkRef {
   hash: string;
   size: number;
   file_name: string;
+  /**
+   * G3'' — medium of THIS chunk. Always resolved: v2 declares it per
+   * chunk, v1 propagates the session `mode`. Never absent, so no
+   * consumer has to guess.
+   */
+  media: 'audio' | 'video';
 }
 
 export interface FullManifest {
   manifest_file_id: string;
   session_id: string;
-  mode: 'audio' | 'video';
+  /**
+   * G3'' — DERIVED from the chunks, never restated from the session.
+   * `undefined` only when the chunks disagree, a response
+   * `getManifestByFileId` refuses to serve.
+   */
+  mode?: 'audio' | 'video';
   created_at: string;
   /**
    * Completion timestamp. Same semantics as `ParsedManifest.completed_at`:
@@ -525,11 +616,20 @@ export function parseManifestFull(
   if (!raw || typeof raw !== 'object') return null;
   const m = raw as Record<string, unknown>;
 
-  if (m.schema !== MANIFEST_SCHEMA) return null;
+  const version = manifestVersion(m.schema);
+  if (version === null) return null;
   if (typeof m.session_id !== 'string' || !UUID_REGEX.test(m.session_id)) {
     return null;
   }
-  if (m.mode !== 'audio' && m.mode !== 'video') return null;
+  // G3'' — v1 states one medium for the session; it is authoritative
+  // there and is PROPAGATED to every chunk below, because a v1 document
+  // can only describe a session with a single producer. v2 states none:
+  // each chunk carries its own and the parser demands it.
+  let v1Mode: 'audio' | 'video' | undefined;
+  if (version === 1) {
+    if (m.mode !== 'audio' && m.mode !== 'video') return null;
+    v1Mode = m.mode;
+  }
   if (typeof m.created_at !== 'string' || m.created_at.length < 10) return null;
   // completed_at: ISO-like string for complete manifests, `null` for
   // partial manifests written during recording. Any other shape rejects.
@@ -607,11 +707,24 @@ export function parseManifestFull(
     if (!cc.file_name.startsWith(`${sessionId}_`)) return null;
     if (seenIndexes.has(cc.chunk_index)) return null; // duplicate index
     seenIndexes.add(cc.chunk_index);
+    // G3'' — every chunk ends up with a declared medium, one way or the
+    // other. v2 demands it in the document; v1 has none, so the session
+    // `mode` is propagated. That propagation is sound for v1 and only
+    // for v1: such a document cannot describe a session with more than
+    // one producer, because no client able to produce one has existed.
+    let media: 'audio' | 'video';
+    if (version === 2) {
+      if (cc.media !== 'audio' && cc.media !== 'video') return null;
+      media = cc.media;
+    } else {
+      media = v1Mode as 'audio' | 'video';
+    }
     chunks.push({
       chunk_index: cc.chunk_index,
       hash: cc.hash,
       size: cc.size,
       file_name: cc.file_name,
+      media,
     });
   }
 
@@ -621,10 +734,17 @@ export function parseManifestFull(
   // deterministic order regardless of how Drive stored them.
   chunks.sort((a, b) => a.chunk_index - b.chunk_index);
 
+  // G3'' — the response still carries a session-level `mode`, but it is
+  // now DERIVED from the chunks rather than restated from the session.
+  // Homogeneous chunks yield one; heterogeneous yield none, and
+  // `getManifestByFileId` refuses to serve that case rather than
+  // omitting a field whose absence a consumer would silently read as
+  // "not video" and use to name a false artifact.
+  const derived = deriveHomogeneousMedia(chunks);
   const out: FullManifest = {
     manifest_file_id: manifestFileId,
     session_id: sessionId,
-    mode: m.mode,
+    ...(derived !== undefined ? { mode: derived } : {}),
     created_at: m.created_at,
     completed_at: m.completed_at as string | null,
     chunk_count: m.chunk_count,
@@ -732,6 +852,41 @@ export async function getManifestByFileId(
           404,
           'MANIFEST_INVALID',
           'Manifest schema check failed',
+        );
+      }
+
+      // G3'' — FAIL CLOSED on heterogeneous evidence.
+      //
+      // `parseManifestFull` leaves `mode` undefined when the chunks do
+      // not share one medium. Serving that response would be worse than
+      // an error: the client reads `mode !== 'video'`, falls through to
+      // its byte-sniffing branch, finds an `ftyp` box at the head of the
+      // first MP4 segment and names the concatenation `.m4a` — a false
+      // artifact produced silently from true bytes.
+      //
+      // Refusing instead surfaces a typed failure the client already
+      // handles (`classifyManifestFailure` → `manifest_failure`). The
+      // bytes stay in Drive and the session stays discoverable; only the
+      // single-file export is withheld, which is precisely the operation
+      // that cannot be performed honestly.
+      //
+      // Unreachable while no producer can mix media in one session. It
+      // exists so that the day one can, the failure is loud.
+      if (parsed.mode === undefined) {
+        logger.warn(
+          {
+            op: 'recovery.manifest_fetch',
+            userId,
+            manifest_file_id: manifestFileId,
+            session_id: parsed.session_id,
+            reason: 'heterogeneous_media',
+          },
+          'GC_RECOVERY_MANIFEST_HETEROGENEOUS',
+        );
+        throw new AppError(
+          409,
+          'MANIFEST_HETEROGENEOUS',
+          'Session holds evidence of more than one medium and cannot be exported as a single file',
         );
       }
 

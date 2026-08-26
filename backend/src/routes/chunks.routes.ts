@@ -45,6 +45,16 @@ const chunkBodySchema = z.object({
   size: z.number().int().positive().max(20 * 1024 * 1024),
   status: z.enum(['pending', 'uploaded', 'failed']),
   remote_reference: z.string().nullable().optional(),
+  /**
+   * G3'' — medium of THIS chunk's bytes.
+   *
+   * Optional so a client that predates the field keeps registering
+   * chunks unchanged; absence persists as NULL and means "not
+   * declared", never "video". The v2 manifest writer refuses to build a
+   * document from a chunk whose medium is unknown rather than guessing
+   * one from the session.
+   */
+  media: z.enum(['video', 'audio']).optional(),
 });
 
 router.post(

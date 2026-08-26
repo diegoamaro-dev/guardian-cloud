@@ -148,6 +148,23 @@ Body (`chunkBodySchema`, `routes/chunks.routes.ts:41-48`):
 | `size` | `int` | `> 0`, máx. `20 MB` |
 | `status` | `'pending' \| 'uploaded' \| 'failed'` | — |
 | `remote_reference` | `string \| null` | opcional |
+| `media` | `'video' \| 'audio'` | **opcional** — ver abajo |
+
+> **`media` — implementado y validado EN EL ÁRBOL DE TRABAJO. NO versionado,
+> NO publicado, NO desplegado.** El backend que corre hoy en el mini servidor
+> es anterior a este campo: lo recibe y lo **descarta** —su esquema es un
+> `z.object` sin `.strict()`—, de modo que un cliente que lo envíe registra
+> chunks exactamente igual que antes. Esta fila describe el contrato del
+> árbol, no el que está sirviendo peticiones.
+>
+> El medio es una propiedad **de la unidad de evidencia**, no de la sesión:
+> `sessions.mode` declara con qué medio **empezó** la captura, y eso no basta
+> para describir cada chunk.
+>
+> **Ausencia = medio no declarado**, que se persiste como `NULL`. Nunca se
+> infiere: ni de `session.mode`, ni de la extensión, ni de la ruta. Un chunk
+> sin medio declarado no puede describirse, y el escritor del manifiesto se
+> niega a construir un documento con él antes que adivinarlo.
 
 > `status === 'uploaded'` **con `remote_reference` no vacío** es el único
 > predicado que acredita que un fragmento está fuera del dispositivo. Lo
@@ -256,9 +273,71 @@ Lista manifests recuperables del usuario.
 }
 ```
 
+> **`mode` en esta respuesta es DERIVADO, no reafirmado** *(árbol de trabajo;
+> el backend desplegado todavía lo copia de la fila de sesión)*. Sale del medio
+> de los chunks cuando todos coinciden. Si no coincidieran se **omite** y la
+> sesión **sigue listándose**: aquí el medio dibuja un icono, y ocultar una
+> sesión cuyos bytes existen sería peor que no dibujarlo. La negativa dura vive
+> en el endpoint siguiente, donde una respuesta equivocada produciría un
+> artefacto falso en lugar de un glifo equivocado.
+
 ### GET /recovery/manifests/:manifest_file_id
 
 Devuelve un manifest concreto.
+
+> **Fallo cerrado ante evidencia heterogénea** *(árbol de trabajo; el backend
+> desplegado no tiene este comportamiento)*. Cuando los chunks de la sesión no
+> comparten un solo medio, el endpoint responde:
+>
+> ```
+> 409 MANIFEST_HETEROGENEOUS
+> ```
+>
+> y **no** devuelve el manifiesto. Servirlo sería peor que un error: el cliente
+> leería un medio ausente, caería a su rama de olfateo de bytes, encontraría una
+> caja `ftyp` al principio del primer segmento MP4 y nombraría la concatenación
+> `.m4a` — un artefacto falso producido en silencio a partir de bytes ciertos.
+>
+> Los bytes siguen en Drive y la sesión sigue siendo descubrible; lo único que se
+> retira es el export en un fichero único, que es precisamente la operación que
+> no puede realizarse con honestidad.
+>
+> **Hoy es inalcanzable**: ningún productor puede mezclar medios en una sesión
+> mientras `VIDEO_AUDIO → AUDIO_ONLY` siga sin implementarse. Existe para que el
+> día que pueda, el fallo sea ruidoso.
+
+---
+
+## Manifiesto de evidencia — v1 y v2
+
+*Implementado y validado **en el árbol de trabajo**. **No** versionado, **no**
+publicado, **no** desplegado: el mini servidor sigue escribiendo v1.*
+
+El manifiesto es un fichero en el Drive del usuario, `{session_id}_manifest.json`.
+**No es contrato con el cliente**: la app nunca lo parsea — consume la respuesta
+ya validada de `/recovery/manifests*`. Es contrato del backend consigo mismo, y
+entre dispositivos.
+
+| | `guardian-cloud.manifest.v1` | `guardian-cloud.manifest.v2` |
+|---|---|---|
+| lo escribe | **el backend desplegado** | **el árbol de trabajo** |
+| se lee | sí, read-only | sí |
+| `mode` de sesión | presente y autoritativo | **ausente** |
+| `format` | `'mp4'` si `mode==='video'` | **ausente** |
+| `chunks[].media` | ausente | **obligatorio** |
+
+**Por qué v2 retira `mode` y `format`.** Un medio a nivel de sesión no puede
+describir una sesión que contenga más de uno, y mantenerlo junto a
+`chunks[].media` daría dos fuentes para el mismo hecho, capaces de contradecirse.
+`format` se derivaba de `mode` y **no tenía ningún lector** en el sistema.
+
+**Por qué v1 sigue leyéndose, y por qué su `mode` es válido ahí.** Todo documento
+v1 describe una sesión con un único productor: nunca ha existido un cliente capaz
+de mezclar medios. Al parsearlo, su `mode` se **propaga** a cada chunk. Esa
+propagación es correcta para v1 y **sólo** para v1.
+
+`mode` **se conserva** en `POST /sessions` y en la fila de sesión, con el
+significado que siempre tuvo: el medio con el que se inició la captura.
 
 ### GET /recovery/chunks/:manifest_file_id/:chunk_index/download
 

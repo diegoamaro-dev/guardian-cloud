@@ -92,10 +92,36 @@ contradiga es incorrecta.
 > `segments/<session_id>/segment_NNNNNN.mp4`. **D3 no soporta sesiones mixtas:
 > las rechaza.** Detalle en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §D3.
 >
-> `G3''` —descripción de la evidencia en backend y manifiesto— **sigue
-> pendiente**: el contrato declara el medio a nivel de **sesión** y todavía no
-> puede representar evidencia mixta sin declarar un tipo falso. Mientras siga
-> así, el gate atómico `VIDEO_AUDIO → AUDIO_ONLY` permanece **bloqueado**.
+> `G3''` —descripción de la evidencia en backend y manifiesto— está
+> **implementado y validado EN EL ÁRBOL DE TRABAJO**. Las tres cosas hay que
+> mantenerlas separadas:
+>
+> ```
+> IMPLEMENTADO Y VALIDADO EN EL ÁRBOL   sí
+> VERSIONADO / PUBLICADO                 NO — no existe commit de G3''
+> DESPLEGADO                             NO — el mini servidor sigue con el
+>                                        backend anterior, la migración 0005
+>                                        no se ha aplicado y no hay ningún
+>                                        manifiesto v2 en producción
+> ```
+>
+> Qué contiene el árbol: `media` opcional por chunk en `POST /chunks`,
+> persistencia nullable donde la ausencia significa «no declarado» y nunca se
+> infiere, `guardian-cloud.manifest.v2` con `chunks[].media` obligatorio y sin
+> `mode` ni `format` de sesión, lectura read-only de v1 —cuyo `mode` histórico
+> se propaga a los chunks porque toda sesión v1 es homogénea—, recovery que
+> deriva el medio de los chunks, y `409 MANIFEST_HETEROGENEOUS` en lugar de un
+> artefacto falsamente etiquetado. `mode` se conserva en `POST /sessions` y en
+> la fila de sesión, donde significa el medio con el que se **inició** la
+> captura.
+>
+> Qué **no** hace: no habilita evidencia mixta —ningún productor puede crearla—,
+> no implementa `VIDEO_AUDIO → AUDIO_ONLY`, no implementa el export heterogéneo
+> —una sesión mixta se **rechaza**—, y no toca D3, `/complete`, terminalidad,
+> background, worker ni cleanup.
+>
+> **`G4` sigue BLOQUEADO** mientras `G3''` no esté versionado y desplegado.
+> Contrato en [`API_SPEC.md`](./API_SPEC.md) §Manifiesto de evidencia.
 
 > **D3 `LOCAL SEGMENT SALVAGE` no pertenece a este nivel y no es un export
 > `.mp4`.** Es una capacidad distinta, implementada en `cb59c7e` y con

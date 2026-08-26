@@ -26,11 +26,18 @@ const {
   chunkInsertSingle,
   chunkSelectSingle,
   chunkUpdateSingle,
+  chunkInsertSpy,
+  chunkUpdateSpy,
 } = vi.hoisted(() => ({
   sessionMaybeSingle: vi.fn(),
   chunkInsertSingle: vi.fn(),
   chunkSelectSingle: vi.fn(),
   chunkUpdateSingle: vi.fn(),
+  // G3'' — spies on the PAYLOAD, not just on the result. What the
+  // service writes for `media` is invisible to every downstream test
+  // once the row exists, so the persistence boundary needs its own eyes.
+  chunkInsertSpy: vi.fn(),
+  chunkUpdateSpy: vi.fn(),
 }));
 
 vi.mock('../../src/config/supabase.js', () => {
@@ -46,15 +53,19 @@ vi.mock('../../src/config/supabase.js', () => {
   };
 
   const chunksTable = {
-    insert: () => ({ select: () => ({ single: chunkInsertSingle }) }),
+      insert: (payload: unknown) => {
+      chunkInsertSpy(payload);
+      return { select: () => ({ single: chunkInsertSingle }) };
+    },
     select: () => ({
       eq: () => ({
         eq: () => ({ single: chunkSelectSingle }),
       }),
     }),
-    update: () => ({
-      eq: () => ({ select: () => ({ single: chunkUpdateSingle }) }),
-    }),
+    update: (payload: unknown) => {
+      chunkUpdateSpy(payload);
+      return { eq: () => ({ select: () => ({ single: chunkUpdateSingle }) }) };
+    },
   };
 
   return {
@@ -126,6 +137,8 @@ describe('POST /chunks', () => {
   beforeEach(() => {
     sessionMaybeSingle.mockReset();
     chunkInsertSingle.mockReset();
+    chunkInsertSpy.mockReset();
+    chunkUpdateSpy.mockReset();
     chunkSelectSingle.mockReset();
     chunkUpdateSingle.mockReset();
   });
@@ -217,6 +230,60 @@ describe('POST /chunks', () => {
 
   // ── happy path + idempotency ─────────────────────────────────────────────
 
+  // ---- G3II - per-chunk medium ------------------------------------
+
+  it('★ N6 — absent media PERSISTS AS NULL, never as a medium', async () => {
+    // The persistence boundary. Downstream cover is not equivalent: if
+    // this write fell back to a medium, `buildManifest` would receive a
+    // declared chunk and accept it, and the session-level claim would be
+    // back — one row at a time, invisibly.
+    sessionMaybeSingle.mockResolvedValueOnce(activeSession());
+    chunkInsertSingle.mockResolvedValueOnce({ data: chunkRow(), error: null });
+
+    const res = await request(app)
+      .post('/chunks')
+      .set('Authorization', bearer())
+      .send(validBody());
+
+    expect(res.status).toBe(201);
+    expect(chunkInsertSpy).toHaveBeenCalledTimes(1);
+    const written = chunkInsertSpy.mock.calls[0]![0] as Record<string, unknown>;
+    expect(written.media).toBeNull();
+    expect(written.media).not.toBe('video');
+    expect(written.media).not.toBe('audio');
+  });
+
+  it('201 persists an explicitly declared medium, both values', async () => {
+    for (const media of ['video', 'audio'] as const) {
+      chunkInsertSpy.mockReset();
+      sessionMaybeSingle.mockResolvedValueOnce(activeSession());
+      chunkInsertSingle.mockResolvedValueOnce({ data: chunkRow(), error: null });
+
+      const res = await request(app)
+        .post('/chunks')
+        .set('Authorization', bearer())
+        .send(validBody({ media }));
+
+      expect(res.status).toBe(201);
+      const written = chunkInsertSpy.mock.calls[0]![0] as Record<string, unknown>;
+      expect(written.media).toBe(media);
+    }
+  });
+  it('201 TOLERATES an unknown field - the schema must not be strict', async () => {
+    // Pins the property the deployed backend already has (E1): zod
+    // strips what it does not know. Making the schema strict would
+    // reject any client that ships a field this build predates, which
+    // is exactly how a rollout breaks uploads in the field.
+    sessionMaybeSingle.mockResolvedValueOnce(activeSession());
+    chunkInsertSingle.mockResolvedValueOnce({ data: chunkRow(), error: null });
+
+    const res = await request(app)
+      .post('/chunks')
+      .set('Authorization', bearer())
+      .send(validBody({ some_field_this_build_predates: 'x' }));
+    expect(res.status).toBe(201);
+  });
+
   it('201 on first register', async () => {
     sessionMaybeSingle.mockResolvedValueOnce(activeSession());
     chunkInsertSingle.mockResolvedValueOnce({
@@ -261,6 +328,12 @@ describe('POST /chunks', () => {
     expect(res.body.chunk_id).toBe(CHUNK_ID);
     // No update should have been performed on pure replay.
     expect(chunkUpdateSingle).not.toHaveBeenCalled();
+    // G3'' — and none was ATTEMPTED either. The existing row carries no
+    // `media` key while the merge normalises to `null`; comparing those
+    // raw would call an unchanged row changed and turn this replay into
+    // a write. Asserting the spy, not just the result, is what catches
+    // that: a spurious update would still return 200.
+    expect(chunkUpdateSpy).not.toHaveBeenCalled();
   });
 
   it('200 on valid state transition pending → uploaded', async () => {

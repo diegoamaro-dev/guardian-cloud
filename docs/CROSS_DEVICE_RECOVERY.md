@@ -77,7 +77,11 @@ NO romper:
 - recovery depende de Google Drive conectado
 - no streaming reconstruction
 - export sigue memory-bound
-- manifest v1 únicamente
+- manifest v1 únicamente **en el backend desplegado**. El árbol de trabajo
+  escribe `guardian-cloud.manifest.v2` y sigue leyendo v1 read-only, pero eso
+  **no está versionado ni desplegado**: el mini servidor sigue emitiendo v1.
+  Detalle del contrato en [`API_SPEC.md`](./API_SPEC.md) §Manifiesto de
+  evidencia
 - no NAS recovery todavía
 
 ---

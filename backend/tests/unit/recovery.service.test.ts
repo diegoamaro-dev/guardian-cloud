@@ -59,9 +59,59 @@ describe('parseManifest', () => {
   });
 
   it('rejects unknown schema versions', () => {
-    expect(parseManifest(validManifest({ schema: 'guardian-cloud.manifest.v2' }))).toBeNull();
+    // G3'' — v2 is no longer unknown; it is the version this build
+    // writes. Anything outside {v1, v2} still rejects.
+    expect(parseManifest(validManifest({ schema: 'guardian-cloud.manifest.v3' }))).toBeNull();
     expect(parseManifest(validManifest({ schema: 'something-else' }))).toBeNull();
     expect(parseManifest(validManifest({ schema: undefined }))).toBeNull();
+  });
+
+  // ---- G3'' — v1 read-only, v2 per-chunk medium -----------------------
+
+  it('v1 keeps stating the session mode, and it stays authoritative', () => {
+    // Every v1 document describes a session with a single producer: no
+    // client able to mix media in one session has ever existed.
+    const parsed = parseManifest(validManifest({ mode: 'video' }));
+    expect(parsed?.mode).toBe('video');
+  });
+
+  it('v2 DERIVES the mode from its chunks, never from the session', () => {
+    const parsed = parseManifest(
+      validManifest({
+        schema: 'guardian-cloud.manifest.v2',
+        mode: undefined,
+        chunks: [
+          { chunk_index: 0, hash: 'a'.repeat(64), size: 1, file_name: 'x', media: 'video' },
+          { chunk_index: 1, hash: 'b'.repeat(64), size: 1, file_name: 'x', media: 'video' },
+        ],
+      }),
+    );
+    expect(parsed?.mode).toBe('video');
+  });
+
+  it('v2 with heterogeneous chunks still LISTS, carrying no mode', () => {
+    // Discovery must not hide a session whose bytes exist. The medium
+    // drives an icon here; the hard refusal belongs to the export path.
+    const parsed = parseManifest(
+      validManifest({
+        schema: 'guardian-cloud.manifest.v2',
+        mode: undefined,
+        chunks: [
+          { chunk_index: 0, hash: 'a'.repeat(64), size: 1, file_name: 'x', media: 'video' },
+          { chunk_index: 1, hash: 'b'.repeat(64), size: 1, file_name: 'x', media: 'audio' },
+        ],
+      }),
+    );
+    expect(parsed).not.toBeNull();
+    expect(parsed?.mode).toBeUndefined();
+  });
+
+  it('v2 never falls back to the session mode when chunks lack a medium', () => {
+    const parsed = parseManifest(
+      validManifest({ schema: 'guardian-cloud.manifest.v2', mode: 'video' }),
+    );
+    expect(parsed).not.toBeNull();
+    expect(parsed?.mode).toBeUndefined();
   });
 
   it('rejects non-object inputs', () => {
@@ -556,7 +606,89 @@ describe('parseManifestFull', () => {
       'chunk_index',
       'file_name',
       'hash',
+      'media',
       'size',
     ]);
+    // G3'' — a v1 document has no per-chunk medium, so the session mode
+    // is propagated onto each chunk. Sound for v1, and only for v1.
+    expect(parsed!.chunks[0]!.media).toBe('audio');
+  });
+});
+
+/**
+ * G3'' — `deriveHomogeneousMedia` decides whether a chunk list has ONE
+ * medium, and `getManifestByFileId` refuses to serve the case where it
+ * does not. That refusal is the reason the export path needs no change:
+ * a client that cannot obtain a heterogeneous manifest cannot name a
+ * false artifact from one.
+ */
+describe("G3'' — parseManifestFull and the medium of each chunk", () => {
+  it('v2 requires a declared medium on EVERY chunk', () => {
+    const parsed = parseManifestFull(
+      validFullManifest({
+        schema: 'guardian-cloud.manifest.v2',
+        mode: undefined,
+        chunks: [
+          { ...validChunk(SID_A, 0, HASH_A), media: 'video' },
+          validChunk(SID_A, 1, HASH_B), // no media
+        ],
+        chunk_count: 2,
+      }),
+      MANIFEST_FILE_ID,
+    );
+    expect(parsed).toBeNull();
+  });
+
+  it('v2 homogeneous resolves a derived session mode', () => {
+    const parsed = parseManifestFull(
+      validFullManifest({
+        schema: 'guardian-cloud.manifest.v2',
+        mode: undefined,
+        chunks: [
+          { ...validChunk(SID_A, 0, HASH_A), media: 'video' },
+          { ...validChunk(SID_A, 1, HASH_B), media: 'video' },
+        ],
+        chunk_count: 2,
+      }),
+      MANIFEST_FILE_ID,
+    );
+    expect(parsed).not.toBeNull();
+    expect(parsed!.mode).toBe('video');
+    expect(parsed!.chunks.map((c) => c.media)).toEqual(['video', 'video']);
+  });
+
+  it('★ N3 — v2 heterogeneous parses, but resolves NO session mode', () => {
+    // The state `getManifestByFileId` turns into 409. Leaving `mode`
+    // undefined here — rather than picking one — is what makes that
+    // refusal possible. If this ever resolved a mode, the export path
+    // would concatenate two media and name the result after one of them.
+    const parsed = parseManifestFull(
+      validFullManifest({
+        schema: 'guardian-cloud.manifest.v2',
+        mode: undefined,
+        chunks: [
+          { ...validChunk(SID_A, 0, HASH_A), media: 'video' },
+          { ...validChunk(SID_A, 1, HASH_B), media: 'audio' },
+        ],
+        chunk_count: 2,
+      }),
+      MANIFEST_FILE_ID,
+    );
+    expect(parsed).not.toBeNull();
+    expect(parsed!.mode).toBeUndefined();
+    expect(parsed!.chunks.map((c) => c.media)).toEqual(['video', 'audio']);
+  });
+
+  it('v1 propagates its session mode onto every chunk', () => {
+    const parsed = parseManifestFull(
+      validFullManifest({
+        mode: 'video',
+        chunks: [validChunk(SID_A, 0, HASH_A), validChunk(SID_A, 1, HASH_B)],
+        chunk_count: 2,
+      }),
+      MANIFEST_FILE_ID,
+    );
+    expect(parsed!.mode).toBe('video');
+    expect(parsed!.chunks.map((c) => c.media)).toEqual(['video', 'video']);
   });
 });

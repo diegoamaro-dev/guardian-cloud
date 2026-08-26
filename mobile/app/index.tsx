@@ -586,6 +586,13 @@ interface RealChunk {
   chunk_index: number;
   hash: string;
   size: number;
+  /**
+   * G3'' — medium of THIS chunk's bytes, carried to the backend so it
+   * can describe the evidence without inferring the medium from the
+   * session. Optional on the wire: absence persists as NULL, which
+   * means "not declared", never "video".
+   */
+  media?: 'video' | 'audio';
 }
 
 interface PendingState {
@@ -2618,7 +2625,15 @@ async function drainBody(pause: GlobalPauseState): Promise<void> {
           await postChunk(
             accessToken,
             sessionId,
-            { chunk_index: chunk.chunk_index, hash: chunk.hash, size: chunk.size },
+            // G3II - explicit three-field literal PLUS the medium. The
+            // body spread in `postChunk` widens THIS object, not the
+            // QueueChunk, so nothing else leaks onto the wire.
+            {
+              chunk_index: chunk.chunk_index,
+              hash: chunk.hash,
+              size: chunk.size,
+              ...(chunk.media !== undefined ? { media: chunk.media } : {}),
+            },
             'uploaded',
             // The validated value, not the raw response field, so the
             // guard above cannot be bypassed by a later edit.
