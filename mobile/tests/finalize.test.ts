@@ -48,12 +48,20 @@ vi.mock('@react-native-async-storage/async-storage', () => {
 // then calls completeSession, which uses global `fetch`. We control
 // both so each test asserts the exact decision branch.
 vi.mock('@/auth/store', () => ({
+  // R6: no-op = ownership gate open. Tests that need it SHUT override it.
+  assertOwnershipGateOpen: vi.fn(),
+  isOwnershipGateOpen: vi.fn(() => true),
   useAuthStore: { setState: vi.fn(), getState: vi.fn(() => ({ status: 'loading' })) },
   getFreshAccessToken: vi.fn(async () => 'test-token'),
+  getOwnershipAccessToken: vi.fn(async () => 'test-token'),
 }));
 
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { getFreshAccessToken } from '@/auth/store';
+import {
+  getFreshAccessToken,
+  getOwnershipAccessToken,
+  type OwnershipToken,
+} from '@/auth/store';
 import {
   MAX_COMPLETE_ATTEMPTS,
   PENDING_RETRY_KEY,
@@ -118,6 +126,10 @@ beforeEach(async () => {
   await AsyncStorage.clear();
   vi.clearAllMocks();
   vi.mocked(getFreshAccessToken).mockResolvedValue('test-token');
+  // The mock stands in for the ownership authority, the sole producer.
+  vi.mocked(getOwnershipAccessToken).mockResolvedValue(
+    'test-token' as OwnershipToken,
+  );
   // Default fetch — will be overridden per test.
   vi.stubGlobal('fetch', vi.fn());
 });
@@ -300,8 +312,11 @@ describe('tryFinalizeReadySessions — completeSession failure', () => {
     expect(q[0]?.session_completed).toBe(false);
   });
 
-  it('bumps complete_attempts and leaves the entry when getFreshAccessToken returns null', async () => {
-    vi.mocked(getFreshAccessToken).mockResolvedValue(null);
+  // R5: the completion path takes its token from the ownership authority
+  // now, so "no token" is driven through that accessor. Same assertion:
+  // no request, entry retained, attempts bumped.
+  it('bumps complete_attempts and leaves the entry when no ownership token is available', async () => {
+    vi.mocked(getOwnershipAccessToken).mockResolvedValue(null);
     await queueAppendNewSession(
       entry({
         next_chunk_index: 1,
@@ -427,5 +442,216 @@ describe('persistence sanity', () => {
     const raw = await AsyncStorage.getItem(PENDING_RETRY_KEY);
     expect(raw).not.toBeNull();
     expect(Array.isArray(JSON.parse(raw as string))).toBe(true);
+  });
+});
+
+/**
+ * GC-AUTH-001 — the vacuous-gate guard.
+ *
+ * The gate asks "is every index in 0..expectedChunks-1 uploaded?". For
+ * an entry whose chunker never ran, that range is EMPTY, so the answer
+ * is trivially yes and the entry sails straight through to
+ * `completeSession` + `reapEntry` — and `reapEntry` deletes the file the
+ * entry points at.
+ *
+ * "The empty set is fully uploaded" is true arithmetic and a
+ * catastrophic operational rule. Such an entry arises whenever a
+ * recorder went live and the chunker did not: a hard 4xx on POST
+ * /sessions, a crash during start-up, a boot that flipped
+ * `recording_closed` on a session that never emitted. The file on disk
+ * may be a real capture.
+ *
+ * Nothing here decides how those entries are eventually cleaned up.
+ * Holding a useless entry costs bytes; reaping a potential capture costs
+ * the evidence.
+ */
+describe('TEST_ZERO_CHUNK_ENTRY_IS_NEVER_COMPLETED_OR_REAPED', () => {
+  it('never calls /complete for an entry with expectedChunks === 0', async () => {
+    vi.stubGlobal('fetch', vi.fn());
+
+    await queueAppendNewSession(
+      entry({ recording_closed: true, next_chunk_index: 0, chunks: [] }),
+    );
+
+    const finalized = await tryFinalizeReadySessions();
+
+    expect(finalized).toBe(false);
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  it('never reaps an entry with expectedChunks === 0', async () => {
+    vi.stubGlobal('fetch', vi.fn());
+
+    await queueAppendNewSession(
+      entry({ recording_closed: true, next_chunk_index: 0, chunks: [] }),
+    );
+
+    await tryFinalizeReadySessions();
+
+    const queue = await queueRead();
+    expect(queue).toHaveLength(1);
+    expect(queue[0]?.session_id).toBe(SID);
+    // The uri is the whole point: it is the only durable pointer to a
+    // capture that may still be on disk.
+    expect(queue[0]?.uri).toBe('file:///doc/rec.m4a');
+  });
+
+  it('holds the entry across repeated drain passes', async () => {
+    vi.stubGlobal('fetch', vi.fn());
+
+    await queueAppendNewSession(
+      entry({ recording_closed: true, next_chunk_index: 0, chunks: [] }),
+    );
+
+    await tryFinalizeReadySessions();
+    await tryFinalizeReadySessions();
+    await tryFinalizeReadySessions();
+
+    expect(global.fetch).not.toHaveBeenCalled();
+    expect(await queueRead()).toHaveLength(1);
+  });
+
+  it('does not bump complete_attempts — it is held, not failing', async () => {
+    vi.stubGlobal('fetch', vi.fn());
+
+    await queueAppendNewSession(
+      entry({ recording_closed: true, next_chunk_index: 0, chunks: [] }),
+    );
+
+    await tryFinalizeReadySessions();
+    await tryFinalizeReadySessions();
+
+    expect((await queueRead())[0]?.complete_attempts).toBe(0);
+  });
+
+  it('a normal session with chunks still completes — the guard is narrow', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ session_id: SID, status: 'completed' }),
+      })),
+    );
+
+    await queueAppendNewSession(
+      entry({ next_chunk_index: 1, chunks: [uploadedChunk(0)] }),
+    );
+
+    expect(await tryFinalizeReadySessions()).toBe(true);
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+    expect(await queueRead()).toEqual([]);
+  });
+});
+
+/**
+ * G1's terminality-invariance block (I1 / I2 / I2b) lived here and has
+ * been SUPERSEDED by the `canAdvanceToTerminality` suite below.
+ *
+ * Those tests pinned `evidence_closed` as inert for the /complete
+ * decision — correct while G1 only introduced the durable field. G2'
+ * deliberately makes it operational for that ONE decision, so I2b
+ * ("evidence_closed=true CANNOT unblock a session with
+ * recording_closed=false") now asserts the exact opposite of T4. They
+ * cannot both hold; T1–T6 are the stricter, current contract.
+ *
+ * What survives unchanged is the OTHER half of G1's invariance, and it
+ * still lives in `queue.test.ts`: `evidence_closed` remains invisible to
+ * `pickNext`, the worker, retry and reap (I3). This gate narrowed the
+ * field's authority to a single decision; it did not widen it.
+ */
+
+/**
+ * G2' — the compatibility authority for `/complete`.
+ *
+ * `canAdvanceToTerminality(entry) = evidence_closed ?? recording_closed`
+ * decides ONE thing: whether `tryFinalizeReadySessions` may advance a
+ * Protection Session towards `POST /complete`. It is not the system's
+ * reader of terminality — `recording_closed` keeps other readers with
+ * other, still-valid semantics, none of which this gate touches.
+ *
+ * T1/T2 pin legacy compatibility: entries written before G1 and by
+ * `migrateLegacyPendingState` carry no key and MUST keep behaving
+ * exactly as they do today. T3/T4 pin the semantics a later gate will
+ * rely on; no product writer produces those states yet.
+ */
+describe("G2' — canAdvanceToTerminality", () => {
+  async function seedAndFinalize(
+    patch: Partial<PendingQueueEntry>,
+  ): Promise<{ finalized: boolean; left: number }> {
+    const e = entry({ next_chunk_index: 1, chunks: [uploadedChunk(0)], ...patch });
+    // Absence must be a MISSING KEY, not `undefined` — the round-trip
+    // through JSON is what a real persisted entry goes through.
+    if (patch.evidence_closed === undefined) {
+      delete (e as Partial<PendingQueueEntry>).evidence_closed;
+    }
+    // A successful /complete, so the branches that SHOULD advance can
+    // actually reach the end. Without it every variant would stall on a
+    // failed request and the comparison would be vacuous.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ session_id: SID, status: 'completed' }),
+      })),
+    );
+    await AsyncStorage.setItem(PENDING_RETRY_KEY, JSON.stringify([e]));
+    const finalized = await tryFinalizeReadySessions();
+    return { finalized, left: (await queueRead()).length };
+  }
+
+  it('T1 — legacy (key absent, recording_closed=true) FINALISES', async () => {
+    // The reachable-today case that a naive "read only evidence_closed"
+    // would strand forever: uploaded evidence, never declared complete.
+    const r = await seedAndFinalize({ recording_closed: true });
+    expect(r.finalized).toBe(true);
+    expect(r.left).toBe(0);
+  });
+
+  it('T2 — legacy (key absent, recording_closed=false) does NOT finalise', async () => {
+    const r = await seedAndFinalize({ recording_closed: false });
+    expect(r.finalized).toBe(false);
+    expect(global.fetch).not.toHaveBeenCalled();
+    expect(r.left).toBe(1);
+  });
+
+  it('T3 — evidence_closed=false BLOCKS even with recording_closed=true', async () => {
+    // The case that distinguishes `??` from `||`. A later gate will
+    // write exactly this: producer closed, Protection Session open.
+    const r = await seedAndFinalize({
+      recording_closed: true,
+      evidence_closed: false,
+    });
+    expect(r.finalized).toBe(false);
+    expect(global.fetch).not.toHaveBeenCalled();
+    expect(r.left).toBe(1);
+  });
+
+  it('T4 — evidence_closed=true may advance even with recording_closed=false', async () => {
+    const r = await seedAndFinalize({
+      recording_closed: false,
+      evidence_closed: true,
+    });
+    expect(r.finalized).toBe(true);
+    expect(r.left).toBe(0);
+  });
+
+  it('T5 — G1 false/false stays open', async () => {
+    const r = await seedAndFinalize({
+      recording_closed: false,
+      evidence_closed: false,
+    });
+    expect(r.finalized).toBe(false);
+    expect(r.left).toBe(1);
+  });
+
+  it('T6 — G1 true/true behaves exactly as today', async () => {
+    const r = await seedAndFinalize({
+      recording_closed: true,
+      evidence_closed: true,
+    });
+    expect(r.finalized).toBe(true);
+    expect(r.left).toBe(0);
   });
 });

@@ -42,8 +42,19 @@ captura. `GC-AUD-001` deja de ser un defecto vigente.
 ## ⚙️ Estado actual
 
 ⛔ **Veredicto vigente: `NO APTO PARA RELEASE`** — por cifrado local, recovery
-`I5c`, export `.mp4` y cobertura de dispositivos. **Ya no por `GC-AUD-001`.**
+`I5c`, export `.mp4`, cobertura de dispositivos **y findings de
+identidad/destino todavía no cerrados**. **Ya no por `GC-AUD-001`.**
 Empezar por [`START_HERE.md`](./START_HERE.md).
+
+> **Bloque de identidad (21/08 – 24/08).** Ocho findings registrados; **uno
+> cerrado en hardware** (`GC-AUTH-MIGRATION-001`) y **otro revalidado en
+> hardware** el 24/08 (`GC-DEST-PAUSE-001`, `FIXED IN CODE` /
+> `HARDWARE REVALIDATED`). Un release blocker corregido en código
+> (`GC-DEV-RESET-001`). Los demás permanecen corregidos o abiertos con
+> distintos niveles de validación; el más grave de los que siguen `OPEN` es
+> `GC-AUTH-SESSION-RECOVERY-001`. Tabla completa en
+> [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md#findings-abiertos-de-identidad-destino-y-herramientas)
+> y detalle en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md).
 
 > **Qué está implementado y qué está validado:** la referencia canónica es la
 > tabla de tres niveles en
@@ -71,11 +82,25 @@ El sistema actualmente:
 * ✔ subida en background
 * ✔ durable cleanup del almacenamiento local en la ruta normal
 * ✔ export de evidencia (`.m4a`)
+* ✔ captura local-first: la grabación no depende de tener identidad remota
+* ✔ frontera de migración de identidad sellada durablemente (`gc.legacy_probe.v1`)
 * ❌ sin `capture_end_reason`: no se puede probar finalización limpia
 * ❌ recovery automático tras reinicio del dispositivo (I5c) no implementado
 * ❌ cifrado local no implementado
 * ❌ export final `.mp4` no implementado
 * ❌ un solo dispositivo validado: sin cobertura multi-dispositivo ni Android 13+
+* ❌ **la sesión de Supabase puede desaparecer tras una ventana offline
+  prolongada y dejar la evidencia sin poder subirse** (`GC-AUTH-SESSION-RECOVERY-001`, abierto).
+  Desde el 24/08 esa evidencia sí tiene **salida local** si es vídeo nativo
+  segmentado: D3 `LOCAL SEGMENT SALVAGE` copia los segmentos MP4 originales
+  fuera del sandbox (`HARDWARE FUNCTIONAL PASS`). **No es una corrección**: la
+  identidad no se recupera, la subida no se reanuda y no es un `.mp4` final
+* ✅ `GC-START-LATENCY-001` = **`FIXED IN CODE` / `HARDWARE VALIDATED`** (24/08).
+  Aquí decía que «el inicio de captura se bloquea ~4½ min con la red remota
+  muerta». Ya no: **auth puede seguir tardando, pero ya no bloquea START**.
+  Detalle en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §6
+* ❌ **un destino Drive revocado sigue reportándose `connected`**
+  (`GC-DEST-STATUS-001`, abierto, backend)
 
 Las afirmaciones históricas de validación de este repositorio quedaron retiradas
 por la auditoría. Ver [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md).
@@ -109,14 +134,17 @@ Export:
 Leer en este orden:
 
 1. docs/START_HERE.md
-2. **docs/releases/v0.3.0-rc.1.md** — baseline técnica vigente
-3. **docs/DEVELOPMENT_WORKFLOW.md** — cómo se avanza sobre la baseline
-4. docs/MVP_SCOPE.md
-5. docs/ARCHITECTURE.md
-6. docs/API_SPEC.md
-7. docs/DESIGN.md
-8. docs/UI_SCREENS.md
-9. docs/SECURITY.md
+2. **docs/IMPLEMENTATION_STATUS.md** — referencia canónica de qué está implementado y qué validado
+3. **docs/KNOWN_LIMITS.md** — límites vigentes y findings §1–§6
+4. **docs/RELEASE_CHECKLIST_v0.3.md** — §0 es un invariante **bloqueante** de release
+5. **docs/releases/v0.3.0-rc.1.md** — baseline técnica vigente
+6. **docs/DEVELOPMENT_WORKFLOW.md** — cómo se avanza sobre la baseline
+7. docs/MVP_SCOPE.md
+8. docs/ARCHITECTURE.md
+9. docs/API_SPEC.md
+10. docs/DESIGN.md
+11. docs/UI_SCREENS.md
+12. docs/SECURITY.md
 
 Auditoría y estado real:
 
@@ -131,14 +159,18 @@ Auditoría y estado real:
 ## 🧪 Validación
 
 **Condición vigente: toda la suite actual debe pasar, sin tests saltados.** No
-se fija aquí ninguna cifra: quedaría obsoleta al añadir pruebas y empujaría a
-«arreglar» el documento en vez del código. Registrar el total observado al
-ejecutarla.
+se fija aquí ninguna cifra como objetivo: quedaría obsoleta al añadir pruebas y
+empujaría a «arreglar» el documento en vez del código. Registrar el total
+observado al ejecutarla.
+
+Última ejecución registrada: **936/936 en 42 ficheros**, el 2026-08-26, tras
+`fc9a20e`. *(Corte anterior: 900/900 en 42 ficheros el 2026-08-24, tras
+`cb59c7e`.)*
 
 **12 errores TypeScript heredados** (typecheck **NO** verde) · sin CI.
 
 Resultados históricos, por baseline: **198/198** en `v0.3.0-rc.1`, **263/263** en
-`baseline-fea160c-android11-20260730`.
+`baseline-fea160c-android11-20260730`, **360/360** en el corte del 2026-08-20.
 
 La baseline `v0.3.0-rc.1` distingue tres niveles de evidencia —verificado por
 instrumentación, atestiguado manualmente, y no ejecutado— y **no marca como

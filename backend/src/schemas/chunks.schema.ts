@@ -27,6 +27,11 @@ export const createChunkSchema = z.object({
   size: z.number().int().positive().max(MAX_CHUNK_SIZE_BYTES),
   status: z.enum(['pending', 'uploaded', 'failed']),
   remote_reference: z.string().min(1).max(512).nullable().optional(),
+  /**
+   * G3'' — medium of THIS chunk's bytes. Optional; absence persists as
+   * NULL and means "not declared", never "video".
+   */
+  media: z.enum(['video', 'audio']).optional(),
 });
 
 export type CreateChunkInput = z.infer<typeof createChunkSchema>;

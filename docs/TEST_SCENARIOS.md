@@ -4,6 +4,87 @@
 
 Validar el producto bajo condiciones reales, no solo en demo feliz.
 
+## Los cuatro niveles — no confundirlos
+
+Un escenario escrito aquí **no** es un escenario probado. Un escenario probado
+en la suite **no** es un escenario validado en dispositivo. Esta distinción es
+el motivo por el que la auditoría del 2026-07-28 retiró las afirmaciones de
+validación del repositorio, y se mantiene explícita para no repetirlo.
+
+| Nivel | Significa | Qué lo acredita |
+|---|---|---|
+| `DEFINIDO` | El escenario está escrito. **Nada más** | Este documento |
+| `PROBADO EN TESTS` | Hay pruebas automáticas que ejercitan su lógica | Un fichero de `mobile/tests/` |
+| `HARDWARE_VALIDATED` | Ejecutado en dispositivo real, con evidencia fechada | Un informe de `docs/audits/` o el archivo de evidencia |
+| `HARDWARE PENDIENTE` | Implementado y probado; **sin** ejecutar en dispositivo | La ausencia de lo anterior |
+
+> `PROBADO EN TESTS` nunca asciende a `HARDWARE_VALIDATED` por acumulación. Son
+> ejes distintos: una prueba unitaria demuestra lógica, no comportamiento del
+> sistema operativo bajo estrés.
+
+### Estado por escenario
+
+Mapeo por asunto de los ficheros de prueba, sobre la **evidencia vigente**.
+**No corresponde a un único commit ni a un único artefacto**: la tabla mezcla
+validaciones de hardware, corridas de la suite y findings fechados en momentos
+distintos, y cada fila declara su propia procedencia. **No es exhaustivo**:
+marca el nivel que se puede acreditar, no el máximo alcanzable.
+
+| Escenario | Nivel | Acreditación |
+|---|---|---|
+| 1 — Grabación corta | `HARDWARE_VALIDATED` | Validación 20/08 (vídeo) · `durableBeforeBackend`, `queue` |
+| 2 — Pérdida de conexión | `HARDWARE_VALIDATED` | Escenario H1 de `GC-START-LATENCY-001`, 24/08: con el token caducado y el dispositivo en modo avión, la captura arrancó en 243 ms, encoló 77 fragmentos de forma durable y, al restaurar la red, el registro diferido convergió con el **mismo** `localSessionId` y drenó 77/77. Además `drainPause`, `errorPolicy`, `classifyError`, `deferredRegistration`, `captureWhileDegraded`. **La ruta de auth de Supabase sigue sin timeout** — ver [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §6, residuales |
+| 3 — Cierre forzado | `HARDWARE_VALIDATED` | Vía 2 fase 2.3, 21/08 · `durableBeforeBackend`, `captureWhileDegraded`, `finalize`, `normalize` |
+| 4 — Reinicio del dispositivo | `PROBADO EN TESTS` · **HARDWARE PENDIENTE** | `drainPause`. El recovery autónomo tras reinicio (`I5c`) **no está implementado** |
+| 5 — Permisos denegados | `DEFINIDO` | Sin cobertura automática identificada |
+| 6 — Drive desconectado | `HARDWARE_VALIDATED` | Revalidación `GC-DEST-PAUSE-001` del 24/08 (cross-build): pausa `DRIVE_NOT_CONNECTED` sostenida ~20 h, reconexión real por OAuth, retirada de la pausa y drenaje de 10/10 con referencias remotas distintas. Además `drainPause`, `destinationPauseClear`, `authPauseRecovery`. **`GC-DEST-STATUS-001` sigue abierto**: `connected` no prueba que el destino funcione |
+| 7 — Chunk duplicado | `PROBADO EN TESTS` | `normalize` (pasos 2 y 3) · idempotencia de backend por `UNIQUE(session_id, chunk_index)` |
+| 8 — Batería baja | `DEFINIDO` | Sin cobertura automática identificada |
+| 9 — Historial | `DEFINIDO` | Sin cobertura automática identificada |
+| 10 — Modo Kids | `DEFINIDO` | Post-MVP. No implementado |
+| 11–13 — Chunks corruptos y export sin chunks válidos | `PROBADO EN TESTS` | `exportFromChunkRefs` |
+| 14 — UI de export bajo fallo | `PROBADO EN TESTS` | `exportRunner` |
+| 15 — Uso bajo estrés | `DEFINIDO` · **HARDWARE PENDIENTE** | Sin corrida registrada con el artefacto vigente |
+| 16 — Recuperación por usuario | `HARDWARE_VALIDATED` **parcial** | Recovery de una sesión pendiente tras restaurar Drive, 20/08 · `recoveryVerdict`, `exportFromChunkRefs`. Los casos 2–7 de este escenario **no** están validados en hardware |
+| 17 — Vídeo nativo con durable cleanup | `HARDWARE_VALIDATED` en su **ruta normal** | Validación 20/08 · puntos 5–8 en `HARDWARE_HARDENING_PENDING` |
+| 18 — Transición segura a segundo plano | `DEFINIDO` | Sin cobertura. Su criterio es `BACKGROUND TRANSITION SAFETY` y se acreditará en el gate G5 de Continuous Protection |
+
+#### Escenario 18 — Transición segura a segundo plano
+
+Verifica que abandonar el primer plano durante captura de vídeo **no pierde
+evidencia** y **no interrumpe la protección**. Separa tres capacidades que no
+deben confundirse:
+
+| | Capacidad | Régimen |
+|---|---|---|
+| 1 | capturar **vídeo nuevo** en segundo plano | **prohibido por diseño** |
+| 2 | seguir **subiendo** la evidencia ya capturada | exigible |
+| 3 | **preservar y recuperar** la sesión | obligatorio |
+
+Un fallo en 2 o en 3 es un fallo del escenario. La ausencia de 1 **no** lo es:
+es el comportamiento correcto.
+
+Nivel `DEFINIDO`: no existe corrida que lo acredite. La ejecución `H-1A` del
+2026-08-25 observó, en **una sola ejecución y un solo dispositivo**, un cierre
+controlado del productor de vídeo con la evidencia íntegra y subidas que
+continuaron en segundo plano. Es **evidencia provisional**, no congelada, y **no
+acredita este escenario**: en aquella ejecución la sesión terminó al cerrarse el
+vídeo, sin fase de audio posterior.
+
+G5 deberá además medir **por contenido** el hueco entre la última evidencia útil
+de vídeo y la primera de audio. Ver
+[`decisions/ADR-CONTINUOUS-PROTECTION.md`](./decisions/ADR-CONTINUOUS-PROTECTION.md) §9.
+
+### Escenarios de identidad — sin entrada propia todavía
+
+Los findings del bloque de identidad no tienen escenario numerado en este
+documento, pero sí cobertura automática densa: `legacyProbeSeal` (52),
+`devResetGuard` (62), `authDiagnostics` (46), `ownershipGate` (26),
+`destinationPauseClear` (17), `ownershipBrand` (10). Su estado exacto está en
+[`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md#findings-abiertos-de-identidad-destino-y-herramientas).
+
+**Sólo `GC-AUTH-MIGRATION-001` está `HARDWARE_VALIDATED`.**
+
 ## Estado de validación vigente
 
 * La grabación nativa segmentada, la **subida de vídeo durante la captura** y
@@ -13,10 +94,29 @@ Validar el producto bajo condiciones reales, no solo en demo feliz.
   [validación del 20/08](./audits/GUARDIAN_CLOUD_NATIVE_SEGMENTED_DURABLE_CLEANUP_VALIDATION_2026-08-20.md).
 * También está `HARDWARE_VALIDATED` el recovery real de una sesión pendiente
   tras restaurar la autorización de Drive.
-* Validación automática actual: 360/360 tests; 12 errores TypeScript
-  históricos y cero nuevos; Kotlin
-  `:gc-segmented-recorder:compileDebugKotlin` con `BUILD SUCCESSFUL`;
-  `git diff --check` limpio.
+* **D3 `LOCAL SEGMENT SALVAGE`** está `HARDWARE FUNCTIONAL PASS` desde el 24/08
+  en el mismo dispositivo, sobre `cb59c7e` (APK `8151c338…`): con el teléfono en
+  modo avión y sin ruta de red, una captura de vídeo nativo segmentado cerrada
+  (12 segmentos, índices 0–11, `remote_reference = 0`) se exportó a una carpeta
+  SAF con `status: complete`, 12/12 segmentos, manifest válido y `sha256`
+  coincidente en los doce. Es **supervivencia, no recuperación**: no cierra
+  `GC-AUTH-SESSION-RECOVERY-001` ni implementa el export `.mp4`.
+* **`POST-SALVAGE NETWORK RECOVERY`** es un **gate distinto**, también `PASS` el
+  24/08 y sobre la misma sesión: al restaurar la conectividad después del
+  salvage, la sesión convergió con normalidad —mismo `localSessionId`, 1
+  `POST /sessions`, 12/12 chunks con 12 `remote_reference` únicas, `missing []`,
+  `/complete`, `GC_CLEANUP_AUTHORIZED` con `http_200`, cleanup y `GC_QUEUE`
+  vacía— con el export SAF intacto (13/13 por `sha256`). Demuestra que **D3 es
+  aditivo**: el salvage no interfiere con la convergencia normal posterior. **No
+  reproduce** el escenario del finding, que sigue `OPEN`.
+* Validación automática vigente, ejecutada el 2026-08-26 sobre el árbol
+  posterior a `fc9a20e`: **936/936 tests en 42 ficheros**; 12 errores
+  TypeScript históricos y cero nuevos; `git diff --check` limpio.
+  `compileDebugKotlin` dio `BUILD SUCCESSFUL` el 20/08 y **no se ha reejecutado
+  desde entonces**.
+  *(Cifras anteriores de esta línea: 360/360 en el corte del 20/08, 781/781 en
+  el del 23/08 sobre `34412a0`, 792/792 en 41 ficheros el 24/08 tras `3c10994`
+  y 900/900 en 42 ficheros el 24/08 tras `cb59c7e`.)*
 * **No** se declaran validados: recovery completo de vídeo, export final
   `.mp4`, cobertura multi-dispositivo, Android 13+ ni las rutas artificiales de
   fallo del scheduler.

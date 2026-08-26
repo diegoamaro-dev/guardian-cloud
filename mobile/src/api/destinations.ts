@@ -16,7 +16,11 @@
  */
 
 import { env } from '@/config/env';
-import { getFreshAccessToken } from '@/auth/store';
+import {
+  getOwnershipAccessToken,
+  assertOwnershipGateOpen,
+  type OwnershipToken,
+} from '@/auth/store';
 import { apiFetch, ApiError } from './client';
 
 export type DestinationType = 'drive' | 'nas';
@@ -87,6 +91,7 @@ export function startDriveConnect(
 ): Promise<DriveConnectStartResponse> {
   return apiFetch<DriveConnectStartResponse>('/destinations/drive/connect', {
     method: 'POST',
+    ownership: true,
     body: {
       action: 'start',
       ...(redirectUri ? { redirect_uri: redirectUri } : {}),
@@ -105,6 +110,7 @@ export function exchangeDriveCode(
 ): Promise<DriveConnectExchangeResponse> {
   return apiFetch<DriveConnectExchangeResponse>('/destinations/drive/connect', {
     method: 'POST',
+    ownership: true,
     body: {
       action: 'exchange',
       code,
@@ -121,6 +127,7 @@ export function driveTestUpload(
 ): Promise<DriveTestUploadResponse> {
   return apiFetch<DriveTestUploadResponse>('/destinations/drive/test-upload', {
     method: 'POST',
+    ownership: true,
     ...(signal ? { signal } : {}),
   });
 }
@@ -203,14 +210,24 @@ export async function uploadChunkBytes(
   base64Slice: string,
   timeoutMs = 30_000,
   destinationType: DestinationType = 'drive',
-  accessToken?: string,
+  accessToken?: OwnershipToken,
 ): Promise<DriveChunkUploadResponse> {
+  // R6 — the worker's cached token arrives as a parameter, so the brand is
+  // the compile-time half and this is the runtime half. O(1), safe per
+  // chunk: no AsyncStorage, no getSession.
+  assertOwnershipGateOpen(`/destinations/${destinationType}/chunks`);
   // Token resolution: use the caller-provided one when present (worker
   // hot path — saves one supabase.auth.getSession() per chunk), fall back
   // to the inline refresh otherwise. supabase-js refreshes the persisted
   // access token in-place when it has expired, so a stale snapshot in
   // the Zustand store cannot drag this into a 401.
-  const token = accessToken ?? (await getFreshAccessToken());
+  // R5 — OWNERSHIP TOKEN, not the plain one. This call writes bytes into
+  // the user's Drive and returns a `remote_reference`: it is the most
+  // literal creation of remote ownership in the app. The caller-provided
+  // `accessToken` is the worker's hot-path cache, and it must come from
+  // the ownership authority too — a cached read token here would walk
+  // straight around the gate.
+  const token = accessToken ?? (await getOwnershipAccessToken());
   if (!token) {
     console.log('AUTH MISSING', { path: `/destinations/${destinationType}/chunks` });
     throw new ApiError(401, 'NO_TOKEN', 'No access token in store', null);

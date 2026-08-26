@@ -69,7 +69,7 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
     bundleIdentifier: 'com.guardiancloud.app',
   },
   android: {
-    package: 'com.guardiancloud.app',
+    package: 'com.guariacloud.app',
     adaptiveIcon: {
       foregroundImage: './assets/foreground.png',
       backgroundColor: '#000000',

@@ -55,6 +55,19 @@ Si falla en estos escenarios:
 
 > el producto no es válido
 
+**Qué significa «app minimizada».** Significa que la **protección** debe
+continuar: la evidencia ya capturada sigue subiéndose. **No** significa que la
+cámara siga grabando. La captura de vídeo es deliberadamente *foreground-only*,
+y con la aplicación en segundo plano o la pantalla bloqueada no se autoriza el
+uso de la cámara.
+
+> **Dirección aprobada · NO implementada.** Hoy, al minimizar durante una
+> captura de vídeo, el productor se detiene de forma controlada y **la sesión
+> actual termina**; Continuous Protection cambia ese contrato para que la
+> Protection Session permanezca abierta y continúe mediante `AUDIO_ONLY`, sin
+> que el usuario decida nada. Decide
+> [`decisions/ADR-CONTINUOUS-PROTECTION.md`](./decisions/ADR-CONTINUOUS-PROTECTION.md).
+
 ---
 
 ## 5. No sobreingeniería

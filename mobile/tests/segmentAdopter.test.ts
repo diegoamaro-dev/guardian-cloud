@@ -103,6 +103,7 @@ function expectContract(call: unknown[], index: number, bytes: Buffer): void {
     'chunk_index',
     'hash',
     'local_uri',
+    'media',
     'size',
     'status',
   ]);
@@ -112,6 +113,10 @@ function expectContract(call: unknown[], index: number, bytes: Buffer): void {
   expect(chunk.size).toBe(bytes.length);
   expect(chunk.hash).toBe(sha(bytes));
   expect(chunk.local_uri).toBe(stableSegmentUri(SID, index));
+  // G3' — WRITER 1 of 3. This adopter only ever emits native segmented
+  // video, so the medium is a literal. If it ever became derived, this
+  // is where the drift would show.
+  expect(chunk.media).toBe('video');
 }
 
 beforeEach(() => {

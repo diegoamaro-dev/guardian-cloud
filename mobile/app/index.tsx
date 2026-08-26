@@ -42,10 +42,53 @@ import {
   subscribePreferredDestinationChange,
 } from '@/destinations/preference';
 import { ApiError } from '@/api/client';
+import { classifyFailure, type FailureDecision } from '@/upload/errorPolicy';
+import {
+  ensureReady as ensurePauseReady,
+  getSnapshot as getPauseSnapshot,
+  isDestinationBlocked,
+  isGloballyBlocked,
+  readState as readPauseState,
+  registerAuthRestoreHandler,
+  writeState as writePauseState,
+  PAUSE_POLICY_VERSION,
+  type GlobalPauseState,
+} from '@/upload/pauseStore';
 import { listSessionChunks } from '@/api/export';
-import { useAuthStore, getFreshAccessToken } from '@/auth/store';
+import {
+  useAuthStore,
+  getFreshAccessToken,
+  getOwnershipAccessToken,
+  assertOwnershipGateOpen,
+  type OwnershipToken,
+} from '@/auth/store';
+import {
+  LEGACY_PROBE_VERSION,
+  decideIdentityState,
+  ensureMigrationBoundary,
+  invalidateLegacyProbeSeal,
+  markIdentityInitialized,
+  resolveIdentityInitialized,
+} from '@/auth/identityMarker';
 import { appendHistoryEntry, type SessionMode } from '@/api/history';
-import { hardResetAppState } from '@/dev/reset';
+import {
+  describeResetRefusal,
+  hardResetAppState,
+  inspectPendingEvidence,
+  inspectResetSafety,
+  producerActiveRefusal,
+  type ResetRefusal,
+} from '@/dev/reset';
+// GC-DEV-RESET-001 (third gap) — mutual exclusion between capture starts
+// and destructive dev tools. Zero-import leaf; see the module docblock
+// for why nothing existing could be reused.
+import {
+  acquireDestructiveExclusion,
+  acquireProducerSlot,
+  releaseDestructiveExclusion,
+  releaseProducerSlot,
+  type ProducerSlot,
+} from '@/recording/evidenceExclusion';
 import type { ChunkPayload } from '@/recording/chunkProducer';
 import { RecordingController } from '@/recording/recordingController';
 // Native segmented recorder. Imported eagerly (same shape the validated D_15S_2S
@@ -272,7 +315,7 @@ const DEBUG_DUPLICATE_SUBMISSION = false;
  * completeSession"). When > 0, Phase 1 multi-chunk waits this many ms
  * after the final chunk uploads and BEFORE calling completeSession.
  * That opens a deterministic window for an external `adb shell am
- * force-stop com.guardiancloud.app` to hit the exact state the test
+ * force-stop com.guariacloud.app` to hit the exact state the test
  * wants to cover: all chunks server-side, session still `active`,
  * client killed before completion. Phase 2 recovery on relaunch must
  * then see `remaining: []` and run completeSession alone.
@@ -543,6 +586,13 @@ interface RealChunk {
   chunk_index: number;
   hash: string;
   size: number;
+  /**
+   * G3'' — medium of THIS chunk's bytes, carried to the backend so it
+   * can describe the evidence without inferring the medium from the
+   * session. Optional on the wire: absence persists as NULL, which
+   * means "not declared", never "video".
+   */
+  media?: 'video' | 'audio';
 }
 
 interface PendingState {
@@ -664,6 +714,35 @@ export interface QueueChunk {
   /** Set when the upload to Drive returned a file_id we should use as remote_reference on /chunks. */
   remote_reference?: string | null | undefined;
   last_error?: { status: number; code?: string; message: string } | undefined;
+  /**
+   * G3' — medium of THIS chunk's bytes.
+   *
+   * A property of the unit of evidence, never of the session: a
+   * Protection Session will eventually carry chunks of both media, and
+   * a session-level `mode` cannot describe that without lying.
+   *
+   * Written by exactly three producers, each medium-specific BY
+   * CONSTRUCTION — no parameter, no derivation, no heuristic:
+   *   · `segmentAdopter`  → 'video'  native segmented MP4 segments
+   *   · `videoChunkSink`  → 'video'  legacy post-stop video slices
+   *   · `emitChunk`       → 'audio'  called only by runAudioChunkerTick
+   *
+   * ── WHAT IT DOES NOT GUARANTEE ─────────────────────────────────────
+   * `'video'` does NOT mean "self-contained MP4 segment exportable by
+   * D3". `videoChunkSink` writes `'video'` for base64 slices living
+   * under `chunks/<sid>/N.b64`, which are NOT segments. Any consumer
+   * that wants to treat a chunk as a native segment must ALSO verify the
+   * structural signature `segments/<sid>/segment_NNNNNN.mp4`.
+   *
+   * Absence means "metadata unavailable" — never "video", never "audio".
+   * Entries written before G3' carry no key; the D3 fallback treats them
+   * by structural evidence alone and fails closed on any ambiguity.
+   *
+   * Optional and additive, like `destination_type`, `paused` and
+   * `evidence_closed`: making it required would break every inline chunk
+   * literal across the test suite.
+   */
+  media?: 'video' | 'audio' | undefined;
 }
 
 export interface PendingQueueEntry {
@@ -703,6 +782,60 @@ export interface PendingQueueEntry {
    * absence of the field is a meaningful "wasn't bound" signal.
    */
   destination_type?: DestinationType | undefined;
+  /**
+   * PHASE 1A — entry-scoped upload block.
+   *
+   * Set when a failure is unrepairable by repeating the same request
+   * but affects only this session (`409 SESSION_NOT_ACTIVE`) or is not
+   * recognised at all (`UNCLASSIFIED_PAUSE`). While present, the worker
+   * skips this entry entirely.
+   *
+   * This is a SELECTION filter, not a terminal state: the chunks stay
+   * `pending` and keep their bytes, hash and index, so the entry
+   * resumes intact the moment the pause is lifted. Nothing about the
+   * chunk format changes — the flag lives on the entry, never on
+   * `QueueChunk`.
+   *
+   * Optional for backward compatibility: entries written before this
+   * field existed simply have no pause, which is the correct default.
+   */
+  paused?:
+    | {
+        reason: 'SESSION_STATE_PAUSE' | 'UNCLASSIFIED_PAUSE';
+        at: number;
+        code?: string | undefined;
+      }
+    | undefined;
+  /**
+   * G1 — durable terminality state of the Protection Session.
+   *
+   * `true` means: this Protection Session no longer accepts new evidence
+   * and may advance toward terminality.
+   *
+   * It does NOT encode the CAUSE of that closure. It does not mean the
+   * user tapped PARAR, it is not equivalent to `session_completed`, and
+   * it does not assert that `/complete` has happened.
+   *
+   * ── INERT DURING G1 ────────────────────────────────────────────────
+   * `recording_closed` remains the SOLE operational authority. Nothing
+   * reads this field: not `tryFinalizeReadySessions`, not `pickNext`,
+   * not cleanup, not recovery. It is written in parallel with
+   * `recording_closed`, carrying the same value, so the schema is on
+   * disk and proven before G2 changes WHO writes it and WHO reads it.
+   *
+   * Absence means ONLY "metadata unavailable" — never "closed", never
+   * "open". Entries written before G1, and those produced by
+   * `migrateLegacyPendingState` (deliberately untouched), have no key at
+   * all. The operational fallback policy for a missing value belongs to
+   * G2, once cross-version compatibility has been audited; defining one
+   * here would decide G2 in advance.
+   *
+   * Optional and additive: the same pattern as `destination_type` and
+   * `paused`. Making it required would break every inline entry literal
+   * across the test suite, which is precisely the destructive migration
+   * this shape avoids.
+   */
+  evidence_closed?: boolean | undefined;
 }
 
 const CHUNK_TICK_MS = 1500;
@@ -1021,6 +1154,10 @@ export async function queueMarkRecordingClosed(
     const e = q.find(x => x.session_id === sessionId);
     if (!e) return;
     e.recording_closed = true;
+    // G1 — parallel write, same value, same moment. `recording_closed`
+    // stays the operational authority; this only records the durable
+    // terminality state of the Protection Session. Inert during G1.
+    e.evidence_closed = true;
     e.uri = finalUri;
     e.emitted_base64_length = emittedBase64Length;
     e.next_chunk_index = nextChunkIndex;
@@ -1194,8 +1331,37 @@ export async function normalizeQueueOnRecovery(): Promise<NormalizationReport> {
         target.next_chunk_index,
         dup.next_chunk_index,
       );
+      // G2' — capture each side's OWN `recording_closed` BEFORE the merge
+      // below overwrites the target's. Each operand must fall back to its
+      // own standing contract; using the already-combined value as the
+      // fallback for both would let one side's closure leak into the
+      // other's effective value.
+      const targetRecordingClosed = target.recording_closed;
+      const dupRecordingClosed = dup.recording_closed;
       target.recording_closed =
         target.recording_closed || dup.recording_closed;
+      // G2' — merge the EFFECTIVE terminality of each side, not the raw
+      // field. The G1 rule (three-valued OR over `evidence_closed` alone)
+      // was safe only while the field was inert: collapsing a legacy
+      // entry (key absent, `recording_closed = true`) with a G1 open one
+      // (`false`/`false`) produced `evidence_closed = false` alongside
+      // `recording_closed = true` — a divergence no writer can produce,
+      // and one that `canAdvanceToTerminality` would now read as BLOCKED
+      // on a session that completes today.
+      //
+      // Two absences still stay absent: with no new metadata on either
+      // side, `recording_closed` remains the authority and materialising
+      // the key would assert knowledge we do not have.
+      if (
+        target.evidence_closed === undefined &&
+        dup.evidence_closed === undefined
+      ) {
+        delete target.evidence_closed;
+      } else {
+        target.evidence_closed =
+          (target.evidence_closed ?? targetRecordingClosed) ||
+          (dup.evidence_closed ?? dupRecordingClosed);
+      }
       target.session_completed =
         target.session_completed || dup.session_completed;
       target.complete_attempts = Math.max(
@@ -1263,10 +1429,17 @@ export async function normalizeQueueOnRecovery(): Promise<NormalizationReport> {
           for (const c of group) {
             if (seenHashes.has(c.hash)) continue;
             seenHashes.add(c.hash);
+            // PHASE 1A: `base64Slice` is deliberately NOT cleared here.
+            // This branch runs on chunks the loop above has already
+            // confirmed have NO surviving upload (the `uploadedKept`
+            // check took the confirmed ones out). Pruning them meant
+            // recovery itself destroyed evidence that never reached the
+            // backend — the exact opposite of what recovery is for.
+            // Bytes, hash, index and size are all retained; only the
+            // status and the diagnostic error are set.
             finalChunks.push({
               ...c,
               status: 'failed',
-              base64Slice: undefined,
               last_error: {
                 status: 0,
                 code: 'CORRUPT_HASH_DIVERGENCE',
@@ -1322,28 +1495,65 @@ export async function normalizeQueueOnRecovery(): Promise<NormalizationReport> {
  * attached to globalThis for one-off invocation from the React Native
  * debugger console:  `await clearGuardianQueueDev()`.
  *
- * Intentionally module-level (not behind __DEV__) so a release-mode build
- * can still surface it if we ever ship a recovery tool. The Settings UI
- * gate is what enforces "DEV-only" today.
+ * Module-level rather than behind `__DEV__` so a release build could
+ * surface it if we ever ship a recovery tool.
+ *
+ * GC-DEV-RESET-001 — the previous version of this docblock claimed "the
+ * Settings UI gate is what enforces DEV-only today". That was FALSE:
+ * `app/settings.tsx` contained no `__DEV__` at all, so a single tap in a
+ * shipped build could drop the queue. The screen is gated now, and this
+ * function no longer relies on a caller to be careful — it applies the
+ * same refusal policy as `hardResetAppState`, from the same module, so
+ * the two destructive dev tools cannot disagree about what "pending"
+ * means.
+ *
+ * Removing `test.pending_retry` orphans every chunk on disk: the files
+ * survive but nothing references them, which is unrecoverable from
+ * inside the app. That is why this refuses rather than confirms.
  */
 export async function clearGuardianQueueDev(): Promise<{
   removed: string[];
+  refused?: ResetRefusal;
 }> {
-  const keys = [PENDING_RETRY_KEY, LAST_SESSION_ID_KEY];
-  const removed: string[] = [];
-  for (const k of keys) {
-    try {
-      await AsyncStorage.removeItem(k);
-      removed.push(k);
-    } catch (err) {
-      console.log('GC_QUEUE clearGuardianQueueDev failed', { key: k, err });
-    }
+  // Same TOCTOU as `hardResetAppState`, and this one does not go through
+  // `queueMutate` either — it removes the key underneath the chain. The
+  // lease makes check-and-drop atomic against a capture start.
+  const lease = acquireDestructiveExclusion('clearGuardianQueueDev');
+  if (lease === null) {
+    console.log('GC_QUEUE clearGuardianQueueDev refused', {
+      reason: 'producer_active',
+    });
+    return { removed: [], refused: producerActiveRefusal() };
   }
-  // Reset module-level rehydration cache too — otherwise a stale base64
-  // copy could outlive the queue wipe.
-  rehydrationCache.clear();
-  console.log('GC_QUEUE clearGuardianQueueDev done', { removed });
-  return { removed };
+
+  try {
+    const refusal = await inspectPendingEvidence();
+    if (refusal) {
+      console.log('GC_QUEUE clearGuardianQueueDev refused — pending evidence', {
+        sessions: refusal.sessions,
+        unconfirmed_chunks: refusal.unconfirmed_chunks,
+      });
+      return { removed: [], refused: refusal };
+    }
+
+    const keys = [PENDING_RETRY_KEY, LAST_SESSION_ID_KEY];
+    const removed: string[] = [];
+    for (const k of keys) {
+      try {
+        await AsyncStorage.removeItem(k);
+        removed.push(k);
+      } catch (err) {
+        console.log('GC_QUEUE clearGuardianQueueDev failed', { key: k, err });
+      }
+    }
+    // Reset module-level rehydration cache too — otherwise a stale base64
+    // copy could outlive the queue wipe.
+    rehydrationCache.clear();
+    console.log('GC_QUEUE clearGuardianQueueDev done', { removed });
+    return { removed };
+  } finally {
+    releaseDestructiveExclusion(lease);
+  }
 }
 
 /**
@@ -1450,7 +1660,13 @@ export async function reconcileStaleSessionsWithBackend(): Promise<{
     const expected = entry.next_chunk_index;
     if (expected === 0) continue;
 
-    const token = await getFreshAccessToken();
+    // R6 — OWNERSHIP TOKEN. This block reads backend chunk state (a GET)
+    // but then hands the same token to `finalizeAndAuthorizeCleanup`,
+    // which calls POST /complete and authorises deleting local evidence.
+    // It used to take a plain read token, which is a genuine ownership
+    // leak — found by the branded type, not by reading the code. The
+    // ownership token satisfies the GET too, so nothing else changes.
+    const token = await getOwnershipAccessToken();
     if (!token) {
       console.log('GC_QUEUE_STALE_LOCAL_ERROR_NOT_RECONCILED', {
         session_id: entry.session_id,
@@ -1634,7 +1850,7 @@ interface PendingSessionRegistration {
   destination_type?: DestinationType;
 }
 
-async function loadPendingRegistrations(): Promise<PendingSessionRegistration[]> {
+export async function loadPendingRegistrations(): Promise<PendingSessionRegistration[]> {
   try {
     const raw = await AsyncStorage.getItem(PENDING_SESSIONS_KEY);
     if (!raw) return [];
@@ -1659,7 +1875,7 @@ async function savePendingRegistrations(
   await AsyncStorage.setItem(PENDING_SESSIONS_KEY, JSON.stringify(list));
 }
 
-async function addPendingRegistration(
+export async function addPendingRegistration(
   session_id: string,
   mode: SessionMode,
   destination_type?: DestinationType,
@@ -1693,57 +1909,121 @@ let pendingRegistrationLoopRunning = false;
  * Single-flight: a second caller while the loop is already running is
  * a no-op (the running instance covers their entry too once persisted).
  */
+/**
+ * ONE pass of the deferred-registration replay: read the list, try to
+ * register every entry, report how many are still pending.
+ *
+ * Extracted from `runPendingRegistrationLoop` so a test can drive the
+ * REAL replay mechanism without waiting out the retry interval or
+ * reimplementing it. The loop below is now nothing but "run a pass, sleep
+ * if work remains" — cadence, interval and backoff are untouched and
+ * still live exclusively there. Production and tests execute the same
+ * code, which is the entire point: an earlier version of the R6 test
+ * drove `uploadDrainLoop` instead, which never touches this path at all,
+ * so it asserted "no request was sent" about a mechanism it never ran.
+ *
+ * Returns the number of registrations still outstanding afterwards.
+ */
+export async function runPendingRegistrationPass(): Promise<number> {
+  const list = await loadPendingRegistrations();
+  if (list.length === 0) return 0;
+
+  // R5 — OWNERSHIP TOKEN. This replay's whole job is `POST /sessions`, so
+  // it waits for a durable marker exactly as it already waits for a
+  // token. Only the authority that answers "may I?" has changed.
+  const token = await getOwnershipAccessToken();
+  if (token) {
+    for (const item of list) {
+      try {
+        // `destination_type` is optional on legacy entries persisted
+        // before the destination-truth fix — those fall back to the
+        // historical `'drive'` default so the backend insert still
+        // succeeds (the schema accepts both). New entries always
+        // carry the actual pinned destination from GRABAR time, so
+        // the backend record matches where chunks physically went.
+        const destinationType: DestinationType =
+          item.destination_type ?? 'drive';
+        await createSessionRequest(
+          token,
+          item.mode,
+          item.session_id,
+          destinationType,
+        );
+        console.log('GC_LOCAL_FIRST session registered', {
+          session_id: item.session_id,
+          mode: item.mode,
+          destination_type: destinationType,
+          legacyFallback: item.destination_type === undefined,
+        });
+        await removePendingRegistration(item.session_id);
+      } catch (err) {
+        console.log('GC_LOCAL_FIRST register retry failed', {
+          session_id: item.session_id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+  } else {
+    console.log('GC_LOCAL_FIRST register loop — no token yet');
+  }
+
+  return (await loadPendingRegistrations()).length;
+}
+
 async function runPendingRegistrationLoop(): Promise<void> {
   if (pendingRegistrationLoopRunning) return;
   pendingRegistrationLoopRunning = true;
   try {
     while (true) {
-      const list = await loadPendingRegistrations();
-      if (list.length === 0) return;
-
-      const token = await getFreshAccessToken();
-      if (token) {
-        for (const item of list) {
-          try {
-            // `destination_type` is optional on legacy entries persisted
-            // before the destination-truth fix — those fall back to the
-            // historical `'drive'` default so the backend insert still
-            // succeeds (the schema accepts both). New entries always
-            // carry the actual pinned destination from GRABAR time, so
-            // the backend record matches where chunks physically went.
-            const destinationType: DestinationType =
-              item.destination_type ?? 'drive';
-            await createSessionRequest(
-              token,
-              item.mode,
-              item.session_id,
-              destinationType,
-            );
-            console.log('GC_LOCAL_FIRST session registered', {
-              session_id: item.session_id,
-              mode: item.mode,
-              destination_type: destinationType,
-              legacyFallback: item.destination_type === undefined,
-            });
-            await removePendingRegistration(item.session_id);
-          } catch (err) {
-            console.log('GC_LOCAL_FIRST register retry failed', {
-              session_id: item.session_id,
-              error: err instanceof Error ? err.message : String(err),
-            });
-          }
-        }
-      } else {
-        console.log('GC_LOCAL_FIRST register loop — no token yet');
-      }
-
-      const remaining = await loadPendingRegistrations();
-      if (remaining.length === 0) return;
+      const remaining = await runPendingRegistrationPass();
+      if (remaining === 0) return;
       await sleep(PENDING_SESSIONS_RETRY_INTERVAL_MS);
     }
   } finally {
     pendingRegistrationLoopRunning = false;
   }
+}
+
+/**
+ * GC-AUTH-MIGRATION-001 — an identity is established but `gc.identity.v1`
+ * could not be written.
+ *
+ * The dangerous shape is durable `legacy_identity_evidence: false` sitting
+ * next to an absent marker. On a later boot with the session gone that
+ * reads as FIRST_IDENTITY and mints a SECOND identity, silently orphaning
+ * everything the first one uploaded. The marker is what normally prevents
+ * it, and the marker is exactly what just failed to land.
+ *
+ * So we stop trusting the seal. Dropping it makes the next boot re-decide
+ * the boundary, and any trace the established identity left — a queue
+ * entry, a history row — makes the probe answer "yes", which yields
+ * IDENTITY_DEGRADED and keeps ownership. On a device that genuinely left
+ * no trace the probe answers "no" again and re-seals; nothing is lost.
+ *
+ * What this deliberately does NOT do: sign out, mint again, drop the
+ * session, or touch a single byte of evidence. The identity we have is
+ * the one we keep, uploads under it stay valid, and the recording path is
+ * untouched. The only thing withdrawn is a stale claim that the migration
+ * question is settled.
+ *
+ * R4 — THIS IS THE FIRST LINE OF DEFENCE, NOT THE ONLY ONE. Removing the
+ * seal is itself a storage write and can fail too, and a protection that
+ * assumes "delete usually works" is not a protection. When both writes
+ * fail, `resolveIdentityInitialized` falls back to
+ * `hasProvenIdentityEvidence()`, which needs no write to have succeeded:
+ * it reads what the upload path already wrote. That is why this function
+ * is allowed to log a failure and carry on.
+ */
+async function guardUndurableIdentity(
+  persisted: boolean,
+  how: 'minted' | 'observed',
+): Promise<void> {
+  if (persisted) return;
+  const sealDropped = await invalidateLegacyProbeSeal();
+  console.log('GC_IDENTITY_MARKER_NOT_DURABLE', {
+    how,
+    seal_invalidated: sealDropped,
+  });
 }
 
 async function schedulePendingSessionRegistration(
@@ -1762,18 +2042,34 @@ async function schedulePendingSessionRegistration(
  * Detect errors from `createSessionRequest` that warrant local-first
  * fallback (retry in background) rather than aborting the recording.
  *
- * Retryable: any failure that did NOT come back as a 4xx HTTP response.
+ * Retryable: any failure that did NOT come back as a STRUCTURAL 4xx.
  * That covers offline (TypeError "Network request failed"), DNS errors,
- * AbortError on timeout, and 5xx/408/429.
+ * AbortError on timeout, 5xx/408/429 — and 401.
  *
- * Not retryable: 4xx (validation/auth errors) — the user input is wrong
- * and recording should not start. The original `throw` path handles it.
+ * Not retryable: 400 / 403 / 409 / 422 — the request itself is wrong,
+ * and no amount of retrying will make it right. Those still abort.
+ *
+ * GC-AUTH-001: 401 used to sit with the structural 4xx, and that
+ * conflated two different statements. A 400 says "this request is
+ * invalid"; a 401 says "I do not know who you are RIGHT NOW". The
+ * second is a property of the session, not of the capture — the
+ * identity may be mid-refresh, or degraded and recovering — and
+ * answering it by throwing away a recording in progress destroys
+ * evidence over a condition that routinely resolves itself. Deferred
+ * registration is exactly the mechanism for "cannot register yet", and
+ * the backend is idempotent on (id, user_id), so replaying the same
+ * `localSessionId` once identity returns produces one row, not two.
+ *
+ * The 4xx block is deliberately NOT widened any further: turning every
+ * client error into an unbounded retry would hide real defects behind
+ * a loop that never ends.
  */
-function isRetryableSessionCreateError(err: unknown): boolean {
+export function isRetryableSessionCreateError(err: unknown): boolean {
   if (!(err instanceof Error)) return false;
   const m = err.message.match(/HTTP (\d{3})/);
   if (!m) return true; // no HTTP status → network/abort
   const status = Number(m[1]);
+  if (status === 401) return true; // identity, not input
   if (status === 408 || status === 429) return true;
   if (status >= 500 && status < 600) return true;
   return false;
@@ -1905,8 +2201,19 @@ interface NextPick {
   destinationType?: DestinationType | undefined;
 }
 
-async function pickNext(queue: PendingQueueEntry[]): Promise<NextPick | null> {
+export async function pickNext(
+  queue: PendingQueueEntry[],
+  pause: GlobalPauseState,
+): Promise<NextPick | null> {
   for (const entry of queue) {
+    // PHASE 1A: pause filters live in SELECTION, not in chunk status.
+    // A paused entry keeps every chunk `pending` with its bytes intact
+    // — we simply do not choose it. That is what makes a pause fully
+    // reversible with no reconstruction when it is lifted.
+    if (entry.paused) continue;
+    if (isDestinationBlocked(pause, entry.destination_type ?? activeDestinationType)) {
+      continue;
+    }
     const candidate = entry.chunks
       .filter(c => c.status === 'pending')
       .sort((a, b) => a.chunk_index - b.chunk_index)[0];
@@ -1936,12 +2243,139 @@ async function pickNext(queue: PendingQueueEntry[]): Promise<NextPick | null> {
   return null;
 }
 
-async function uploadDrainLoop(): Promise<void> {
+/**
+ * PHASE 1A — persist a pause decision, plus the diagnostic error that
+ * caused it, in ONE serialized mutation.
+ *
+ * Everything runs inside `queueMutate` so the pause key and `GC_QUEUE`
+ * are written under the same `writeChain`. That is what makes "a new
+ * entry cannot slip past an existing global pause" true by
+ * construction: an append and a pause write can never interleave.
+ *
+ * Note what this function never does: it never clears `base64Slice`,
+ * never clears `local_uri`, never changes `hash` / `chunk_index` /
+ * `size`, and never moves a chunk out of `pending`. A pause is a
+ * selection filter, not a terminal state.
+ */
+async function persistFailurePause(
+  sessionId: string,
+  chunkIndex: number,
+  destinationType: DestinationType,
+  failure: Extract<FailureDecision, { kind: 'pause' }>,
+): Promise<void> {
+  await queueMutate(async (queue) => {
+    const entry = queue.find(e => e.session_id === sessionId);
+
+    // The worker flips the chunk to 'uploading' before the attempt. A
+    // pause must hand it back as 'pending', otherwise the chunk is
+    // stranded in the stuck-uploading state that boot recovery has to
+    // repair — and it would not be picked up when the pause lifts.
+    // `attempts` is deliberately NOT incremented: a pause is not a
+    // failed try, and letting it drive backoff would reintroduce the
+    // escalation we are removing.
+    const chunk = entry?.chunks.find(c => c.chunk_index === chunkIndex);
+    if (chunk && chunk.status === 'uploading') {
+      chunk.status = 'pending';
+    }
+
+    if (failure.scope === 'ENTRY') {
+      if (entry) {
+        entry.paused = {
+          reason:
+            failure.reason === 'SESSION_STATE_PAUSE'
+              ? 'SESSION_STATE_PAUSE'
+              : 'UNCLASSIFIED_PAUSE',
+          at: Date.now(),
+          code: failure.code,
+        };
+      }
+      return;
+    }
+
+    const current = await readPauseState();
+    const next: GlobalPauseState = {
+      ...current,
+      destinations: { ...current.destinations },
+    };
+    if (failure.scope === 'DESTINATION') {
+      next.destinations[destinationType] = {
+        at: Date.now(),
+        code: failure.code,
+      };
+    } else if (failure.reason === 'SYSTEMIC_CONFIG_PAUSE') {
+      next.systemic = {
+        at: Date.now(),
+        code: failure.code,
+        policy_version: PAUSE_POLICY_VERSION,
+      };
+    } else {
+      next.client_auth = { at: Date.now(), code: failure.code };
+    }
+    await writePauseState(next);
+  });
+}
+
+/**
+ * Test-only seam. `destinationResolved` / `activeDestinationType` are
+ * normally assigned by the component's `refreshDestination`, which
+ * cannot run headless. Exposed so the worker's pause behaviour can be
+ * exercised past the destination race-guard. Never called by
+ * production code.
+ */
+export function _setDrainPreconditionsForTests(opts: {
+  destinationResolved?: boolean;
+  activeDestinationType?: DestinationType;
+}): void {
+  if (opts.destinationResolved !== undefined) {
+    destinationResolved = opts.destinationResolved;
+  }
+  if (opts.activeDestinationType !== undefined) {
+    activeDestinationType = opts.activeDestinationType;
+  }
+}
+
+export async function uploadDrainLoop(): Promise<void> {
   if (DEBUG_QUEUE) console.log('GC_DEBUG drain called', { isDraining });
   if (isDraining) {
     if (DEBUG_QUEUE) console.log('GC_DEBUG drain skipped — isDraining=true');
     return;
   }
+  // Single-flight claim MUST stay synchronous with the check above.
+  // PHASE 1A introduces an `await` (pause hydration) before any network
+  // work; taking the flag first is what keeps two concurrent callers
+  // from both entering. Everything from here is wrapped so the flag is
+  // always released — see the outer `finally`.
+  isDraining = true;
+  try {
+    return await drainWithPauseGuard();
+  } finally {
+    isDraining = false;
+  }
+}
+
+/**
+ * PHASE 1A gate in front of the historical drain body.
+ *
+ * Nothing in this function may issue a network request before the
+ * persisted pause state has been read from disk. On a cold start the
+ * previous process may have paused for `NO_TOKEN` or `BODY_TOO_LARGE`;
+ * firing a request before hydrating would re-open the retry storm on
+ * every app launch. The background drain enters through the same
+ * `uploadDrainLoop`, so it inherits this gate — no separate wiring.
+ */
+async function drainWithPauseGuard(): Promise<void> {
+  const pause = await ensurePauseReady();
+  if (isGloballyBlocked(pause)) {
+    console.log('GC_QUEUE blocked: global pause', {
+      client_auth: pause.client_auth?.code ?? null,
+      systemic: pause.systemic?.code ?? null,
+    });
+    return;
+  }
+  return drainBody(pause);
+}
+
+async function drainBody(pause: GlobalPauseState): Promise<void> {
   // Hard race-guard: refuse to route any chunk until `refreshDestination`
   // has resolved the active destination at least once. Without this,
   // boot/recovery would happily drain pending chunks against the default
@@ -1954,7 +2388,8 @@ async function uploadDrainLoop(): Promise<void> {
     console.log('GC_QUEUE blocked: destination not resolved');
     return;
   }
-  isDraining = true;
+  // `isDraining` is claimed by `uploadDrainLoop` before it awaits, and
+  // released in its `finally`. This body must not touch it.
   if (DEBUG_QUEUE) console.log('GC_DEBUG drain entered loop');
   try {
     while (true) {
@@ -1963,7 +2398,7 @@ async function uploadDrainLoop(): Promise<void> {
       // applicable). Pure observation; no behavior change.
       const t_pickStart = Date.now();
       const queue = await queueRead();
-      const pick = await pickNext(queue);
+      const pick = await pickNext(queue, pause);
       perfLog('GC_PERF_DRAIN_PICK', {
         ms: Date.now() - t_pickStart,
         found: pick !== null,
@@ -1975,6 +2410,30 @@ async function uploadDrainLoop(): Promise<void> {
           : {}),
       });
       if (!pick) {
+        // PHASE 1A: distinguish "nothing left to do" from "everything
+        // left is paused". Without this the idle branch below sees a
+        // non-empty queue, concludes there is residual work, and spins
+        // on a 150ms sleep forever — a wakeup/battery hot loop standing
+        // in for the network one we just removed. If every remaining
+        // entry is blocked, there is nothing this pass can ever pick:
+        // exit and wait for a restoration event.
+        const blockedCheck = await queueRead();
+        const allBlocked =
+          blockedCheck.length > 0 &&
+          blockedCheck.every(
+            e =>
+              e.paused !== undefined ||
+              isDestinationBlocked(
+                pause,
+                e.destination_type ?? activeDestinationType,
+              ),
+          );
+        if (allBlocked) {
+          console.log('GC_QUEUE drain exit — all remaining entries paused', {
+            entries: blockedCheck.length,
+          });
+          return;
+        }
         // Nothing pending. Try to finalize any closed session whose chunks
         // are all done, then check if any session is still recording.
         const finalized = await tryFinalizeReadySessions();
@@ -2089,7 +2548,14 @@ async function uploadDrainLoop(): Promise<void> {
           // marks transient → retry on the next drain pass picks up a
           // fresh token. Same self-healing as before, fewer get-session
           // round-trips on the steady-state path.
-          const accessToken = await getFreshAccessToken();
+          // R5 — OWNERSHIP TOKEN. This is the worker's hot-path cache,
+          // reused for `uploadChunkBytes` AND the subsequent `POST /chunks`.
+          // Both create remote state, so the cache must be filled from the
+          // ownership authority; a plain token here would be the one way a
+          // `remote_reference` could appear under a non-durable identity.
+          // A null answer produces the same 401 the worker already treats
+          // as transient, so the chunk stays `pending` and nothing is lost.
+          const accessToken = await getOwnershipAccessToken();
           if (!accessToken) {
             throw new ApiError(401, 'NO_TOKEN', 'No access token in store', null);
           }
@@ -2116,11 +2582,40 @@ async function uploadDrainLoop(): Promise<void> {
             destination_type: sessionDestinationType,
             size: chunk.size,
           });
+          // PHASE 1A — runtime validation of the confirmation token.
+          //
+          // `uploadChunkBytes` ends in `return parsed as
+          // DriveChunkUploadResponse` (src/api/destinations.ts) — a bare
+          // TypeScript cast over whatever the response body parsed to.
+          // There is NO runtime check there, so a 2xx carrying `{}`,
+          // `null`, or `remote_reference: ""` reaches us as a
+          // structurally invalid confirmation. Without this guard the
+          // worker would mark the chunk uploaded, drop `base64Slice`,
+          // delete `local_uri`, and leave the completion gate stuck
+          // forever on a chunk with no reference — evidence destroyed
+          // in exchange for nothing.
+          //
+          // A 2xx is necessary but NOT sufficient. The reference itself
+          // must be a non-empty string before anything local is
+          // released. Anything else is treated as a failed attempt:
+          // UNCLASSIFIED_PAUSE at entry scope, bytes untouched, and
+          // `postChunk` is never told the chunk is uploaded.
+          const remoteRef = (
+            drive as { remote_reference?: unknown } | null | undefined
+          )?.remote_reference;
+          if (typeof remoteRef !== 'string' || remoteRef.trim().length === 0) {
+            throw new ApiError(
+              0,
+              'REMOTE_REFERENCE_INVALID',
+              'Upload returned 2xx without a usable remote_reference',
+              null,
+            );
+          }
           if (DEBUG_QUEUE) {
             console.log('GC_DEBUG after uploadChunkBytes', {
               sessionId,
               chunk_index: chunk.chunk_index,
-              remote_reference: drive.remote_reference,
+              remote_reference: remoteRef,
             });
           }
           // GC_PERF_DRAIN_POST_CHUNKS isolates the metadata leg (mobile →
@@ -2130,26 +2625,68 @@ async function uploadDrainLoop(): Promise<void> {
           await postChunk(
             accessToken,
             sessionId,
-            { chunk_index: chunk.chunk_index, hash: chunk.hash, size: chunk.size },
+            // G3II - explicit three-field literal PLUS the medium. The
+            // body spread in `postChunk` widens THIS object, not the
+            // QueueChunk, so nothing else leaks onto the wire.
+            {
+              chunk_index: chunk.chunk_index,
+              hash: chunk.hash,
+              size: chunk.size,
+              ...(chunk.media !== undefined ? { media: chunk.media } : {}),
+            },
             'uploaded',
-            drive.remote_reference,
+            // The validated value, not the raw response field, so the
+            // guard above cannot be bypassed by a later edit.
+            remoteRef,
           );
           perfLog('GC_PERF_DRAIN_POST_CHUNKS', {
             ms: Date.now() - t_postStart,
             session_id: sessionId,
             chunk_index: chunk.chunk_index,
           });
-          await queueUpdateChunk(sessionId, chunk.chunk_index, {
-            status: 'uploaded',
-            base64Slice: undefined,           // poda
-            remote_reference: drive.remote_reference,
-            last_error: undefined,
-          });
+          // PHASE 1A — the ONLY legal place in the codebase where local
+          // bytes may be released. Ordering is a hard requirement, not
+          // an optimisation:
+          //
+          //   2xx received
+          //     → remote_reference present
+          //       → 'uploaded' + remote_reference DURABLY persisted
+          //         → and only then may bytes/files be dropped.
+          //
+          // If this write throws (CursorWindow, storage full, ...) the
+          // remote copy exists but we have no durable record of it. We
+          // must NOT delete anything: the queue on disk still says
+          // pending, so the chunk will be retried and the backend's
+          // dedup will absorb it. Deleting here would strand evidence
+          // that our own queue no longer knows is safe.
+          let confirmationPersisted = false;
+          try {
+            await queueUpdateChunk(sessionId, chunk.chunk_index, {
+              status: 'uploaded',
+              base64Slice: undefined,         // released: confirmed remote
+              remote_reference: remoteRef,
+              last_error: undefined,
+            });
+            confirmationPersisted = true;
+          } catch (persistErr) {
+            console.log('GC_QUEUE_CONFIRMED_PERSIST_FAILED', {
+              sessionId,
+              chunk_index: chunk.chunk_index,
+              remote_reference: remoteRef,
+              err:
+                persistErr instanceof Error
+                  ? persistErr.message
+                  : String(persistErr),
+            });
+            // Surface to the outer catch so the chunk is re-attempted.
+            // Local bytes and local_uri are untouched.
+            throw persistErr;
+          }
           if (chunk.chunk_index === 0) {
             perfLog('GC_PERF_FIRST_CHUNK_UPLOADED', {
               session_id: sessionId,
               destination_type: sessionDestinationType,
-              remote_reference: drive.remote_reference,
+              remote_reference: remoteRef,
             });
           }
           // Best-effort cleanup of the on-disk video payload. The file
@@ -2157,7 +2694,10 @@ async function uploadDrainLoop(): Promise<void> {
           // backend AND in Drive; leaving it would just consume disk
           // until the session reaps. Audio chunks have no local_uri,
           // so this is a no-op for them.
-          if (chunk.local_uri) {
+          // `confirmationPersisted` is the gate. A local delete failure
+          // is still best-effort and never reverts the remote
+          // confirmation — the queue already records it as uploaded.
+          if (confirmationPersisted && chunk.local_uri) {
             try {
               await FileSystem.deleteAsync(chunk.local_uri, { idempotent: true });
             } catch (cleanupErr) {
@@ -2172,7 +2712,7 @@ async function uploadDrainLoop(): Promise<void> {
           console.log('GC_QUEUE chunk uploaded', {
             sessionId,
             chunk_index: chunk.chunk_index,
-            remote_reference: drive.remote_reference,
+            remote_reference: remoteRef,
           });
         })();
         // Suppress unhandled-rejection if the timer wins and the upload
@@ -2220,10 +2760,39 @@ async function uploadDrainLoop(): Promise<void> {
           ...errorDetail,
           classification: decision,
         });
+
+        // PHASE 1A — pause policy runs BEFORE the legacy
+        // transient/permanent split. `classifyFailure` uses a closed
+        // allow-list: only failures it positively recognises as
+        // transport faults fall through to the historical backoff. Any
+        // pause decision exits the loop immediately — no attempts++, no
+        // backoff sleep, no `continue`, and above all no pruning. The
+        // chunk stays `pending` with its bytes so it resumes intact.
+        const failure = classifyFailure(err);
+        if (failure.kind === 'pause') {
+          // The write is awaited before we return so the worker can
+          // never hand control back with the pause only in memory.
+          await persistFailurePause(
+            sessionId,
+            chunk.chunk_index,
+            sessionDestinationType,
+            failure,
+          );
+          console.log('GC_QUEUE chunk paused', {
+            ...errorDetail,
+            pause_reason: failure.reason,
+            pause_scope: failure.scope,
+          });
+          return;
+        }
+
         if (decision === 'permanent') {
+          // Unreachable in practice: every status that `classifyError`
+          // calls permanent is a pause above. Kept as a defensive
+          // branch, but it no longer prunes — nothing that was not
+          // confirmed off-device may lose its bytes.
           await queueUpdateChunk(sessionId, chunk.chunk_index, {
             status: 'failed',
-            base64Slice: undefined,         // poda — no sirve reintentar
             last_error: errShape,
           });
           console.log('GC_QUEUE chunk failed (permanent)', errorDetail);
@@ -2252,8 +2821,154 @@ async function uploadDrainLoop(): Promise<void> {
       }
     }
   } finally {
-    isDraining = false;
+    if (DEBUG_QUEUE) console.log('GC_DEBUG drain body exited');
   }
+}
+
+/**
+ * PHASE 1A — the only event that may lift `CLIENT_SESSION_EXPIRED`.
+ *
+ * Registered at module scope, so it exists from the moment this module
+ * is imported. `auth/store.ts` may fire before that (supabase-js
+ * restores a persisted session during its own init); `pauseStore`
+ * retains that notification and delivers it here exactly once on
+ * registration. The event cannot be lost, and it cannot be applied
+ * twice.
+ *
+ * Idempotence is what keeps repeated `TOKEN_REFRESHED` events from
+ * requesting repeated drains: if no client-auth pause is set, this is a
+ * no-op and no drain is requested. A valid login therefore requests
+ * exactly one drain.
+ *
+ * Scope discipline: this clears `client_auth` and nothing else. A
+ * Supabase login must not lift a Drive pause, a systemic pause, or any
+ * entry pause.
+ */
+registerAuthRestoreHandler((usable: boolean) => {
+  if (!usable) return;
+  void (async () => {
+    try {
+      // Cheap fast path: skip the write chain entirely for the common
+      // TOKEN_REFRESHED case where no pause is in force. This is an
+      // optimisation, NOT the decision point — see below.
+      const state = await ensurePauseReady();
+      if (!state.client_auth) return;
+
+      // The decision to request a drain must depend on THIS invocation
+      // having actually performed the `client_auth: value → null`
+      // transition. A burst of simultaneous events (init() + a
+      // subsequent INITIAL_SESSION, or several TOKEN_REFRESHED in one
+      // tick) all pass the check above while the pause still exists;
+      // they then serialize here, and only one of them finds a pause
+      // left to clear. Deciding on the pre-check instead would have
+      // every member of the burst request its own drain.
+      let clearedByThisInvocation = false;
+      await queueMutate(async () => {
+        const current = await readPauseState();
+        if (!current.client_auth) return;
+        await writePauseState({ ...current, client_auth: null });
+        clearedByThisInvocation = true;
+      });
+      if (!clearedByThisInvocation) return;
+
+      console.log('GC_QUEUE client auth pause cleared');
+      await uploadDrainLoop();
+    } catch (err) {
+      console.log('GC_QUEUE client auth restore failed', {
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+  })();
+});
+
+/**
+ * GC-DEST-PAUSE-001 — retire a destination pause whose cause is provably
+ * gone.
+ *
+ * The defect: `destinations[type]` could be written and never removed.
+ * `client_auth` got a recovery signal (`notifyClientAuth` from the
+ * Supabase lifecycle) and a handler to act on it; `destinations` got
+ * neither. So a Drive pause survived reconnecting Drive, survived a cold
+ * start, and blocked the drain forever. Evidence stayed durable and
+ * local — nothing was ever lost — but it could not leave the device.
+ * Observed on hardware: 54 chunks pending, 0 uploading, indefinitely.
+ *
+ * ## What counts as proof, and what does NOT
+ *
+ * The ONLY accepted signal is the backend confirming this specific
+ * destination: `listDestinations()` returning a row with
+ * `type === T && status === 'connected'`. That is the direct negation of
+ * the 409 `DRIVE_NOT_CONNECTED` ("No connected Google Drive destination
+ * for this user") that created the pause.
+ *
+ * `destinationResolved` is NOT proof and must never be used here. It is
+ * a race guard meaning "routing is known", and `refreshDestination` sets
+ * it to `true` even when NOTHING is connected — the routing line falls
+ * back to `'drive'` with zero destinations. On hardware we observed
+ * `destinationResolved: true` coexisting with an active Drive pause and
+ * a disconnected Drive. Clearing on it would unblock a broken
+ * destination.
+ *
+ * Elapsed time is NOT proof either. `at` is never read.
+ *
+ * ## Scope discipline
+ *
+ * Clears `destinations[T]` for the confirmed T and nothing else. A Drive
+ * reconnection must not lift a NAS pause, a `client_auth` pause, a
+ * `systemic` pause, or any entry pause. Touches no queue entry and no
+ * chunk: it only grants permission, never discards evidence.
+ *
+ * ## Atomicity
+ *
+ * The decision to report a transition depends on THIS invocation having
+ * performed `paused → unpaused` inside the `queueMutate` chain. Two
+ * concurrent `refreshDestination` calls can both observe `connected`;
+ * only the one that still finds the pause present may claim it and ask
+ * for a drain. Same rule the `client_auth` restore handler already uses,
+ * and for the same reason.
+ *
+ * Returns the destination types this invocation actually unblocked.
+ */
+export async function clearRecoveredDestinationPauses(
+  connected: Partial<Record<DestinationType, boolean>>,
+): Promise<DestinationType[]> {
+  const confirmed = (Object.keys(connected) as DestinationType[]).filter(
+    (type) => connected[type] === true,
+  );
+  if (confirmed.length === 0) return [];
+
+  // Cheap fast path: skip the write chain when nothing is paused. An
+  // optimisation, NOT the decision point — the decision is made below,
+  // under the chain, against a fresh read.
+  const snapshot = await ensurePauseReady();
+  const candidates = confirmed.filter(
+    (type) => snapshot.destinations[type] !== undefined,
+  );
+  if (candidates.length === 0) return [];
+
+  const cleared: DestinationType[] = [];
+  await queueMutate(async () => {
+    const current = await readPauseState();
+    const next: GlobalPauseState = {
+      ...current,
+      destinations: { ...current.destinations },
+    };
+    let changed = false;
+    for (const type of candidates) {
+      // Re-checked inside the chain: a concurrent invocation may have
+      // won this transition already. Only the winner reports it.
+      if (next.destinations[type] === undefined) continue;
+      delete next.destinations[type];
+      cleared.push(type);
+      changed = true;
+    }
+    if (changed) await writePauseState(next);
+  });
+
+  if (cleared.length > 0) {
+    console.log('GC_QUEUE destination pause cleared', { destinations: cleared });
+  }
+  return cleared;
 }
 
 /**
@@ -2415,7 +3130,7 @@ type FinalizeOutcome =
   | { kind: 'failed'; reason: FinalizeFailureReason };
 
 async function finalizeAndAuthorizeCleanup(
-  token: string,
+  token: OwnershipToken,
   sessionId: string,
   uri: string,
 ): Promise<FinalizeOutcome> {
@@ -2479,11 +3194,51 @@ async function finalizeAndAuthorizeCleanup(
     : { kind: 'already_completed' };
 }
 
+/**
+ * G2' — compatibility authority for ONE decision, and only one:
+ * whether `tryFinalizeReadySessions` may advance a Protection Session
+ * towards `POST /complete`.
+ *
+ * ── SCOPE ──────────────────────────────────────────────────────────
+ * This is NOT "the reader of terminality" for the system. Other places
+ * read `recording_closed` under DIFFERENT, still-valid semantics —
+ * "the evidence set is final" for D3 and the protection banner, "the
+ * session is still open, keep spinning" for the drain loop. G2' does
+ * not reinterpret, own, or modify any of them.
+ *
+ * ── SEMANTICS ──────────────────────────────────────────────────────
+ *   `evidence_closed === true`   → may advance
+ *   `evidence_closed === false`  → BLOCKED, whatever `recording_closed`
+ *                                  says. In an entry written by a later
+ *                                  gate this means "Protection Session
+ *                                  still open" even though the producer
+ *                                  is closed — the whole point of the
+ *                                  decoupling.
+ *   `evidence_closed` absent     → metadata unavailable, neither open
+ *                                  nor closed; defer to the standing
+ *                                  contract, `recording_closed`.
+ *
+ * `??` and not `||`: only ABSENCE delegates. A `||` would let a stale
+ * `recording_closed = true` override an explicit `false` and complete a
+ * session that is still accepting evidence.
+ *
+ * Behaviour today is unchanged: every product writer stamps
+ * `evidence_closed === recording_closed`, so this returns exactly what
+ * the previous `!entry.recording_closed` test returned for every entry
+ * reachable at 8983bad — including pre-G1 and migrated entries, which
+ * carry no key and fall through to `recording_closed`.
+ */
+export function canAdvanceToTerminality(
+  entry: Pick<PendingQueueEntry, 'evidence_closed' | 'recording_closed'>,
+): boolean {
+  return entry.evidence_closed ?? entry.recording_closed;
+}
+
 export async function tryFinalizeReadySessions(): Promise<boolean> {
   const queue = await queueRead();
   let anyFinalized = false;
   for (const entry of queue) {
-    if (!entry.recording_closed) continue;
+    if (!canAdvanceToTerminality(entry)) continue;
 
     // Skip if anything is still in motion — the worker will process
     // those and we will re-evaluate on the next drain pass.
@@ -2573,6 +3328,32 @@ export async function tryFinalizeReadySessions(): Promise<boolean> {
       });
     }
 
+    // GC-AUTH-001 — the vacuous-gate guard.
+    //
+    // The gate asks "is every index in 0..expectedChunks-1 uploaded?".
+    // For an entry whose chunker never ran, that range is EMPTY, so the
+    // answer is trivially yes and the entry sails through: `/complete`
+    // fires against a session that may not even exist server-side, and
+    // `reapEntry` then deletes the recording the entry points at.
+    //
+    // "The empty set is fully uploaded" is true arithmetic and a
+    // catastrophic operational rule. A zero-chunk entry is not proof of
+    // complete remote evidence — it is proof of nothing at all, and the
+    // file on disk may be a real capture the chunker had not reached yet.
+    //
+    // So: never complete, never reap. Deciding how these entries are
+    // eventually cleaned up is deliberately left open; keeping a useless
+    // entry costs a few bytes, and deleting a potential capture costs
+    // the evidence.
+    if (expectedChunks === 0) {
+      console.log('GC_QUEUE completion gate — zero-chunk entry held', {
+        sessionId: entry.session_id,
+        recording_closed: entry.recording_closed,
+        uri: entry.uri,
+      });
+      continue;
+    }
+
     if (missingUploadedIndexes.length > 0) {
       // Observability-only diagnostic — does NOT change behaviour.
       // Detect the "stuck forever" shape: the missing indexes are NOT
@@ -2629,7 +3410,10 @@ export async function tryFinalizeReadySessions(): Promise<boolean> {
       continue;
     }
     try {
-      const token = await getFreshAccessToken();
+      // R5 — OWNERSHIP TOKEN. `POST /sessions/:id/complete` mutates a row
+      // this user owns and authorises deleting local evidence. Both are
+      // ownership operations.
+      const token = await getOwnershipAccessToken();
       if (!token) throw new ApiError(401, 'NO_TOKEN', 'No access token in store', null);
       // Both the fresh-200 and the already-completed-409 branches now go
       // through one helper, so the ordering that makes the cleanup journal
@@ -2698,6 +3482,150 @@ export async function reapEntry(sessionId: string, uri: string): Promise<void> {
       console.log('GC_QUEUE chunks dir cleanup failed', { sessionId, err });
     }
   }
+}
+
+/**
+ * Closes a live recorder so its bytes are flushed and its FINAL uri is
+ * known, for the abandon path (GC-AUTH-001, 4A).
+ *
+ * Mirrors the closing half of `stopRecording`, and must keep mirroring
+ * it: the uri a recorder ends up with is NOT the one the caller started
+ * with. For audio the engine reports the uri it captured before `stop()`
+ * flushed; for video `recordAsync` resolves with the camera's own
+ * authoritative uri, which is the only one guaranteed to point at the
+ * finished file. Promoting a stale `cacheUri` instead can move a
+ * placeholder, or nothing at all, and call it preserved evidence.
+ *
+ * Precedence for video matches `stopRecording`: camera uri first, then
+ * the uri the chunker has been reading (still real bytes on disk, just
+ * partial) when `recordAsync` rejected.
+ *
+ * Dependencies are injected rather than read from component refs so the
+ * ordering guarantee this function exists to provide is testable.
+ * Returns null when nothing usable could be closed.
+ */
+export async function closeRecorderForAbandon(deps: {
+  hadAudio: boolean;
+  stopAudio: () => Promise<string | null>;
+  stopCamera: () => void;
+  videoPromise: Promise<{ uri?: string } | null | undefined> | null;
+  chunkedUri: string | null;
+}): Promise<string | null> {
+  if (deps.hadAudio) {
+    try {
+      return await deps.stopAudio();
+    } catch (err) {
+      console.log('GC_LOCAL_FIRST abandon audio stop failed', {
+        err: err instanceof Error ? err.message : String(err),
+      });
+      return null;
+    }
+  }
+
+  try {
+    deps.stopCamera();
+  } catch (err) {
+    console.log('GC_LOCAL_FIRST abandon camera stop threw', {
+      err: err instanceof Error ? err.message : String(err),
+    });
+  }
+
+  let cameraUri: string | null = null;
+  if (deps.videoPromise) {
+    try {
+      const result = await deps.videoPromise;
+      cameraUri = result?.uri ?? null;
+    } catch (err) {
+      console.log('GC_LOCAL_FIRST abandon recordAsync rejected', {
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  return cameraUri ?? deps.chunkedUri;
+}
+
+/**
+ * Terminal path for a capture that became durable in GC_QUEUE but whose
+ * backend registration failed non-retryably (GC-AUTH-001, 4A).
+ *
+ * MUST be called with a recorder that is already closed and with the
+ * uri that closing actually produced — see `closeRecorderForAbandon`.
+ * Moving a file out from under a live recorder is not preservation.
+ *
+ * Why the entry cannot simply be left in place: with the chunker never
+ * started, `next_chunk_index` is 0, and the completion gate iterates an
+ * empty range. That vacuous pass is now blocked by an explicit guard in
+ * `tryFinalizeReadySessions`, but the entry is still useless as it
+ * stands, so a confirmed promotion supersedes it.
+ *
+ * Why the file cannot simply be abandoned either: it lives in
+ * `cacheDirectory` under the recorder's own name. `orphanScan` only
+ * sweeps `documentDirectory` for `guardian_recording_*`, and the move
+ * that produces that name happens in `stopRecording`, which never runs
+ * on this path. The bytes would be invisible to every recovery route
+ * and would disappear with the next cache reclaim.
+ *
+ * THE RULE, and it is one-directional:
+ *
+ *   promotion confirmed      → the entry may be dropped
+ *   promotion NOT confirmed  → GC_QUEUE MUST survive
+ *
+ * A dropped entry after a failed move would leave the bytes referenced
+ * by nothing durable at all — the precise loss 4A exists to close. So
+ * the entry is only ever retired once something else is holding the
+ * evidence, and the move happens first so that a process death between
+ * the two steps errs towards a redundant reference rather than none.
+ */
+export async function abandonUnregisteredSession(
+  sessionId: string,
+  finalUri: string | null,
+): Promise<{ moved_to: string | null; entry_dropped: boolean }> {
+  let movedTo: string | null = null;
+
+  const docDir = FileSystem.documentDirectory;
+  if (docDir && finalUri) {
+    const extMatch = finalUri.match(/\.[A-Za-z0-9]{1,8}$/);
+    const ext = extMatch ? extMatch[0] : '.m4a';
+    const target = `${docDir}guardian_recording_${Date.now()}${ext}`;
+    try {
+      await FileSystem.moveAsync({ from: finalUri, to: target });
+      movedTo = target;
+    } catch (err) {
+      console.log('GC_LOCAL_FIRST abandon move failed', {
+        sessionId,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  if (movedTo === null) {
+    // Nothing else is holding these bytes. The entry stays, whatever it
+    // costs in tidiness — it is the only durable reference left.
+    console.log('GC_LOCAL_FIRST session abandoned — entry RETAINED', {
+      sessionId,
+      promoted_to_orphan: false,
+      reason: finalUri ? 'move_failed' : 'no_final_uri',
+    });
+    return { moved_to: null, entry_dropped: false };
+  }
+
+  let dropped = false;
+  try {
+    await queueDropEntry(sessionId);
+    dropped = true;
+  } catch (err) {
+    console.log('GC_LOCAL_FIRST abandon drop failed', {
+      sessionId,
+      err: err instanceof Error ? err.message : String(err),
+    });
+  }
+
+  console.log('GC_LOCAL_FIRST session abandoned', {
+    sessionId,
+    promoted_to_orphan: true,
+    entry_dropped: dropped,
+  });
+  return { moved_to: movedTo, entry_dropped: dropped };
 }
 
 // ----- chunker (incremental slicer driven by setTimeout) -----
@@ -3030,7 +3958,10 @@ async function runVideoChunkerTick(
   }
 }
 
-async function emitChunk(
+// Exported for tests only — G3' pins that this writer, and only this
+// writer, stamps `media: 'audio'`. Follows the same convention as
+// `queueMutate` / `pickNext` / `tryFinalizeReadySessions`.
+export async function emitChunk(
   sessionId: string,
   base64Slice: string,
   chunk_index: number,
@@ -3097,6 +4028,10 @@ async function emitChunk(
     status: 'pending',
     attempts: 0,
     local_uri,
+    // G3' — `emitChunk` is called only from `runAudioChunkerTick`; the
+    // video tick delegates to `videoChunkSink` and never reaches here.
+    // The medium is therefore known statically. Literal, not derived.
+    media: 'audio',
   };
   await queueAppendChunk(sessionId, chunk, emittedAfter, chunk_index + 1);
   if (DEBUG_QUEUE) {
@@ -3262,7 +4197,10 @@ function videoChunkLocalUri(sessionId: string, chunk_index: number): string {
  * `emittedBase64Length` is passed as `null`: the video path tracks
  * progress by `chunks[*]` count, not by the audio-only resume cursor.
  */
-async function videoChunkSink(payload: ChunkPayload): Promise<void> {
+// Exported for tests only — G3' pins that this writer stamps
+// `media: 'video'` while producing NON-segment paths, which is exactly
+// why D3 cannot trust the medium alone.
+export async function videoChunkSink(payload: ChunkPayload): Promise<void> {
   const bytes = sliceToBytes(payload.base64Slice);
   const hash = bytesDigestToHex(
     await Crypto.digest(Crypto.CryptoDigestAlgorithm.SHA256, bytes),
@@ -3290,6 +4228,11 @@ async function videoChunkSink(payload: ChunkPayload): Promise<void> {
     status: 'pending',
     attempts: 0,
     local_uri,
+    // G3' — this sink is wired only to `VideoFileChunkProducer` (legacy
+    // post-stop video), so the medium is known statically. NOTE: these
+    // are base64 slices under `chunks/<sid>/`, NOT native MP4 segments —
+    // `media: 'video'` alone must never let them into D3.
+    media: 'video',
   };
   await queueAppendChunk(
     payload.sessionId,
@@ -3529,12 +4472,16 @@ async function deleteRecordingBestEffort(
 const POST_CHUNKS_TIMEOUT_MS = 30_000;
 
 async function postChunk(
-  token: string,
+  token: OwnershipToken,
   sessionId: string,
   chunk: RealChunk,
   status: 'pending' | 'uploaded' | 'failed',
   remoteReference?: string | null,
 ): Promise<unknown> {
+  // R6 — last moment before a mutation can leave the device. The brand
+  // stops a plain string at compile time; this stops a forced cast at run
+  // time. One boolean, no I/O.
+  assertOwnershipGateOpen('/chunks');
   // Only include `remote_reference` in the body when the caller has
   // actually obtained one (i.e. the Drive proxy returned a file_id).
   // Omitting the field keeps the POST shape identical to the pre-Drive
@@ -3617,9 +4564,11 @@ function isIdempotentReplay(body: unknown): boolean {
  * without losing the evidence (the chunks themselves are already safe).
  */
 async function completeSession(
-  token: string,
+  token: OwnershipToken,
   sessionId: string,
 ): Promise<unknown> {
+  // R6 — see `postChunk`. Same authority, same last moment.
+  assertOwnershipGateOpen(`/sessions/${sessionId}/complete`);
   const url = `${env.apiUrl}/sessions/${sessionId}/complete`;
   if (!token) console.log('AUTH MISSING', { path: `/sessions/${sessionId}/complete` });
   console.log('API CALL', { method: 'POST', url, authed: true });
@@ -3646,7 +4595,7 @@ async function completeSession(
  * eventually reap it (chunks list is empty → all-settled → complete).
  */
 async function createSessionRequest(
-  token: string,
+  token: OwnershipToken,
   mode: SessionMode = 'audio',
   /**
    * Optional client-provided session id. The backend treats POST
@@ -3677,6 +4626,10 @@ async function createSessionRequest(
    */
   destinationType: DestinationType = 'drive',
 ): Promise<string> {
+  // R6 — see `postChunk`. A `sessions` row keyed by (id, user_id) is the
+  // first ownership a capture creates, so this is the most important of
+  // the three raw guards.
+  assertOwnershipGateOpen('/sessions');
   const sessionBody = JSON.stringify({
     user_id: 'test_user',
     mode,
@@ -3771,7 +4724,6 @@ export default function Index() {
   // mode === 'video', not on screen mount, so audio sessions never
   // surface a camera prompt.
   const [, requestCameraPermission] = useCameraPermissions();
-  const tokenRef = useRef<string | null>(null);
   /**
    * Session id of the currently-active recording. Set when GRABAR fires
    * `createSessionRequest`, cleared when stopRecording finishes (or on
@@ -4368,11 +5320,30 @@ export default function Index() {
       const wasBlocked = !destinationResolved;
       destinationResolved = true;
       console.log('DEST_TYPE', { activeDestinationType, destinationResolved });
+
+      // GC-DEST-PAUSE-001 — the backend has just told us which
+      // destinations are connected. That is the one signal that can
+      // retire a destination pause, and this is the only place in the
+      // app that holds it.
+      //
+      // NOTE THE INPUT: `drive` / `nas` are the rows filtered on
+      // `status === 'connected'` above — NOT `destinationResolved`,
+      // which is true even with nothing connected and would unblock a
+      // broken destination.
+      //
+      // This function does not own uploading. It removes a block that is
+      // provably stale and then asks the EXISTING drain to run.
+      const unblocked = await clearRecoveredDestinationPauses({
+        drive: Boolean(drive),
+        nas: Boolean(nas),
+      });
+
       // Re-kick the drain: any tick that early-returned while we were
-      // resolving needs a fresh entry point now that routing is known.
-      // uploadDrainLoop is single-flight (`isDraining`), so a redundant
-      // kick while already draining is a harmless no-op.
-      if (wasBlocked) {
+      // resolving needs a fresh entry point now that routing is known,
+      // and a pause we just retired leaves chunks that were parked on
+      // it. uploadDrainLoop is single-flight (`isDraining`), so a
+      // redundant kick while already draining is a harmless no-op.
+      if (wasBlocked || unblocked.length > 0) {
         uploadDrainLoop().catch((err) => {
           if (DEBUG_QUEUE) {
             console.log('GC_DEBUG drain rejected (from refreshDestination)', {
@@ -4479,6 +5450,33 @@ export default function Index() {
   useEffect(() => {
     (async () => {
       try {
+        // GC-AUTH-MIGRATION-001 — start resolving the migration boundary
+        // FIRST, so it is settled as early as this effect can make it.
+        //
+        // It used to sit after `init()` and two `getSession()` calls,
+        // behind ~550ms of diagnostic sleeps. Every one of those can block
+        // for seconds on a hostile network — and 4C no longer refuses a
+        // capture without a token, so a recording started meanwhile would
+        // write a queue entry and a history row BEFORE the probe had
+        // looked, and the probe would then read the app's own fresh traces
+        // as proof of an identity that never existed.
+        //
+        // THIS HOIST ALONE DOES NOT CLOSE THE RACE, and an earlier version
+        // of this comment wrongly claimed it ran "before anything can be
+        // rendered or tapped". It does not: React commits the render — and
+        // paints an enabled GRABAR AHORA — before effects run. The
+        // structural guarantee lives in `startRecording`, which awaits
+        // `ensureMigrationBoundary()` before its first durable write. Both
+        // callers share one single-flight execution, so whichever arrives
+        // first does the work and the other joins it. The hoist is what
+        // makes that join almost always free.
+        const {
+          initialized,
+          fromLegacyProbe,
+          source: identitySource,
+          boundaryUnsealed,
+        } = await resolveIdentityInitialized();
+
         // DEBUG: unmistakable build sentinel. If this string does NOT appear
         // on screen at boot, the emulator is running a stale JS bundle and
         // none of the ZZ_HEALTH_PROBE_* / ZZ_FETCH_POST_START / enhanced
@@ -4488,6 +5486,24 @@ export default function Index() {
         await new Promise(r => setTimeout(r, 500));
         setTestStatus(`API URL: ${env.apiUrl}`);
         await new Promise(r => setTimeout(r, 50));
+        // GC-AUTH-001 — bring the auth store to life, exactly once.
+        //
+        // `init()` had no callers at all. Two things were dead as a
+        // result: `onAuthStateChange` was never subscribed, so
+        // TOKEN_REFRESHED and SIGNED_OUT went unobserved; and
+        // `notifyClientAuth` — the only thing that lifts the Phase 1A
+        // `client_auth` queue pause — could never fire. The queue could
+        // enter that pause and never leave it.
+        //
+        // Called here, at the top of the mount-once bootstrap effect and
+        // BEFORE the identity state machine, so the subscription is
+        // already live when a first-boot `signInAnonymously()` emits
+        // SIGNED_IN. `store.ts` guards the subscription with a
+        // module-level latch, so a second invocation (React StrictMode
+        // double-invokes effects in dev) cannot register a second
+        // listener.
+        await useAuthStore.getState().init();
+
         // Auth bootstrap — anonymous Supabase user per device. Each
         // install gets its own distinct auth.users.id, so the existing
         // server-side `user_id` filters on destinations / sessions /
@@ -4503,49 +5519,95 @@ export default function Index() {
         // it is the only reliable signal we can pivot off to detect
         // and purge those legacy sessions on app update.
         const HARDCODED_LEGACY_EMAIL = 'diego@hotmail.com';
-        const existingSession = (await supabase.auth.getSession()).data
-          .session;
+        const existingProbe = await supabase.auth.getSession();
+        const existingSession = existingProbe.data.session;
         if (existingSession?.user?.email === HARDCODED_LEGACY_EMAIL) {
           console.log('AUTH PURGE legacy hardcoded session');
           await supabase.auth.signOut();
         }
 
-        let bootstrapSession = (await supabase.auth.getSession()).data
-          .session;
-        if (!bootstrapSession) {
-          // Capture the pre-signin user id (if any survived the legacy
-          // purge above). For the common cold-boot case `existingSession`
-          // was already null and `prev_sub` will be null too. The
-          // meaningful diagnostic case is when `prev_sub` is a real UUID
-          // that differs from `new_sub` — that combination means the
-          // device's persisted auth was lost between runs, which lines
-          // up 1:1 with the "GC_QUEUE entries=0 after restart" symptom
-          // (Clear Data / OS data-pressure wipe / uninstall+reinstall
-          // would clear both Supabase tokens AND the queue key).
-          const prevSub = existingSession?.user?.id ?? null;
-          const legacyPurged =
-            existingSession?.user?.email === HARDCODED_LEGACY_EMAIL;
+        // GC-AUTH-001 — identity state machine.
+        //
+        // This used to read `!session` as "no identity has ever existed
+        // here" and answer it by minting a new anonymous user. Because a
+        // new sign-in overwrites the persisted session and this app has
+        // no login, that made every transient failure — a dropped
+        // packet, a refresh that could not complete — permanently orphan
+        // the identity that owned everything already uploaded.
+        //
+        // Now the decision needs two inputs: whether a session came back,
+        // AND durable proof about whether an identity ever existed.
+        // `error` is read too, and it never opens the minting gate: a
+        // `getSession()` that failed cannot prove absence, it only proves
+        // we could not find out.
+        const bootstrapProbe = await supabase.auth.getSession();
+        let bootstrapSession = bootstrapProbe.data.session;
+        // `initialized` / `fromLegacyProbe` / `identitySource` were resolved
+        // at the very top of this effect — see the GC-AUTH-MIGRATION-001
+        // note there for why they cannot wait until here.
+        const decision = decideIdentityState({
+          hasSession: !!bootstrapSession,
+          hasError: !!bootstrapProbe.error,
+          initialized,
+          boundaryUnsealed,
+        });
+        console.log('GC_IDENTITY_STATE', {
+          state: decision.state,
+          reason: decision.reason,
+          initialized,
+          from_legacy_probe: fromLegacyProbe,
+          // GC-AUTH-MIGRATION-001: which durable record decided it.
+          // 'seal' / 'probe' distinguishes a boundary crossing from every
+          // boot after it; 'marker_malformed' is the conservative refusal.
+          identity_source: identitySource,
+          probe_version: LEGACY_PROBE_VERSION,
+          // True only when the probe said "no prior identity" and that
+          // answer could not be written down. Minting stays closed.
+          boundary_unsealed: boundaryUnsealed,
+          had_error: !!bootstrapProbe.error,
+          error_name: bootstrapProbe.error?.name ?? null,
+        });
+
+        if (decision.state === 'IDENTITY_DEGRADED') {
+          // Deliberately NOT minting. The device keeps whatever identity
+          // it has (or had); recovery is retried on foreground resume by
+          // the AppState handler. Capture and the queue are unaffected —
+          // evidence is never held hostage to the backend.
+          setTestStatus('Sin sesión — reintentando');
+          return;
+        }
+
+        if (decision.state === 'FIRST_IDENTITY') {
           const { data: anonData, error: anonError } =
             await supabase.auth.signInAnonymously();
-          // Diagnostic-only — fires regardless of success/failure so a
-          // failed sign-in (with prev_sub captured) is also visible.
           console.log('GC_ANON_SIGNIN', {
-            prev_sub: prevSub,
-            new_sub: anonData?.user?.id ?? null,
-            legacy_purged: legacyPurged,
-            error: anonError ? anonError.message : null,
+            new_sub_prefix: anonData?.user?.id?.slice(0, 8) ?? null,
+            error: anonError ? anonError.name : null,
           });
           if (anonError || !anonData.session) {
+            // No marker is written: a sign-in that failed did not create
+            // an identity, and pretending otherwise would wall the device
+            // off permanently on its very first boot.
             setTestStatus('No se pudo iniciar sesión anónima');
             console.log('AUTH ANON_SIGNIN_FAIL', {
-              message: anonError?.message ?? 'no session returned',
+              message: anonError?.name ?? 'no session returned',
             });
             return;
           }
           bootstrapSession = anonData.session;
+          const mint = await markIdentityInitialized(anonData.user?.id ?? null);
+          await guardUndurableIdentity(mint.persisted, 'minted');
           console.log('AUTH ANON_SIGNIN_OK', {
-            sub: anonData.user?.id ?? null,
+            sub_prefix: anonData.user?.id?.slice(0, 8) ?? null,
+            marker_durable: mint.persisted,
           });
+        } else {
+          // IDENTITY_OK. Back-fill the marker for devices that already
+          // had a live identity before this shipped. Idempotent.
+          const backfill = await markIdentityInitialized(
+            bootstrapSession?.user?.id ?? null,
+          );
+          await guardUndurableIdentity(backfill.persisted, 'observed');
         }
 
         const {
@@ -4557,7 +5619,6 @@ export default function Index() {
           console.log('ERROR: missing access_token');
           return;
         }
-        tokenRef.current = token;
         // Make the token visible to `apiFetch` (via useAuthStore) so the
         // destinations client and the Settings screen can issue
         // authenticated calls without re-running the login flow. This is
@@ -4894,6 +5955,12 @@ export default function Index() {
             for (const e of q) {
               if (!e.recording_closed) {
                 e.recording_closed = true;
+                // G1 — parallel write. This route force-closes every
+                // persisted entry on a cold boot; see finding S2, which
+                // records that ADR-CONTINUOUS-PROTECTION §6 will require
+                // revisiting it in G7. G1 changes neither the condition
+                // nor the behaviour: it only mirrors the value.
+                e.evidence_closed = true;
                 entriesClosed += 1;
               }
               for (const c of e.chunks) {
@@ -5174,8 +6241,65 @@ export default function Index() {
       /* haptics not available — ignore */
     });
     isStartingRef.current = true;
+
+    // GC-DEV-RESET-001 (third gap) — THE DOOR.
+    //
+    // This is the commit point, and it sits before every irreversible
+    // effect on every path: before the recorder opens (audio/legacy
+    // video reach `startAudioRecording` / `recordAsync` first) and
+    // before the 4A durable write (native segmented video reaches
+    // `queueAppendNewSession` first). Neither ordering can slip past it.
+    //
+    // Returning null means a destructive dev tool currently holds
+    // exclusion. Aborting HERE costs nothing — not a byte has been
+    // written — which is the only reason it is acceptable to refuse a
+    // capture at all. One acquire, one door; anywhere later and the
+    // refusal would be destroying evidence rather than declining to
+    // create it.
+    //
+    // The slot's lifetime is exactly `isStartingRef`'s, released in the
+    // same `finally`, so it covers the window in which the capture's
+    // evidence is not yet visible to `inspectResetSafety`. After 4A the
+    // queue entry itself blocks a reset.
+    const producerSlot: ProducerSlot | null = acquireProducerSlot('startRecording');
+    if (producerSlot === null) {
+      isStartingRef.current = false;
+      console.log('REC START ignored — destructive operation holds exclusion');
+      setTestStatus('REC START bloqueado — reset en curso');
+      return;
+    }
+
     setIsStarting(true);
     resetProgress();
+
+    // GC-AUTH-MIGRATION-001 — the migration boundary must be decided
+    // before this function writes ANYTHING durable.
+    //
+    // Everything below leaves signals the legacy probe reads as proof of
+    // a historical identity: the GC_QUEUE entry, the history row, the
+    // pending registration, the last-session id. Since 4C a capture can
+    // start with no identity at all, so a fresh install whose first mint
+    // failed can manufacture its own false "prior identity" — unless the
+    // probe has already answered.
+    //
+    // The bootstrap effect starts this resolution, but React commits the
+    // render before effects run, so GRABAR AHORA is tappable first. That
+    // is why the guarantee lives HERE and not in the effect, and why it
+    // is structural rather than a matter of timing: both callers share
+    // one single-flight execution, so whichever arrives first performs
+    // the probe and the seal while the other awaits the same promise.
+    //
+    // Local storage only — no network, no session, no token — so this
+    // costs a few milliseconds and usually zero, and it can never hold a
+    // recording behind a dead network.
+    //
+    // The property, stated exactly: before this capture creates a legacy
+    // signal, migration-boundary RESOLUTION HAS RUN. It does NOT gate on
+    // that resolution reaching disk — if the seal cannot be persisted
+    // even after a retry, the recording proceeds anyway, because evidence
+    // outranks migration hygiene. What protects the install in that case
+    // is that the minting gate stays closed, not that the capture waited.
+    await ensureMigrationBoundary();
 
     // Capture mode synchronously so it cannot change mid-flight if the
     // user somehow flips the toggle (the UI locks it, but defense in
@@ -5197,14 +6321,48 @@ export default function Index() {
     //   3. schedulePendingSessionRegistration on the deferred branch
     const pinnedDestinationType: DestinationType = activeDestinationType;
 
-    const token = tokenRef.current;
-    if (!token) {
-      console.log('ERROR REC: TOKEN_MISSING_AT_START');
-      setTestStatus('ERROR REC: TOKEN_MISSING_AT_START');
-      isStartingRef.current = false;
-      setIsStarting(false);
-      return;
-    }
+    // GC-AUTH-001 (4C) — a missing token no longer refuses the capture.
+    //
+    // This used to abort with TOKEN_MISSING_AT_START, which meant that a
+    // device in IDENTITY_DEGRADED — one whose Supabase session had died
+    // and which, correctly, refuses to mint a replacement identity —
+    // could not record at all. Guardian Cloud's whole purpose is to get
+    // evidence off the device; refusing to capture because the backend
+    // cannot be reached inverts that. The backend is where evidence
+    // GOES, not permission to gather it.
+    //
+    // Nothing is improvised to make this safe. The path was built by the
+    // two preceding commits and is simply used here:
+    //   4A — the recorder going live writes a durable GC_QUEUE entry
+    //        before anything depends on the backend, and a zero-chunk
+    //        entry can never complete or be reaped;
+    //   4B — no token routes to `schedulePendingSessionRegistration`
+    //        under this same `localSessionId`, with no doomed HTTP call,
+    //        and the backend is idempotent on (id, user_id) so the
+    //        replay after identity returns yields one row.
+    // Chunks accumulate locally and the worker retries them; 401 and
+    // SESSION_NOT_FOUND are both already classified transient.
+    // GC-START-LATENCY-001 — THE OWNERSHIP TOKEN IS NOT READ HERE.
+    //
+    // It used to be, and that `await` sat on the critical path between the
+    // tap and the first byte. `getOwnershipAccessToken()` goes through
+    // `supabase.auth.getSession()`, which refreshes over the network once
+    // the access token has expired, and NOTHING on that path carries a
+    // timeout: auth-js sets none, and the fetch wrapper adds none. (Our
+    // own backend client defaults to 10 s — see `src/api/client.ts`. The
+    // asymmetry was the defect.) With the remote unreachable, the recorder
+    // waited on a request the platform alone decided when to fail.
+    //
+    // The value was never needed here. Its only consumers live inside
+    // `sessionCreatePromise` below, which is deliberately NOT awaited
+    // before the recorder starts. Reading it there costs nothing and
+    // removes an entire class of "the network decides when you may begin
+    // gathering evidence" — which inverts the product.
+    //
+    // R5 is unaffected and travels with the read; see its docblock at the
+    // new site. Nothing else moves: `ensureMigrationBoundary()` still runs
+    // before any durable write, `queueAppendNewSession` still precedes the
+    // producer, and the deferral path is the one 4B already built.
 
     // ----- KICK in PARALLEL (do NOT await — recorder doesn't need them) -----
 
@@ -5272,6 +6430,51 @@ export default function Index() {
       destination_type: pinnedDestinationType,
     });
     const sessionCreatePromise: Promise<string> = (async () => {
+      // R5 — OWNERSHIP TOKEN. `POST /sessions` creates a `sessions` row
+      // keyed by (id, user_id): that is remote ownership, and it may not
+      // be created before `gc.identity.v1` is durable. The gate lives
+      // INSIDE `getOwnershipAccessToken`, which returns null unless the
+      // marker is durable — so reading the token here leaves R5 exactly as
+      // it was. The gate still closes in front of the POST, which is the
+      // only thing it ever guarded; it never guarded the capture.
+      //
+      // GC-START-LATENCY-001 — this is the read that used to block the
+      // critical path. It NEVER rejects (see its docblock): auth, storage
+      // or network failure all resolve to null, which routes to the same
+      // deferral below. Awaiting it here delays only the remote row.
+      const token = await getOwnershipAccessToken();
+      if (!token) {
+        console.log('GC_LOCAL_FIRST capture without identity', {
+          session_id: localSessionId,
+          mode: recordingMode,
+        });
+      }
+
+      // GC-AUTH-001 (4B) — do not send a request we already know will
+      // come back 401. With no token there is nothing to authenticate
+      // with, so the round-trip buys nothing but latency, a log line
+      // and an error to re-classify. Skip straight to the durable
+      // mechanism and say so plainly.
+      //
+      // Live since 4C removed the TOKEN_MISSING_AT_START abort: this is
+      // now the ordinary path for a capture started in
+      // IDENTITY_DEGRADED.
+      if (!token) {
+        await schedulePendingSessionRegistration(
+          localSessionId,
+          recordingMode,
+          pinnedDestinationType,
+        );
+        console.log('GC_LOCAL_FIRST session deferred', {
+          session_id: localSessionId,
+          reason: 'no_token',
+        });
+        perfLog('GC_PERF_SESSION_CREATED', {
+          session_id: localSessionId,
+          deferred_offline: true,
+        });
+        return localSessionId;
+      }
       try {
         const sid = await createSessionRequest(
           token,
@@ -5379,6 +6582,9 @@ export default function Index() {
           // `local_uri`.
           uri: '',
           recording_closed: false,
+          // G1 — written in parallel with `recording_closed`, same value.
+          // Inert: nothing reads it. See the field's docblock.
+          evidence_closed: false,
           session_completed: false,
           complete_attempts: 0,
           emitted_base64_length: 0,
@@ -5499,14 +6705,71 @@ export default function Index() {
       // entry), so the user-visible cost is dominated by the AsyncStorage
       // write of `queueAppendNewSession` (~10–30ms).
 
-      // Resolve the session id. Parallel kick from the top of the function
-      // means in the common case this await is ~0ms. On non-retryable POST
-      // /sessions failure (4xx) it throws — caught by the outer try/catch,
-      // where the recorder is stopped cleanly BEFORE the user ever sees
-      // "Grabando", restoring the pre-Phase-1 semantics. Retryable errors
-      // were already converted to a deferred registration inside the
-      // promise body, so they resolve with `localSessionId` and never
-      // throw here. `sessionId === localSessionId` in both branches.
+      // ----- DURABILITY BEFORE THE BACKEND (GC-AUTH-001, 4A) -----
+      //
+      // The queue entry used to be written only AFTER
+      // `await sessionCreatePromise`. That left a window in which the
+      // recorder was live, bytes were accumulating in the cache file,
+      // and NOTHING durable referenced them. A non-retryable POST
+      // /sessions failure aborted the start, and the capture became
+      // unreachable: no queue entry, so neither the worker nor the
+      // export nor `findLocalRecordingUri` could see it; and the move
+      // to `documentDirectory/guardian_recording_*` — the only thing
+      // `orphanScan` looks for — happens in `stopRecording`, which
+      // never ran. The bytes sat in `cacheDirectory` under the
+      // recorder's own name until the OS reclaimed them.
+      //
+      // Now the local session becomes durable the moment the recorder
+      // is live. `sessionId` is `localSessionId` on every success path
+      // (the deferred branch returns it verbatim, the online branch
+      // echoes it back), so writing the entry with `localSessionId`
+      // before the await is equivalent on the happy path — it only
+      // changes what survives on the failure paths.
+      sessionIdRef.current = localSessionId;
+      // Pinning log — `pinnedDestinationType` was captured ONCE earlier
+      // in this function so the backend `sessions.destination_type`
+      // and the queue entry's `destination_type` cannot diverge under
+      // a Settings race.
+      console.log('GC_QUEUE session destination pinned', {
+        sessionId: localSessionId,
+        destinationType: pinnedDestinationType,
+      });
+      await queueAppendNewSession({
+        session_id: localSessionId,
+        uri: cacheUri,
+        recording_closed: false,
+        // G1 — written in parallel with `recording_closed`, same value.
+        // Inert: nothing reads it. See the field's docblock.
+        evidence_closed: false,
+        session_completed: false,
+        complete_attempts: 0,
+        emitted_base64_length: 0,
+        next_chunk_index: 0,
+        chunks: [],
+        destination_type: pinnedDestinationType,
+      });
+      AsyncStorage.setItem(LAST_SESSION_ID_KEY, localSessionId).catch(() => {});
+      // Append to local history index (best-effort, never blocks the
+      // recording flow). The index is the only source the History
+      // screen has to enumerate past sessions; per-row real status is
+      // still fetched live from GET /sessions/:id/chunks.
+      appendHistoryEntry({
+        session_id: localSessionId,
+        created_at: new Date().toISOString(),
+        mode: recordingMode,
+      });
+
+      // Now — and only now — resolve the backend registration.
+      // Retryable failures were already converted to a deferred
+      // registration inside the promise body and resolve with
+      // `localSessionId`. A non-retryable 4xx still aborts the capture
+      // (4A does not change that policy), but the abort has to hand the
+      // bytes to the orphan route rather than walk away from them.
+      //
+      // Order is not negotiable here: CLOSE the recorder, THEN read the
+      // uri closing produced, THEN promote, and only retire the queue
+      // entry if that promotion is confirmed. Promoting while the
+      // recorder is still writing would move a file out from under it.
       let sessionId: string;
       try {
         sessionId = await sessionCreatePromise;
@@ -5514,44 +6777,26 @@ export default function Index() {
         console.log('SESSION_CREATE_NON_RETRYABLE_ABORT', {
           err: err instanceof Error ? err.message : String(err),
         });
+        const finalUri = await closeRecorderForAbandon({
+          hadAudio: recordingMode === 'audio',
+          stopAudio: stopAudioRecording,
+          stopCamera: () => cameraRef.current?.stopRecording(),
+          videoPromise: videoRecordPromiseRef.current,
+          chunkedUri: videoRecordingUriRef.current ?? cacheUri,
+        });
+        // The outer catch also tears the recorder down; both paths are
+        // idempotent (the audio engine nulls its handle, and the video
+        // branch is guarded on a ref we clear here), so the duplicate
+        // teardown is a no-op rather than a double-stop.
+        videoRecordPromiseRef.current = null;
+        videoRecordingUriRef.current = null;
+        await abandonUnregisteredSession(localSessionId, finalUri);
         throw err;
       }
-
-      sessionIdRef.current = sessionId;
-      AsyncStorage.setItem(LAST_SESSION_ID_KEY, sessionId).catch(() => {});
-      // Append to local history index (best-effort, never blocks the
-      // recording flow). The index is the only source the History
-      // screen has to enumerate past sessions; per-row real status is
-      // still fetched live from GET /sessions/:id/chunks.
-      appendHistoryEntry({
-        session_id: sessionId,
-        created_at: new Date().toISOString(),
-        mode: recordingMode,
-      });
       console.log('GC_VALIDATION: SESSION_CREATED', {
         session_id: sessionId,
         phase: 1,
         mode: recordingMode,
-      });
-
-      // Pinning log — `pinnedDestinationType` was captured ONCE earlier
-      // in this function so the backend `sessions.destination_type`
-      // and the queue entry's `destination_type` cannot diverge under
-      // a Settings race.
-      console.log('GC_QUEUE session destination pinned', {
-        sessionId,
-        destinationType: pinnedDestinationType,
-      });
-      await queueAppendNewSession({
-        session_id: sessionId,
-        uri: cacheUri,
-        recording_closed: false,
-        session_completed: false,
-        complete_attempts: 0,
-        emitted_base64_length: 0,
-        next_chunk_index: 0,
-        chunks: [],
-        destination_type: pinnedDestinationType,
       });
 
       // Capture the mode for stopRecording's dispatch. Stays in a ref
@@ -5642,6 +6887,11 @@ export default function Index() {
       videoRecordingUriRef.current = null;
     } finally {
       isStartingRef.current = false;
+      // Released here and only here — success, early return on the
+      // native-segmented path, or a throw. By this point the 4A entry is
+      // durable on every success path, so `inspectResetSafety` can see
+      // the capture and takes over the protection.
+      releaseProducerSlot(producerSlot);
       setIsStarting(false);
     }
   }
@@ -6200,6 +7450,9 @@ export default function Index() {
       session_id: sessionId,
       uri: orphan.uri,
       recording_closed: false,
+      // G1 — written in parallel with `recording_closed`, same value.
+      // Inert: nothing reads it. See the field's docblock.
+      evidence_closed: false,
       session_completed: false,
       complete_attempts: 0,
       emitted_base64_length: 0,
@@ -6228,15 +7481,37 @@ export default function Index() {
     // Non-retryable 4xx errors propagate to the catch below — recovery
     // for that orphan is abandoned and the file stays on disk for a
     // future attempt.
-    const token = tokenRef.current;
+    //
+    // R5 — OWNERSHIP TOKEN, for the same reason as startRecording: this
+    // path also ends in `createSessionRequest`. A null answer takes the
+    // deferral branch immediately below, which already exists.
+    const token = await getOwnershipAccessToken();
     try {
-      if (!token) throw new Error('no_token');
-      await createSessionRequest(
-        token,
-        orphan.mode,
-        sessionId,
-        pinnedDestinationType,
-      );
+      if (!token) {
+        // GC-AUTH-001 (4B) — this used to be a sentinel
+        // `throw new Error('no_token')`, which reached the deferred
+        // branch only because that string happens not to match the
+        // `HTTP (\d{3})` probe in `isRetryableSessionCreateError`.
+        // Correct behaviour resting on a regex miss is a trap for
+        // whoever edits that classifier next, so state it directly —
+        // and skip a request that could only ever come back 401.
+        await schedulePendingSessionRegistration(
+          sessionId,
+          orphan.mode,
+          pinnedDestinationType,
+        );
+        console.log('GC_LOCAL_FIRST session deferred', {
+          session_id: sessionId,
+          reason: 'no_token',
+        });
+      } else {
+        await createSessionRequest(
+          token,
+          orphan.mode,
+          sessionId,
+          pinnedDestinationType,
+        );
+      }
     } catch (err) {
       if (isRetryableSessionCreateError(err)) {
         await schedulePendingSessionRegistration(
@@ -6587,6 +7862,47 @@ export default function Index() {
           mode: recordingModeRef.current,
           session_id: sessionIdRef.current,
         });
+      }
+
+      // GC-AUTH-001 — auth-js expects React Native hosts to drive the
+      // refresh ticker from AppState; on this platform it starts it
+      // itself only via `document.visibilityState`, which does not
+      // exist here. `autoRefreshToken: true` alone therefore never
+      // started a ticker at all, leaving every refresh to happen lazily
+      // inside whichever `getSession()` happened to notice the token had
+      // aged past the 90s expiry margin.
+      //
+      // Reusing this listener rather than adding one: it is already
+      // mount-once (`[]` deps) with `sub.remove()` on unmount, so no
+      // duplicate registration is possible. `_startAutoRefresh()` also
+      // stops any existing ticker before creating one, so repeated
+      // 'active' transitions cannot leave two timers running.
+      void (nextState === 'active'
+        ? supabase.auth.startAutoRefresh()
+        : supabase.auth.stopAutoRefresh()
+      ).catch(() => {
+        /* refresh scheduling is best-effort; never break the handler */
+      });
+
+      // A device that booted into IDENTITY_DEGRADED has no session and
+      // will not mint one. Coming back to the foreground is the natural
+      // moment to ask again — a `getSession()` that failed on a dead
+      // network may well succeed now. No minting happens here either:
+      // this only observes, and `onAuthStateChange` does the rest.
+      if (nextState === 'active') {
+        void supabase.auth
+          .getSession()
+          .then(({ data, error }) => {
+            if (!data.session) {
+              console.log('GC_IDENTITY_RESUME_PROBE', {
+                recovered: false,
+                error_name: error?.name ?? null,
+              });
+            }
+          })
+          .catch(() => {
+            /* diagnostics must never break the AppState handler */
+          });
       }
       // Video is foreground-only (honest mode). If the app went to
       // background during a video session, run a clean shutdown so the
@@ -7625,7 +8941,19 @@ export default function Index() {
         </Text>
       )}
 
-      {/* DEV-only hard reset. Long-press, gated on __DEV__. */}
+      {/* GC-DEV-RESET-001 — DEV-only hard reset.
+        *
+        * This control destroyed a validation run on 2026-08-21: an
+        * accidental long-press wiped 54 chunks and 1 776 751 bytes of
+        * audio whose `remote_reference` was 0 of 54 — none of it had ever
+        * left the device. An 800 ms press on a 10 px target executed
+        * immediately, with no confirmation and no evidence check.
+        *
+        * Two things changed. The press no longer executes anything: it
+        * asks first. And `hardResetAppState` REFUSES outright while any
+        * chunk is unconfirmed — there is no "delete anyway", because a
+        * dev convenience may not be what loses someone's evidence.
+        */}
       {__DEV__ ? (
         <Pressable
           onLongPress={async () => {
@@ -7633,15 +8961,46 @@ export default function Index() {
               Alert.alert('Reset bloqueado', 'Stop recording before reset.');
               return;
             }
-            try {
-              await hardResetAppState();
-              Alert.alert('Reset hecho', 'App state cleared.');
-            } catch (err) {
-              Alert.alert(
-                'Reset error',
-                err instanceof Error ? err.message : String(err),
-              );
+            // Check BEFORE showing a dialog, so the refusal is what the
+            // user sees rather than a confirm prompt for something that
+            // was never going to run. GLOBAL check: this control deletes
+            // documentDirectory, where evidence survives with no queue
+            // entry by design (`abandonUnregisteredSession`).
+            const pending = await inspectResetSafety();
+            if (pending) {
+              Alert.alert('Reset bloqueado', describeResetRefusal(pending));
+              return;
             }
+            Alert.alert(
+              'Reset de estado (DEV)',
+              'Borra cola, historial y ficheros locales. No toca tu ' +
+                'identidad ni tu sesión de Google. ¿Continuar?',
+              [
+                { text: 'Cancelar', style: 'cancel' },
+                {
+                  text: 'Resetear',
+                  style: 'destructive',
+                  onPress: async () => {
+                    try {
+                      // Re-checked inside the tool: the dialog may have
+                      // been open while a capture wrote new chunks.
+                      const outcome = await hardResetAppState();
+                      Alert.alert(
+                        outcome.ok ? 'Reset hecho' : 'Reset bloqueado',
+                        outcome.ok
+                          ? 'App state cleared.'
+                          : describeResetRefusal(outcome),
+                      );
+                    } catch (err) {
+                      Alert.alert(
+                        'Reset error',
+                        err instanceof Error ? err.message : String(err),
+                      );
+                    }
+                  },
+                },
+              ],
+            );
           }}
           delayLongPress={800}
           hitSlop={20}

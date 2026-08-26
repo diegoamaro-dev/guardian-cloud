@@ -50,6 +50,11 @@ export interface CreateChunkInput {
   size: number;
   status: ChunkStatus;
   remote_reference?: string | null;
+  /**
+   * G3'' — medium of THIS chunk's bytes, as sent by the client.
+   * Optional: absence persists as NULL, meaning "not declared".
+   */
+  media?: 'video' | 'audio';
 }
 
 export interface ChunkRow {
@@ -60,6 +65,12 @@ export interface ChunkRow {
   size: number;
   status: ChunkStatus;
   remote_reference: string | null;
+  /**
+   * G3'' — medium of THIS chunk's bytes. `null` means "not declared" —
+   * a row written before the column existed, or by a client that does
+   * not send it. It never means "video".
+   */
+  media: 'video' | 'audio' | null;
   created_at: string;
   updated_at: string;
 }
@@ -144,6 +155,10 @@ async function insertChunk(input: CreateChunkInput): Promise<ChunkRow> {
       size: input.size,
       status: input.status,
       remote_reference: input.remote_reference ?? null,
+      // G3'' — absent stays NULL. Never derived from `session.mode`:
+      // the session declares how the capture STARTED, which is not a
+      // statement about this chunk's bytes.
+      media: input.media ?? null,
     })
     .select('*')
     .single();
@@ -263,10 +278,22 @@ async function updateExistingChunk(
 
   const nextRemoteReference = input.remote_reference ?? existing.remote_reference ?? null;
 
+  // G3'' — a declared medium is never reinterpreted. We only BACKFILL a
+  // row that has none: same hash means same bytes, so a later client
+  // that knows the medium is adding information, not changing it. An
+  // already-declared value wins over anything the retry sends.
+  const nextMedia = existing.media ?? input.media ?? null;
+
+  // `existing.media ?? null` and not `existing.media`: a row read from a
+  // database that predates the column — or from a fixture that never set
+  // it — arrives as `undefined`, while `nextMedia` normalises to `null`.
+  // Comparing them raw would call an unchanged row "changed" and turn an
+  // idempotent replay into a write.
   const noChanges =
     existing.status === input.status &&
     existing.size === input.size &&
-    existing.remote_reference === nextRemoteReference;
+    existing.remote_reference === nextRemoteReference &&
+    (existing.media ?? null) === nextMedia;
 
   if (noChanges) {
     return {
@@ -281,6 +308,7 @@ async function updateExistingChunk(
       status: input.status,
       size: input.size,
       remote_reference: nextRemoteReference,
+      media: nextMedia,
     })
     .eq('id', existing.id)
     .select('*')

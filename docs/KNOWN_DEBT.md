@@ -18,7 +18,30 @@ Detalle completo en [`releases/v0.3.0-rc.1.md`](./releases/v0.3.0-rc.1.md) §7.
 - **12 errores heredados**; el typecheck **no** está verde. 6 en `app.config.ts`
   (tipos de `ExpoConfig`/`ManifestService`), 4 en `app/index.tsx` y 2 en
   `src/api/*` (`Uint8Array<ArrayBufferLike>` vs `BufferSource`/`BodyInit`).
-- **No hay CI.** Los 198 tests corren sólo en la máquina del desarrollador.
+- **No hay CI.** Los tests corren sólo en la máquina del desarrollador —
+  **936/936 en 42 ficheros el 2026-08-26**, tras `fc9a20e`. *(Cifras anteriores
+  de esta línea: «los 198 tests» del corte de `v0.3.0-rc.1`, 781 el 2026-08-23
+  sobre `34412a0`, 792/792 en 41 ficheros tras `3c10994` y 900/900 en 42
+  ficheros tras `cb59c7e`. La deuda de CI no ha cambiado.)*
+- **La suite del backend NO está verde.** Cuatro fallos de integración,
+  **preexistentes en `HEAD`** y medidos por primera vez el 2026-08-26:
+
+  ```
+  HEAD          4 fallos · 102 passing (106)
+  árbol de G3'' 4 fallos · 114 passing (118)   ← los MISMOS cuatro
+
+  tests/integration/auth.test.ts      ×1
+  tests/integration/chunks.test.ts    ×1
+  tests/integration/sessions.test.ts  ×2
+  ```
+
+  **`G3''` introduce cero fallos nuevos**; los cuatro son anteriores y **no se
+  le atribuyen**. Su causa, su alcance y su impacto **no han sido
+  investigados**, así que esto se registra como **baseline conocida**, no como
+  finding: sin causa raíz no hay nada que un identificador pudiera identificar.
+  Sin remediation propuesta. Su investigación es un gate propio, previo al
+  release. Hasta entonces, cualquier afirmación de que el backend pasa sus
+  pruebas es incorrecta.
 - `npm ci` **falla** sin `--legacy-peer-deps`: el lockfile no materializa los
   peers `react-dom` y `scheduler`.
 - 29 vulnerabilidades de `npm audit` (1 baja, 17 moderadas, 8 altas, 3
@@ -45,6 +68,16 @@ Detalle completo en [`releases/v0.3.0-rc.1.md`](./releases/v0.3.0-rc.1.md) §7.
 - La ReliabilityCard **desplaza el botón principal** hacia abajo en Home.
 - El botón legacy de exención de batería en Ajustes coexiste a propósito con la
   tarjeta; su retirada está diferida.
+- **`Subiendo evidencia` con la cola pausada** *(UX observation, 2026-08-24 — no
+  es finding abierto)*. Con `uploading: 0` y el drain saliendo por
+  `all remaining entries paused`, Home rotula en ámbar **«Subiendo evidencia»**:
+  afirma una actividad que no está ocurriendo. Las dos líneas de apoyo sí eran
+  exactas —«Todavía no protegido fuera del dispositivo» y «Sin destino
+  conectado»—, así que el usuario no queda engañado sobre el riesgo, sólo sobre
+  el mecanismo. Observado durante la revalidación de `GC-DEST-PAUSE-001`, en 261
+  ciclos consecutivos de drain pausado. **Sin investigar y sin corregir**: se
+  registra para no perderlo. Es claridad de estado, no integridad — no se pierde
+  evidencia.
 
 ### Repositorio
 
@@ -95,11 +128,73 @@ configuración implicada en [`OAUTH_DRIVE_CONFIGURATION.md`](./OAUTH_DRIVE_CONFI
 
 ## Known technical debt
 
+> **Convención.** Una entrada nunca se borra. Cuando deja de ser cierta se
+> antepone `**RESOLVED**` o `**RECLASSIFIED**` con la fecha y lo que la
+> acredita, y el texto original se conserva. Saber que algo fue deuda y por qué
+> dejó de serlo vale más que una lista corta.
+
 - ngrok is temporary and not valid for production.
+  **RESOLVED (2026-07-28)** — sustituido por Cloudflare Tunnel; ver
+  [`CLOUDFLARE_TUNNEL_SETUP.md`](./CLOUDFLARE_TUNNEL_SETUP.md).
 - Backend proxy Drive upload is acceptable for MVP, but should be reviewed before production.
 - expo-av is deprecated and should later migrate to expo-audio / expo-video.
+  **RECLASSIFIED (2026-08-23)** — la migración del **camino de grabación** ya se
+  hizo: `mobile/src/audio/audioEngine.ts:47` importa de `expo-audio`. Lo que
+  queda es distinto y menor: `expo-av` sigue en `package.json`
+  (`~16.0.8`) y sólo lo importan las dos rutas `app/debug-camera-probe/`. La
+  deuda vigente es **retirar esas rutas y la dependencia**, no migrar el motor.
+  Registrado como `F-15` en el plan de remediación, sin ejecutar.
+  > Cuidado: [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §1 documenta una limitación
+  > real de `expo-av` con `Audio.Recording` huérfano. **Sigue siendo contexto
+  > obligatorio** — describe el motor histórico y el porqué de varias guardas.
 - Existing failing tests need review after the recovery flow is stabilized.
+  **RESOLVED (2026-08-23)** — la suite **estaba** en 781/781 sin tests saltados
+  en esa fecha; hoy va por 936/936, y la cifra vigente vive arriba. El typecheck
+  sigue en 12 errores heredados, que es deuda aparte y está arriba.
 - Logs should be reduced before release.
 - Export flow has no entry point from the home screen yet (reachable only via direct route `/session/:id`). A Historial brick should list past sessions and link in (see `TODO(export-history)`).
+  **RESOLVED** — `mobile/app/history.tsx` existe (382 líneas) y
+  `mobile/app/index.tsx:8094` navega con `router.push('/history')`. La
+  auditoría de trazabilidad ya lo había marcado obsoleto como defecto `D14`.
 - Export accumulates the full session bytes in memory before writing. Acceptable for MVP-size recordings but will OOM on large files — switch to an incremental append (see `TODO(export-large)`).
 - A partial export missing the last chunk loses the MP4 `moov` atom and the resulting .m4a is generally unplayable. File is still produced as forensic output; moov-patching is out of scope (see `TODO(export-headerless-partial)`).
+- `GC-COMPAT-DOWNGRADE-001` — **una versión antigua no respeta
+  `evidence_closed`.** Desde `6c6489c` la autorización de `/complete` se decide
+  con `evidence_closed ?? recording_closed`. Una entrada que un gate posterior
+  escriba como `evidence_closed=false` junto a `recording_closed=true`
+  —productor cerrado, Protection Session abierta— sería leída por un binario
+  anterior a `8983bad`, o por uno de G1, como terminable, y podría completarse
+  antes de tiempo.
+  **No es resoluble con metadata aditiva**: una versión antigua no puede
+  respetar un campo que no conoce. Se registra como limitación conocida y **no
+  se propone solución**. Hoy es inalcanzable —ningún escritor de producto
+  produce `evidence_closed ≠ recording_closed`— y sólo pasa a ser relevante
+  cuando el gate atómico de `VIDEO_AUDIO → AUDIO_ONLY` empiece a producir esos
+  estados. Ver
+  [`decisions/ADR-CONTINUOUS-PROTECTION.md`](./decisions/ADR-CONTINUOUS-PROTECTION.md).
+
+---
+
+## Lo que NO es deuda y no vive aquí
+
+Los findings del bloque de identidad, destino y herramientas (21/08 – 24/08)
+**no son deuda técnica**: unos son release blockers y otros defectos abiertos.
+Se registran en otro sitio y no deben duplicarse aquí.
+
+| Dónde | Qué contiene |
+|---|---|
+| [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §1–§6 | `GC-AUTH-MIGRATION-001`, `GC-DEST-PAUSE-001`, `GC-DEV-RESET-001`, `GC-AUTH-SESSION-RECOVERY-001`, `GC-START-LATENCY-001` y el límite de `expo-av` |
+| [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md#findings-abiertos-de-identidad-destino-y-herramientas) | Tabla de estado de los ocho findings |
+| [`RELEASE_CHECKLIST_v0.3.md`](./RELEASE_CHECKLIST_v0.3.md) §0 | Invariante bloqueante de migración de identidad |
+
+`GC-AUTH-SESSION-RECOVERY-001` y `GC-AUTH-RETRY-CLASSIFICATION-001` pasaron a
+tener registro propio en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §5 al cerrar
+D2-B y D2-C.
+
+`GC-START-LATENCY-001` **tiene registro propio** en
+[`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §6 desde el 2026-08-24, escrito al
+cerrar su validación en hardware.
+
+`GC-DEST-STATUS-001` es el único que **sigue sin ficha propia en `docs/`**; la
+suya está congelada fuera del repositorio. Esa asimetría es la deuda documental
+vigente más relevante.

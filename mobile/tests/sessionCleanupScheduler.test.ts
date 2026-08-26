@@ -190,7 +190,7 @@ describe('cleanup scheduler', () => {
   it('logs only closed reasons, never anything from the exception', async () => {
     const h = makeHarness();
     const leaky =
-      '/data/user/0/com.guardiancloud.app/cache/gc-segmented-recorder/11111111-1111-4111-8111-111111111111/seg_000.mp4';
+      '/data/user/0/com.guariacloud.app/cache/gc-segmented-recorder/11111111-1111-4111-8111-111111111111/seg_000.mp4';
     h.reconcile.mockRejectedValueOnce(new Error(`ENOENT deleting ${leaky}`));
 
     h.scheduler.requestCleanup('finalized');

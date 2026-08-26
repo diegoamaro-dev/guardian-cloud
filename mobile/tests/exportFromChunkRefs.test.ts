@@ -48,7 +48,11 @@ vi.mock('@/config/env', () => ({
 // `@/auth/store` is imported by the API client; stub the single export
 // the helper's import chain pulls in.
 vi.mock('@/auth/store', () => ({
+  // R6: no-op = ownership gate open. Tests that need it SHUT override it.
+  assertOwnershipGateOpen: vi.fn(),
+  isOwnershipGateOpen: vi.fn(() => true),
   getFreshAccessToken: vi.fn(),
+  getOwnershipAccessToken: vi.fn(),
   useAuthStore: { setState: vi.fn() },
 }));
 

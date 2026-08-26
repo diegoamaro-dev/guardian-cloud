@@ -1,9 +1,32 @@
 # IMPLEMENTATION_STATUS.md
 
-⛔ NO APTO PARA RELEASE — por cifrado local, recovery `I5c`, export `.mp4` y cobertura de dispositivos. **Ya no por `GC-AUD-001`.**
+⛔ NO APTO PARA RELEASE — por cifrado local, recovery `I5c`, export `.mp4`, cobertura de dispositivos **y findings de identidad/destino todavía no cerrados**. **Ya no por `GC-AUD-001`.**
 
-Estado vigente a 2026-08-20. Fuentes de continuidad y evidencia:
+| Qué | Cuándo / sobre qué |
+|---|---|
+| Estado documental vigente | **2026-08-26** |
+| Producto usado para la revalidación de `GC-DEST-PAUSE-001` | **`22a9b26`** (APK release `2b3be062…`) |
+| Producto usado para la validación de `GC-START-LATENCY-001` | **`e643b01`** (APK release `1cb80fea…`) |
+| Producto usado para la validación de **D3 local segment salvage** | **`cb59c7e`** (APK release `8151c338…`) |
+| Última suite automática registrada | **2026-08-26**, tras **`fc9a20e`** — 936/936 en 42 ficheros · typecheck 12, sin drift |
 
+> Las fechas y los commits son distintos a propósito, y no deben fundirse. La
+> suite vigente —936/936 en 42 ficheros— se midió sobre el árbol posterior a
+> `fc9a20e`; las tres validaciones de hardware se hicieron en dispositivo, no
+> corriendo la suite, y cada una sobre **su propio APK**:
+> `GC-DEST-PAUSE-001` sobre `22a9b26`, `GC-START-LATENCY-001` sobre `e643b01` y
+> **D3** sobre `cb59c7e`. **Ninguna cifra de tests describe un APK.**
+
+> **Corte anterior: 2026-08-20.** Entre el 20/08 y el 23/08 la rama
+> `fix/gc-auth-001-main-integration` incorporó seis commits que este documento
+> no reflejaba. La sección
+> [Findings abiertos](#findings-abiertos-de-identidad-destino-y-herramientas)
+> los recoge con su estado exacto.
+
+Fuentes de continuidad y evidencia:
+
+* [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) — límites vigentes y findings §1–§6;
+* [`RELEASE_CHECKLIST_v0.3.md`](./RELEASE_CHECKLIST_v0.3.md) §0 — invariante de migración de identidad, bloqueante;
 * [validación física del vídeo nativo con durable cleanup del 20/08](./audits/GUARDIAN_CLOUD_NATIVE_SEGMENTED_DURABLE_CLEANUP_VALIDATION_2026-08-20.md);
 * [validación física de la integración nativa segmentada del 13/08](./audits/GUARDIAN_CLOUD_NATIVE_SEGMENTED_INTEGRATION_VALIDATION_2026-08-13.md);
 * [configuración OAuth de Drive](./OAUTH_DRIVE_CONFIGURATION.md).
@@ -60,6 +83,83 @@ contradiga es incorrecta.
 |---|---|
 | Recuperación completa del vídeo nativo | No consta validación integrada; no se declara implementada o validada por la evidencia actual |
 | Exportación `.mp4` | No implementada ni validada |
+| Continuous Protection — continuidad `VIDEO_AUDIO → AUDIO_ONLY` al perder el primer plano | **Capacidad: no implementada ni validada.** Contrato aceptado el 2026-08-25. **Infraestructura parcial y precondiciones ya publicadas**, sin cambio de comportamiento observable: `8983bad` añadió la metadata durable `evidence_closed`, `6c6489c` desacopló el camino de **lectura** de terminalidad hacia `/complete`, y `fc9a20e` añadió `media` por chunk y la clasificación **fail-closed** de D3. La **escritura** sigue acoplada y la transición no existe: minimizar durante vídeo cierra la sesión igual que antes. Decide [`decisions/ADR-CONTINUOUS-PROTECTION.md`](./decisions/ADR-CONTINUOUS-PROTECTION.md); su criterio de prueba es el escenario 18 de [`TEST_SCENARIOS.md`](./TEST_SCENARIOS.md), que sigue `DEFINIDO` |
+
+> **`fc9a20e` es una precondición de INTEGRIDAD, no Continuous Protection
+> funcionando.** Retira un modo de fallo de D3 —habría podido copiar bytes de
+> audio como `segment_NNNNNN.mp4` y acreditarlos por `sha256`— haciendo que la
+> elegibilidad se decida **por chunk** y exigiendo la firma estructural
+> `segments/<session_id>/segment_NNNNNN.mp4`. **D3 no soporta sesiones mixtas:
+> las rechaza.** Detalle en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §D3.
+>
+> `G3''` —descripción de la evidencia en backend y manifiesto— está
+> **implementado y validado EN EL ÁRBOL DE TRABAJO**. Las tres cosas hay que
+> mantenerlas separadas:
+>
+> ```
+> IMPLEMENTADO Y VALIDADO EN EL ÁRBOL   sí
+> VERSIONADO / PUBLICADO                 NO — no existe commit de G3''
+> DESPLEGADO                             NO — el mini servidor sigue con el
+>                                        backend anterior, la migración 0005
+>                                        no se ha aplicado y no hay ningún
+>                                        manifiesto v2 en producción
+> ```
+>
+> Qué contiene el árbol: `media` opcional por chunk en `POST /chunks`,
+> persistencia nullable donde la ausencia significa «no declarado» y nunca se
+> infiere, `guardian-cloud.manifest.v2` con `chunks[].media` obligatorio y sin
+> `mode` ni `format` de sesión, lectura read-only de v1 —cuyo `mode` histórico
+> se propaga a los chunks porque toda sesión v1 es homogénea—, recovery que
+> deriva el medio de los chunks, y `409 MANIFEST_HETEROGENEOUS` en lugar de un
+> artefacto falsamente etiquetado. `mode` se conserva en `POST /sessions` y en
+> la fila de sesión, donde significa el medio con el que se **inició** la
+> captura.
+>
+> Qué **no** hace: no habilita evidencia mixta —ningún productor puede crearla—,
+> no implementa `VIDEO_AUDIO → AUDIO_ONLY`, no implementa el export heterogéneo
+> —una sesión mixta se **rechaza**—, y no toca D3, `/complete`, terminalidad,
+> background, worker ni cleanup.
+>
+> **`G4` sigue BLOQUEADO** mientras `G3''` no esté versionado y desplegado.
+> Contrato en [`API_SPEC.md`](./API_SPEC.md) §Manifiesto de evidencia.
+
+> **D3 `LOCAL SEGMENT SALVAGE` no pertenece a este nivel y no es un export
+> `.mp4`.** Es una capacidad distinta, implementada en `cb59c7e` y con
+> **`HARDWARE FUNCTIONAL PASS`** el 2026-08-24: cuando una captura de vídeo
+> nativo segmentado queda sin salida cloud, permite copiar del sandbox los
+> **segmentos MP4 originales**, ordenados y verificados por `sha256` en destino,
+> a una carpeta que elige el usuario vía Storage Access Framework.
+>
+> Los segmentos son contenedores MP4 **independientes**; no se concatenan,
+> porque unir contenedores MP4 byte a byte no produce un MP4 válido. D3 **no
+> produce** vídeo reconstruido, MP4 final ni grabación completa. El export final
+> `.mp4` sigue **no implementado**, exactamente como dice la fila de arriba.
+>
+> Alcance y evidencia en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §5.
+
+> **`POST-SALVAGE NETWORK RECOVERY` = `PASS`, gate independiente del anterior.**
+> El 2026-08-24, sobre la misma sesión y el mismo APK, se restauró la
+> conectividad después del salvage y la sesión convergió con normalidad: mismo
+> `localSessionId`, 1 `POST /sessions` efectivo, 12/12 chunks con 12
+> `remote_reference` únicas, `missing []`, `/complete` posterior al 12/12,
+> `GC_CLEANUP_AUTHORIZED` con `http_200`, cleanup, y `GC_QUEUE` sin la sesión —
+> con el export SAF **intacto**, 13/13 por `sha256`.
+>
+> Autoriza una sola afirmación nueva: **D3 es aditivo** —el salvage local no
+> impide el registro, la subida, la completion ni el cleanup normales
+> posteriores de la misma sesión—. **No** es el mismo gate que el
+> `HARDWARE FUNCTIONAL PASS` de arriba y no debe fundirse con él: aquél probó
+> que el salvage funciona, éste que no estorba. **No** reproduce el escenario de
+> `GC-AUTH-SESSION-RECOVERY-001`, que sigue `OPEN`. Detalle en
+> [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §5.
+
+> **`GC-SEGMENT-CONTINUITY-001` = `OBSERVATION / INVESTIGATION OPEN`.** De esa
+> misma corrida salió una observación temporal —`capture_ms` 72,551 s frente a
+> 66,765 s de suma `ffprobe` de los 12 segmentos, 5,786 s de diferencia— que
+> **no es un defecto confirmado ni un release blocker**, no tiene causa
+> atribuida y no afirma pérdida de evidencia. Deliberadamente **no** figura en
+> la tabla de findings de este documento. Registro único en
+> [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §5.
 
 > **Criterio de incompatibilidad.** Cualquier propuesta de «vídeo post-stop»
 > —fragmentar y encolar **después** de detener la captura— es **incompatible
@@ -110,14 +210,99 @@ Demostrado **sólo por pruebas automáticas**, pendiente de hardware:
 * un reap diferido exitoso retira `GC_QUEUE` y vuelve a solicitar cleanup con
   motivo `finalized`.
 
+## Findings abiertos de identidad, destino y herramientas
+
+Ocho findings registrados entre el 20/08 y el 24/08. **Ninguno está CLOSED
+salvo donde se indica explícitamente.** Los estados de §1–§6 son los de
+[`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md). `GC-START-LATENCY-001` **ya tiene
+registro propio** desde el 24/08 —§6—; sólo `GC-DEST-STATUS-001` sigue
+proviniendo de una ficha de evidencia congelada fuera del repositorio.
+
+### Vocabulario de estado
+
+| Etiqueta | Significa |
+|---|---|
+| `FIXED IN CODE` | La corrección está en la rama y cubierta por pruebas. **No** dice nada sobre dispositivo |
+| `CLOSED IN HARDWARE` | Reproducido y verificado corregido en dispositivo, con evidencia fechada |
+| `HARDWARE REVALIDATION REQUIRED` | Corregido en código; la corrida física que lo cerraría no se ha completado |
+| `HARDWARE REVALIDATED` | Una corrección ya implementada ha sido **reejecutada y revalidada con éxito en dispositivo real**, con evidencia fechada. Se escribe junto a `FIXED IN CODE`, no en su lugar |
+| `OPEN` | Observado y caracterizado. **Sin corregir** |
+
+> **`HARDWARE REVALIDATED` no es `CLOSED IN HARDWARE`.** En el segundo, el
+> dispositivo **reprodujo** el fallo y luego verificó su corrección: el ciclo
+> completo ocurrió allí. En el primero, el fallo se había caracterizado antes y
+> lo que el dispositivo acredita es que la corrección **funciona**. Es una
+> acreditación más débil en origen, no en rigor, y por eso el estado conserva
+> `FIXED IN CODE` delante. Ninguna etiqueta histórica se renombra por esto.
+
+### Tabla
+
+| Finding | Estado | Corregido en | Alcance de la validación |
+|---|---|---|---|
+| **GC-AUTH-MIGRATION-001** | **CLOSED IN HARDWARE** | `3f14063` | Único cierre en hardware del bloque. OnePlus A6000, 21/08, desde `pm clear`: la sonda selló el veredicto negativo en disco antes de que existiera un byte de captura |
+| **GC-DEV-RESET-001** | RELEASE BLOCKER · `FIXED IN CODE` / revalidación hardware **no requerida** | `e289dcb` | El defecto es de política de borrado, demostrable en pruebas. 62 tests en `devResetGuard.test.ts` |
+| **GC-DEST-PAUSE-001** | `FIXED IN CODE` / **`HARDWARE REVALIDATED`** | `3fae4f6` | Revalidado el 24/08 como **cross-build durable-state recovery validation**: la pausa la escribió el build `34412a0`-era y la retiró producto `22a9b26`. Reconexión real por OAuth → pausa retirada → 10/10 chunks con referencias remotas distintas → `/complete` → cleanup, en ese orden. Identidad estable (`08c0875e`). La corrida del 21/08 había quedado **anulada** por GC-DEV-RESET-001. Detalle en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §3 |
+| **GC-AUTH-001** | `FIXED IN CODE` · ruta de identidad **PASS en hardware** · flujo extremo a extremo **no alcanzado** | `ad8756b`…`8615ba6`, integrados en `e215e5c` | La Vía 2 del 21/08 dio `Identity PASS` y `Registration PASS`, pero `Upload BLOCKED`, `Completion NOT REACHED` y `Cleanup NOT EXECUTED`. **No es un cierre** |
+| **GC-AUTH-SESSION-RECOVERY-001** | **`OPEN`** · prevención **validada en banco** · **evidencia incidental en hardware** · **validación dirigida en dispositivo PENDIENTE**; supervivencia (D3) **`HARDWARE FUNCTIONAL PASS`** | D0 `02551a1`+`34412a0` · D2-B `08e3cd2` · D2-C `22a9b26` · D3 `cb59c7e` | Tras una ventana offline prolongada la sesión de Supabase desaparecía y 87 chunks quedaron sin poder subirse (22/08). **D2-B** (upgrade a 2.112.3) corrige la destrucción ante `500` / `502` / `525-529` y añade proactive-preserve y un cooldown de 60 s. **D2-C** clasifica `429` en el refresh como reintentable; todo lo demás hace pass-through fail-closed. **D3** es de otra naturaleza: no previene nada, da **salida local** a la evidencia de vídeo nativo segmentado que ya quedó varada. Validado en hardware el 24/08 (OnePlus A6000, modo avión, 12/12 segmentos, `status: complete`). **Ninguna de las tres cierra el finding**: la identidad sigue sin recuperarse, la subida sigue sin reanudarse y el ownership sigue sin restaurarse. Detalle en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §5 |
+| **GC-START-LATENCY-001** | `FIXED IN CODE` / **`HARDWARE VALIDATED`** | producto `e643b01` · guardas de test `3c10994` | `startRecording` esperaba a `getOwnershipAccessToken()` antes de abrir la grabadora, y esa ruta de auth **no lleva timeout en ninguna capa**. La lectura se movió dentro de `sessionCreatePromise`, que no se espera antes del productor. Validado en hardware el 24/08 en dos escenarios: **remoto vivo** — 531 ms tap→productor, 163 ms de lógica propia, 28/29 fragmentos confirmados **antes** de PARAR — y **token caducado + modo avión** — 243 ms tap→productor, 102 ms de lógica propia, con auth resolviendo **10,72 s después** de que el productor ya grababa. **auth no se volvió rápida: dejó de bloquear START.** Recuperación tras restaurar red: mismo `localSessionId`, 1 `POST /sessions`, 77/77 confirmados, cleanup posterior a `http_200`. Detalle en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §6 |
+| **GC-DEST-STATUS-001** | **`OPEN`** · defecto de **backend** | — | Ningún camino de código escribe `revoked` ni `error`. Un destino Drive con refresh token revocado sigue reportándose `connected`. Ver [`API_SPEC.md`](./API_SPEC.md#estado-de-los-destinos--defecto-abierto) |
+| **GC-AUTH-RETRY-CLASSIFICATION-001** | **causa suficiente demostrada** · relación causal con el 22/08 **no probada** | banco `9d682bc` · D2-B `08e3cd2` · D2-C `22a9b26` | Dejó de ser estático: el banco reproduce de forma determinista que un `429` / `500` en el refresh destruye una credencial **intacta** (`refresh_present: true`). Corregido para `500` por D2-B y para `429` por D2-C. **Sigue sin demostrarse** que el incidente del 22/08 fuera uno de esos dos: la respuesta nunca se capturó |
+
+### Consecuencia sobre el veredicto
+
+`GC-DEV-RESET-001` es **release blocker** por derecho propio: así lo declara
+[`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §4. `GC-DEST-PAUSE-001` **no** lleva esa
+etiqueta en §3 y este documento no se la añade; su revalidación física, que el
+21/08 había quedado anulada, **se completó el 24/08**.
+`GC-AUTH-SESSION-RECOVERY-001`
+es el más grave de los abiertos: reproduce el modo de fallo que da nombre a
+`GC-AUTH-001` —evidencia que no puede salir del dispositivo— por una causa
+distinta y todavía sin corregir.
+
+Desde el 2026-08-24 ese modo de fallo tiene una **salida parcial**, no una
+corrección: D3 permite sacar del sandbox los segmentos MP4 de una captura de
+vídeo nativo segmentado varada. La evidencia puede llegar a manos del usuario;
+**no puede llegar a la nube**, y la identidad sigue sin recuperarse. El finding
+continúa `OPEN` y sigue siendo el más grave del bloque.
+
+### Dónde vive la evidencia
+
+`GC-AUTH-SESSION-RECOVERY-001` y `GC-AUTH-RETRY-CLASSIFICATION-001` **ya
+tienen registro en el repositorio**: [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §5,
+escrito al cerrar D2-B y D2-C.
+
+`GC-START-LATENCY-001` **dejó de ser una ficha externa el 2026-08-24**: su
+registro completo, con la evidencia de las dos corridas de hardware, vive en
+[`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §6.
+
+La ficha de `GC-DEST-STATUS-001` sigue **fuera del repositorio**, en el archivo
+de evidencia congelada. No hay ningún documento en `docs/` que la contenga. Esa
+asimetría es deuda documental conocida, no un descuido de este documento.
+
+---
+
 ### Validación automática actual
+
+Ejecutada el 2026-08-26 sobre el árbol posterior a `fc9a20e`.
 
 | Comprobación | Resultado |
 |---|---|
-| Suite completa | **360/360** |
-| Typecheck | **12 errores TypeScript históricos, cero nuevos** |
-| `:gc-segmented-recorder:compileDebugKotlin` | **BUILD SUCCESSFUL** |
+| Suite completa | **936/936**, en **42 ficheros** |
+| Typecheck | **12 errores TypeScript históricos, cero nuevos** — typecheck **NO** verde |
 | `git diff --check` | Limpio |
+
+> Cortes anteriores: **360/360** el 20/08, **781/781 en 40 ficheros** el 23/08
+> sobre `34412a0` y **792/792 en 41 ficheros** el 24/08 tras `3c10994`. El
+> fichero 41 es `startLatencyDecoupling.test.ts`, que aportó 11 tests entre
+> `e643b01` y `3c10994`. El fichero 42 es `localAssembly.test.ts`, que aportó
+> los 108 tests de D3 en `cb59c7e`. Del resto de incrementos históricos **no hay
+> recuento acreditado**, y este documento no se los atribuye a ningún cambio
+> concreto.
+
+> **`:gc-segmented-recorder:compileDebugKotlin` no se ha reejecutado.** Su
+> `BUILD SUCCESSFUL` es del 20/08 y ningún commit posterior toca el módulo
+> Kotlin; aun así, este documento no lo declara como resultado actual porque no
+> se ha vuelto a compilar.
 
 ### Estado del gate
 
@@ -302,20 +487,43 @@ That validation covers a single device — OnePlus A6000 / Android 11 / API 30 /
 multi-device coverage and the scheduler's artificial failure paths are **not**
 declared physically validated.
 
-## Product status
+## Product status — HISTÓRICO / SUPERSEDED
 
-The system is no longer a prototype.
+> **HISTÓRICO / SUPERSEDED — NO representa el veredicto actual.**
+>
+> Este apartado es el veredicto de una baseline anterior, previo a la auditoría
+> del 2026-07-28. Se conserva como registro; **contradice** la cabecera de este
+> mismo documento, y en ese conflicto **gana la cabecera**.
+>
+> El veredicto vigente es `NO APTO PARA RELEASE`, y el estado por capacidad se
+> lee en [Capacidades por nivel](#capacidades-por-nivel-referencia-canónica) y
+> en [Findings abiertos](#findings-abiertos-de-identidad-destino-y-herramientas).
 
-The historical audio/legacy MVP path has been validated under:
+Lo que aquella baseline afirmaba, en sus propios términos:
 
-* app kill
-* network loss
-* background execution
-* recovery after restart
+> The system is no longer a prototype.
+>
+> The historical audio/legacy MVP path has been validated under:
+>
+> * app kill
+> * network loss
+> * background execution
+> * recovery after restart
+>
+> This confirms:
+>
+> > Guardian Cloud fulfills its core promise: evidence survival under real conditions
 
-This confirms:
+**Por qué no se sostiene hoy.** La auditoría del 2026-07-28 retiró
+explícitamente esas tres afirmaciones —«validado bajo kill, pérdida de red,
+background y reinicio», «el sistema ya no es un prototipo» y «cumple su promesa
+central»— por no tener ni un registro de prueba detrás.
 
-> Guardian Cloud fulfills its core promise: evidence survival under real conditions
+Y hay una razón vigente, no sólo histórica: **`GC-AUTH-SESSION-RECOVERY-001`
+sigue `OPEN`.** El 2026-08-22, en hardware, un dispositivo con 87 chunks de
+evidencia sin subir perdió su sesión de Supabase y la evidencia quedó sin poder
+salir del dispositivo. Mientras ese defecto siga abierto, este repositorio **no
+afirma** que Guardian Cloud cumpla su promesa central de forma general.
 
 ---
 

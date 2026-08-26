@@ -16,7 +16,7 @@
  */
 
 import { env } from '@/config/env';
-import { getFreshAccessToken } from '@/auth/store';
+import { getAccessToken, getOwnershipToken } from '@/auth/store';
 
 export interface ApiErrorBody {
   error?: { code?: string; message?: string };
@@ -41,6 +41,17 @@ export interface ApiFetchInit {
   body?: unknown;
   /** Set to false for endpoints that don't need auth (e.g. /health). */
   auth?: boolean;
+  /**
+   * R5 — set on every endpoint that CREATES OR MUTATES remote state owned
+   * by this user. The token then comes from `getOwnershipToken`, which
+   * refuses to hand one out until `gc.identity.v1` is durable.
+   *
+   * Reads leave this off: listing destinations or fetching chunk state
+   * creates nothing to own. Getting this wrong on a new mutating endpoint
+   * is the one way to slip past the gate, so the rule is simple — if the
+   * server keeps anything afterwards, set it.
+   */
+  ownership?: boolean;
   /** Per-call timeout in ms. Default 10s. */
   timeoutMs?: number;
   /** Optional AbortSignal wired in from a caller (e.g. a screen unmount). */
@@ -51,7 +62,14 @@ export async function apiFetch<T = unknown>(
   path: string,
   init: ApiFetchInit = {},
 ): Promise<T> {
-  const { method = 'GET', body, auth = true, timeoutMs = 10_000, signal } = init;
+  const {
+    method = 'GET',
+    body,
+    auth = true,
+    ownership = false,
+    timeoutMs = 10_000,
+    signal,
+  } = init;
 
   const headers: Record<string, string> = {
     Accept: 'application/json',
@@ -67,12 +85,35 @@ export async function apiFetch<T = unknown>(
     // when the persisted token has expired (the store snapshot can
     // be stale after a background window where the auto-refresh
     // timer didn't fire on time).
-    const token = await getFreshAccessToken();
-    if (!token) {
-      console.log('AUTH MISSING', { path });
+    const result = ownership
+      ? await getOwnershipToken()
+      : await getAccessToken();
+    if (!result.ok) {
+      // GC-AUTH-001: `reason` is the whole point of this line. Without it
+      // a lost network packet and a server-revoked session produce the
+      // same log, and a device flooding thousands of these tells you
+      // nothing about which. `name` is a class name, never a message.
+      console.log('AUTH MISSING', {
+        path,
+        reason: result.reason,
+        name: result.name,
+      });
+      // R5 — a refused OWNERSHIP token is not a missing session. The user
+      // is signed in; the device just cannot yet prove locally that this
+      // identity exists, which is transient and self-healing. Give it a
+      // distinct code so a screen can say "one moment" instead of
+      // "you need to sign in", which would be false and alarming.
+      if (result.reason === 'marker_not_durable') {
+        throw new ApiError(
+          401,
+          'IDENTITY_NOT_READY',
+          'Identity not durably recorded yet',
+          null,
+        );
+      }
       throw new ApiError(401, 'NO_TOKEN', 'No access token in store', null);
     }
-    headers.Authorization = `Bearer ${token}`;
+    headers.Authorization = `Bearer ${result.token}`;
   }
 
   // Compose the abort signal: our own timeout + any caller signal.

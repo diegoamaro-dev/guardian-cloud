@@ -38,6 +38,11 @@ export interface AdoptableChunk {
   status: 'pending';
   attempts: number;
   local_uri: string;
+  /**
+   * G3' — medium of this chunk's bytes. This adopter only ever emits
+   * native segmented video, so the value is a literal, not a parameter.
+   */
+  media: 'video';
 }
 
 /** Destino de encolado. Se inyecta; nunca se resuelve por variable global. */
@@ -354,6 +359,9 @@ async function enqueue(
     status: 'pending',
     attempts: 0,
     local_uri: stableUri,
+    // G3' — reached only from the native segmented adoption path, so the
+    // medium is known statically. Literal, never derived.
+    media: 'video',
   };
   await queue.appendChunk(ev.sessionId, chunk, null, ev.segmentIndex + 1);
 }

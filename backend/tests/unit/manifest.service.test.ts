@@ -38,6 +38,9 @@ function mkChunk(overrides: Partial<ChunkRow>): ChunkRow {
     size: 16384,
     status: 'uploaded',
     remote_reference: 'drive-file-id-0',
+    // G3'' — v2 requires a declared medium per chunk. The default keeps
+    // these fixtures describing the homogeneous sessions they always did.
+    media: 'audio',
     created_at: '2026-05-14T10:00:01.000Z',
     updated_at: '2026-05-14T10:00:02.000Z',
     ...overrides,
@@ -61,16 +64,15 @@ describe('chunkFileName', () => {
 });
 
 describe('buildManifest', () => {
-  it('emits the v1 schema and core session metadata', () => {
+  it('emits the v2 schema and core session metadata', () => {
     const manifest: SessionManifest = buildManifest(
       { id: SESSION_ID, mode: 'audio', created_at: CREATED_AT },
       COMPLETED_AT,
       [mkChunk({ chunk_index: 0 })],
     );
 
-    expect(manifest.schema).toBe('guardian-cloud.manifest.v1');
+    expect(manifest.schema).toBe('guardian-cloud.manifest.v2');
     expect(manifest.session_id).toBe(SESSION_ID);
-    expect(manifest.mode).toBe('audio');
     expect(manifest.destination_type).toBe('drive');
     expect(manifest.created_at).toBe(CREATED_AT);
     expect(manifest.completed_at).toBe(COMPLETED_AT);
@@ -149,22 +151,47 @@ describe('buildManifest', () => {
     );
   });
 
-  it('omits format for audio sessions', () => {
-    const manifest = buildManifest(
-      { id: SESSION_ID, mode: 'audio', created_at: CREATED_AT },
-      COMPLETED_AT,
-      [mkChunk({ chunk_index: 0 })],
-    );
-    expect(manifest.format).toBeUndefined();
+  // ---- G3'' — v2 states the medium per chunk, never per session -------
+  //
+  // The two tests these replace pinned `format`, which v1 derived from
+  // `session.mode`. Both are gone from v2 on purpose: a session-level
+  // medium cannot describe a session that holds more than one, and
+  // `format` had no reader anywhere in the system.
+
+  it("v2 carries NO session-level mode, whatever the session declares", () => {
+    for (const mode of ['audio', 'video'] as const) {
+      const manifest = buildManifest(
+        { id: SESSION_ID, mode, created_at: CREATED_AT },
+        COMPLETED_AT,
+        [mkChunk({ chunk_index: 0 })],
+      );
+      expect((manifest as Record<string, unknown>).mode).toBeUndefined();
+      expect((manifest as Record<string, unknown>).format).toBeUndefined();
+    }
   });
 
-  it("sets format='mp4' for video sessions", () => {
+  it('v2 states the medium of each chunk, taken from the chunk row', () => {
     const manifest = buildManifest(
       { id: SESSION_ID, mode: 'video', created_at: CREATED_AT },
       COMPLETED_AT,
-      [mkChunk({ chunk_index: 0 })],
+      [
+        mkChunk({ chunk_index: 0, media: 'video' }),
+        mkChunk({ chunk_index: 1, media: 'audio' }),
+      ],
     );
-    expect(manifest.format).toBe('mp4');
+    expect(manifest.chunks.map((c) => c.media)).toEqual(['video', 'audio']);
+  });
+
+  it('★ REFUSES to build when a chunk has no declared medium', () => {
+    // The rule that keeps `session.mode` out of the document. Guessing
+    // here would put the session-level claim back, one chunk at a time.
+    expect(() =>
+      buildManifest(
+        { id: SESSION_ID, mode: 'video', created_at: CREATED_AT },
+        COMPLETED_AT,
+        [mkChunk({ chunk_index: 0, media: null })],
+      ),
+    ).toThrow(/medium not declared/);
   });
 
   it('returns an empty chunks array and chunk_count=0 when no chunks qualify', () => {
@@ -195,6 +222,7 @@ describe('buildManifest', () => {
       'chunk_index',
       'file_name',
       'hash',
+      'media',
       'size',
     ]);
     expect(JSON.stringify(manifest)).not.toContain('drive-file-id-secret');

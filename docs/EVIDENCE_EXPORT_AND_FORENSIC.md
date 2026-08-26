@@ -64,6 +64,34 @@ Límites que condicionan cualquier afirmación forense futura:
   verificables, pero no hay reconstrucción utilizable como pieza única;
 - **el cifrado local no está implementado**.
 
+> **Salvage local de segmentos (D3), desde el 2026-08-24.** Existe una salida
+> local para el vídeo nativo segmentado que quedó sin poder subir: copia los
+> **segmentos MP4 originales** del sandbox a una carpeta elegida por el usuario,
+> con `sha256` verificado en destino y un manifest releído y validado.
+> `HARDWARE FUNCTIONAL PASS` en OnePlus A6000 el 24/08.
+>
+> **No cambia el límite de arriba.** Los segmentos son piezas independientes, no
+> una reconstrucción: el export final `.mp4` sigue sin existir. Forense y
+> pericialmente, lo que D3 entrega es **un conjunto de MP4 con su manifest de
+> integridad**, no una grabación única, y así debe describirse. D3 tampoco toca
+> la ruta de audio/legacy, que ya tenía su propia salida local por
+> `findLocalRecordingUri` y **no ha sido modificada**.
+>
+> Alcance y evidencia en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §5.
+
+> **Las dos copias coexisten, y conviene saberlo antes de peritar.** Un segundo
+> gate del 2026-08-24 —`POST-SALVAGE NETWORK RECOVERY`, `PASS`— demostró en
+> hardware que, si la conectividad vuelve después del salvage, la misma sesión
+> se registra, sube sus fragmentos y completa con normalidad. Al terminar
+> conviven **dos artefactos independientes**: la evidencia remota subida por el
+> pipeline, y el export SAF en poder del usuario. El cleanup borró las fuentes
+> del sandbox **sin tocar** el export SAF, que es almacenamiento distinto y cae
+> fuera del journal de limpieza.
+>
+> Para un peritaje eso significa que ambos deben poder cotejarse, y que **el
+> export SAF no es una copia derivada de lo subido**: son los mismos bytes de
+> origen, verificados por `sha256` por dos caminos distintos.
+
 `GC-AUD-001` —el vídeo no subía durante la captura— **ya no es un límite
 vigente**: la ruta nativa segmentada sube durante la grabación y quedó
 demostrado en hardware el 20/08. Ver la

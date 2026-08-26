@@ -42,12 +42,26 @@ Tecnologías reales (MVP actual):
   entries `PendingQueueEntry` (sesión + chunks + status). Lectura/escritura
   serializada con un `writeChain` para evitar carreras.
 - expo-file-system para los archivos de grabación y los chunks en disco
-- expo-av para audio
+- **expo-audio** para el motor de grabación de audio. La única importación
+  está en `mobile/src/audio/audioEngine.ts`, que aísla la librería del resto
+  de la app; ningún consumidor la importa directamente. Su configuración
+  replica 1:1 la de expo-av anterior (mono / 64 kbps)
 - módulo nativo Android `gc-segmented-recorder` para vídeo segmentado;
   expo-camera permanece como fallback y ambos productores son mutuamente
   excluyentes
 - react-native-background-actions para el foreground service Android
   (notificación persistente "Guardian Cloud está protegiendo tu evidencia")
+
+> **expo-av ya NO es el motor de audio.** Sigue declarado como dependencia
+> (`~16.0.8`) y lo importan únicamente las dos rutas de diagnóstico
+> `app/debug-camera-probe/`. Retirar ambas y la dependencia está registrado
+> como deuda en [`KNOWN_DEBT.md`](./KNOWN_DEBT.md) y como `F-15` en el plan de
+> remediación; sin ejecutar.
+>
+> La limitación de `Audio.Recording` huérfano descrita en
+> [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §1 **sigue siendo contexto
+> obligatorio**: documenta el motor histórico y el porqué de varias guardas
+> vigentes. La migración no la anula.
 
 > SQLite NO se usa. Se evaluó al inicio y se descartó: AsyncStorage cubre
 > el volumen real (chunks por sesión cuentan en decenas o cientos, no
@@ -106,12 +120,40 @@ Destinos futuros (NO en MVP):
 5. los chunks de audio se encolan y los segmentos nativos se adoptan; ambos se
    suben al destino durante la captura
 6. se actualiza estado en backend
-7. al cerrar se completa la sesión
+7. **al cerrarse el productor** la sesión queda marcada como cerrada, y se
+   completa en cuanto toda su evidencia está confirmada fuera del dispositivo
 
 > **El paso 4 no se ejecuta hoy.** El cifrado local está previsto en el diseño
 > —ver `MVP_SCOPE.md` y `SECURITY.md`— pero **no está implementado**: en el
 > código sólo existe un `TODO`. En `v0.3.0-rc.1` los chunks se encolan y se
 > suben **sin cifrado en el cliente**. El transporte sí va sobre TLS.
+
+> **Dirección aprobada · NO implementada — Continuous Protection.** El paso 7
+> describe el sistema **vigente**, en el que cerrar el productor cierra la
+> sesión. El contrato aprobado el 2026-08-25 separa ambas cosas: la unidad
+> lógica pasa a ser la **Protection Session**, los productores de vídeo y audio
+> son fases dentro de ella, y `producer closed ≠ Protection Session closed`.
+> Bajo ese contrato sólo la acción explícita PARAR termina una sesión, y
+> `/complete` corresponde a esa terminalidad, no al cierre de un productor.
+>
+> **Qué hay construido a fecha de `6c6489c`, y qué no:**
+>
+> * **lectura de terminalidad — PARCIALMENTE IMPLEMENTADA.** La decisión de
+>   avanzar hacia `/complete` ya no consulta `recording_closed` directamente:
+>   pasa por una autoridad de compatibilidad que lee la metadata durable
+>   `evidence_closed` y delega en `recording_closed` cuando está ausente. Es
+>   sólo esa decisión; el transporte, la selección de chunks, el reap y el
+>   cleanup siguen sin depender de la metadata nueva, y otros lectores de
+>   `recording_closed` conservan sus propias semánticas.
+> * **escritura desacoplada — NO IMPLEMENTADA.** Todo escritor sigue
+>   produciendo ambos valores iguales, así que ninguna sesión queda con el
+>   productor cerrado y la sesión abierta.
+> * **`VIDEO_AUDIO → AUDIO_ONLY` — NO IMPLEMENTADO.**
+>
+> El paso 7 sigue describiendo el comportamiento vigente sin excepción:
+> minimizar durante vídeo cierra la sesión igual que antes. Decide
+> [`decisions/ADR-CONTINUOUS-PROTECTION.md`](./decisions/ADR-CONTINUOUS-PROTECTION.md);
+> el estado por capacidad, [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md).
 
 En vídeo, el productor nativo genera segmentos MP4 H.264/AAC independientes.
 La validación física del 13/08 comprobó su reproducción individual, adopción,
@@ -201,6 +243,13 @@ parte del export validado**. Ya existen segmentos MP4 nativos independientes,
 pero la evidencia disponible no demuestra recovery completo de vídeo ni la
 generación de un export final `.mp4`.
 
+> Desde el 2026-08-24 el vídeo nativo segmentado sí tiene **salvage local
+> validado en hardware** (D3 `LOCAL SEGMENT SALVAGE`): entrega los **MP4
+> originales más un manifest de integridad**. **No** produce una grabación
+> `.mp4` única reconstruida y **no** equivale al export final de vídeo, que
+> sigue sin implementar. La afirmación de arriba —el export reconstruido y
+> usable validado sigue siendo audio `.m4a`— no cambia.
+
 ---
 
 ### Nivel 2 — Forensic Reconstruction (futuro)
@@ -216,6 +265,16 @@ Archivo `manifest.json` asociado a cada sesión:
 * hash
 * tamaño
 * metadata básica (modo, formato)
+
+> **Dirección aprobada · NO implementada.** Hoy el modo es un atributo **de
+> sesión**: toda la evidencia de una sesión se describe con un único tipo. El
+> contrato de Continuous Protection exige que el tipo y la fase puedan
+> describirse **por unidad de evidencia** y nunca inferirse de un modo global, y
+> **prohíbe** que el manifiesto o el backend describan evidencia mixta como si
+> fuera exclusivamente vídeo. Es condición **bloqueante**: hasta que el contrato
+> de sesión admita fases, no puede producirse evidencia mixta. El cambio
+> correspondiente en el backend requiere gate propio y no está hecho. Ver
+> [`decisions/ADR-CONTINUOUS-PROTECTION.md`](./decisions/ADR-CONTINUOUS-PROTECTION.md) §7.
 
 #### Chunks
 

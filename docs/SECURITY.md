@@ -93,14 +93,30 @@ No protege completamente contra:
 
 ### Endpoints sensibles
 
+Superficie real, verificada contra `backend/src/app.ts` y los routers. Todos
+exigen `authMiddleware`:
+
 - /sessions
 - /chunks
-- /alerts
+- /destinations
+- /recovery
 
 Deben:
 - validar usuario
 - validar estructura
 - rechazar datos inválidos
+
+> `/alerts` **no existe**: no hay router, no está montado, no hay migración de
+> tabla y el cliente no lo llama. Este documento lo listaba como endpoint
+> sensible actual, lo que era falso. Cuando el modo Kids se implemente
+> —**post-MVP**, ver §11 y [`MVP_SCOPE.md`](./MVP_SCOPE.md)— sus endpoints
+> entrarán en esta lista con las mismas reglas. Inventario vigente en
+> [`API_SPEC.md`](./API_SPEC.md#inventario-real-de-endpoints).
+>
+> Queda una referencia a `/alerts` en un comentario de
+> `backend/src/middleware/auth.ts:9`. Es código y no se corrige aquí.
+
+`/health` es público a propósito y no expone estado de usuario.
 
 ---
 
@@ -242,7 +258,11 @@ Datos en destino:
 
 ---
 
-## 11. Modo Kids
+## 11. Modo Kids — DISEÑO FUTURO, no implementado
+
+`MVP_SCOPE.md` lo sitúa explícitamente en **«No entra en el MVP»**. No existe
+ningún endpoint, tabla ni pantalla de este modo. Estas reglas son requisitos de
+diseño para cuando se construya, no controles vigentes:
 
 - validar relación padre-hijo
 - no permitir acceso cruzado

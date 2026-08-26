@@ -58,6 +58,16 @@ import {
   findLocalRecordingUri,
   findLocalExpectedChunkCount,
 } from '@/recording/localEvidence';
+// D3 · GC-AUTH-SESSION-RECOVERY-001 — the offline exit for native
+// segmented video, whose queue entry carries `uri: ''` and is therefore
+// invisible to `findLocalRecordingUri`. All logic lives in the module;
+// this screen only wires and renders.
+import {
+  planLocalSegmentExport,
+  exportLocalSegments,
+  type LocalSegmentPlan,
+  type LocalSegmentExportResult,
+} from '@/recording/localAssembly';
 
 // Single-flight lock for `Sharing.shareAsync`. Native iOS/Android
 // rejects a second share request while one is mid-flight with
@@ -322,6 +332,9 @@ type Phase =
   | { kind: 'running'; progress: ExportProgress | null }
   | { kind: 'localExport' }
   | { kind: 'localFallback'; filePath: string }
+  // D3 — the salvage of ORIGINAL MP4 segments. Not a reconstructed
+  // video, not a final `.mp4`; final `.mp4` export stays unimplemented.
+  | { kind: 'localSegments'; result: LocalSegmentExportResult }
   | { kind: 'done'; result: ExportResult }
   | { kind: 'error'; message: string };
 
@@ -572,6 +585,26 @@ export default function SessionDetailScreen() {
     };
   }, [sessionId, phase.kind === 'done']);
 
+  // D3 — the same lookup for the native segmented branch, which stores
+  // its bytes per chunk under `local_uri` instead of one recording file.
+  // Read-only and network-free; a rejection (capture still running, no
+  // entry) simply leaves the plan null and the local route unoffered.
+  const [localSegmentPlan, setLocalSegmentPlan] =
+    useState<LocalSegmentPlan | null>(null);
+  useEffect(() => {
+    if (!sessionId) return;
+    let cancelled = false;
+    (async () => {
+      const p = await planLocalSegmentExport(sessionId);
+      if (!cancelled) {
+        setLocalSegmentPlan('rejected' in p || p.status === 'failed' ? null : p);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId, phase.kind === 'done']);
+
   // Independent local emitted-chunk-count lookup. Same persistence
   // source as the URI lookup, same lifetime guarantees. Drives the
   // integrity recompute in ResultBlock so backend's partial chunk list
@@ -763,7 +796,7 @@ export default function SessionDetailScreen() {
   // the button permanently disabled — exactly the bug being fixed.
   const canExportCloud =
     statusSummary !== null && statusSummary.uploaded > 0;
-  const canExportLocal = localRecordingUri !== null;
+  const canExportLocal = localRecordingUri !== null || localSegmentPlan !== null;
   const exportDisabled =
     phase.kind === 'running' ||
     sessionId.length === 0 ||
@@ -807,23 +840,67 @@ export default function SessionDetailScreen() {
     if (!sessionId) return;
     let cancelled = false;
 
-    async function handleDone(result: ExportResult): Promise<void> {
-      if (result.status === 'failed' && result.validChunks === 0) {
-        setPhase({ kind: 'localExport' });
+    /**
+     * The local route after a cloud attempt.
+     *
+     * Gated on `status === 'failed'` ALONE. It used to also require
+     * `validChunks === 0`, which meant a session that downloaded a few
+     * chunks and then failed — an expired token part-way through, say —
+     * was left with no exit at all: cloud could not finish it and D3 was
+     * never offered. Partial cloud progress is not a reason to withhold
+     * the only remaining way to get the evidence off the device.
+     *
+     * Wrapped end to end: nothing here may leave the screen sitting on
+     * "Preparando…". Any throw becomes a visible error.
+     */
+    async function tryLocalAfterCloud(result: ExportResult): Promise<boolean> {
+      setPhase({ kind: 'localExport' });
+      try {
         const localUri =
           localRecordingUriRef.current ??
           (await findLocalRecordingUri(sessionId));
-        if (cancelled) return;
+        if (cancelled) return true;
         if (localUri) {
-          console.log('LOCAL EXPORT fallback used', {
-            sessionId,
-            localUri,
-          });
+          console.log('LOCAL EXPORT fallback used', { sessionId, localUri });
           setPhase({ kind: 'localFallback', filePath: localUri });
-          return;
+          return true;
         }
-        // No local file available either — fall through to the
-        // existing failed UI which renders the cloud result.
+        // D3 — no single recording file, so this may be native segmented
+        // video. Salvage its ORIGINAL segments.
+        const segPlan = await planLocalSegmentExport(sessionId);
+        if (cancelled) return true;
+        if (!('rejected' in segPlan) && segPlan.status !== 'failed') {
+          const segResult = await exportLocalSegments(segPlan);
+          if (cancelled) return true;
+          console.log('LOCAL SEGMENT SALVAGE (cloud failed)', {
+            sessionId,
+            status: segResult.status,
+            written: segResult.written_indexes.length,
+            manifest: segResult.manifest_written,
+          });
+          setPhase({ kind: 'localSegments', result: segResult });
+          return true;
+        }
+        // Nothing salvageable — let the caller render the cloud result.
+        if (cancelled) return true;
+        setPhase({ kind: 'done', result });
+        return true;
+      } catch (err) {
+        console.log('LOCAL fallback threw', err);
+        if (!cancelled) {
+          setPhase({
+            kind: 'error',
+            message: err instanceof Error ? err.message : 'Fallo al preparar en local',
+          });
+        }
+        return true;
+      }
+    }
+
+    async function handleDone(result: ExportResult): Promise<void> {
+      if (result.status === 'failed') {
+        await tryLocalAfterCloud(result);
+        return;
       }
       if (cancelled) return;
       setPhase({ kind: 'done', result });
@@ -846,7 +923,23 @@ export default function SessionDetailScreen() {
           setPhase({ kind: 'idle' });
           return;
         case 'error':
-          setPhase({ kind: 'error', message: status.message });
+          // A runner error is a cloud failure like any other, so the
+          // local route must be offered here too. Rendering the error
+          // straight away would strand exactly the session this feature
+          // exists for. `tryLocalAfterCloud` falls back to showing the
+          // failure itself when there is nothing to salvage.
+          void tryLocalAfterCloud({
+            status: 'failed',
+            filePath: null,
+            totalChunks: 0,
+            validChunks: 0,
+            missingIndexes: [],
+            corruptIndexes: [],
+          }).then(handled => {
+            if (!handled && !cancelled) {
+              setPhase({ kind: 'error', message: status.message });
+            }
+          });
           return;
       }
     });
@@ -867,6 +960,7 @@ export default function SessionDetailScreen() {
     // and this tap.
     if (!canExportCloud && canExportLocal) {
       setPhase({ kind: 'localExport' });
+      try {
       const verifiedUri = await findLocalRecordingUri(sessionId);
       if (verifiedUri) {
         console.log('LOCAL EXPORT direct (no cloud)', {
@@ -876,9 +970,28 @@ export default function SessionDetailScreen() {
         setPhase({ kind: 'localFallback', filePath: verifiedUri });
         return;
       }
+      // D3 — no single recording file. Native segmented video keeps its
+      // bytes per chunk, so re-plan (the queue may have moved since
+      // mount) and salvage the ORIGINAL segments into a folder the user
+      // picks. The module owns every decision; this call site only
+      // reports what it returns.
+      const replanned = await planLocalSegmentExport(sessionId);
+      if (!('rejected' in replanned) && replanned.status !== 'failed') {
+        const result = await exportLocalSegments(replanned);
+        console.log('LOCAL SEGMENT SALVAGE', {
+          sessionId,
+          status: result.status,
+          written: result.written_indexes.length,
+          manifest: result.manifest_written,
+        });
+        setPhase({ kind: 'localSegments', result });
+        return;
+      }
+
       // The file disappeared between mount and tap. Drop the local
       // hint and fall through to the failed UI.
       setLocalRecordingUri(null);
+      setLocalSegmentPlan(null);
       setPhase({
         kind: 'done',
         result: {
@@ -891,6 +1004,19 @@ export default function SessionDetailScreen() {
         },
       });
       return;
+      } catch (err) {
+        // Nothing above is allowed to leave the screen sitting on
+        // "Exportando…". The salvage module never rejects, but the
+        // lookup and the state setters are outside it, so this is the
+        // backstop: any throw becomes a visible error.
+        console.log('LOCAL EXPORT path threw', err);
+        setPhase({
+          kind: 'error',
+          message:
+            err instanceof Error ? err.message : 'Fallo al exportar en local',
+        });
+        return;
+      }
     }
 
     // Cloud-first path. Routed through the export-runner singleton
@@ -1216,6 +1342,9 @@ export default function SessionDetailScreen() {
       {phase.kind === 'localFallback' && (
         <LocalFallbackBlock filePath={phase.filePath} />
       )}
+      {phase.kind === 'localSegments' && (
+        <LocalSegmentsBlock result={phase.result} />
+      )}
       {phase.kind === 'done' && (
         <ResultBlock
           result={phase.result}
@@ -1228,18 +1357,41 @@ export default function SessionDetailScreen() {
       )}
       {phase.kind === 'error' && <ErrorBlock message={phase.message} />}
 
-      <Text
-        style={{
-          color: '#6e7681',
-          fontSize: 11,
-          marginTop: 28,
-          lineHeight: 16,
-        }}
-      >
-        Estamos recuperando los fragmentos protegidos desde tu Google
-        Drive y reconstruyendo el archivo. Si falta alguna parte, se
-        generará la versión disponible.
-      </Text>
+      {/* The cloud story is false on every local phase: nothing is being
+          fetched from Drive and nothing is being rebuilt. Showing it
+          there would describe the opposite of what is happening. */}
+      {phase.kind !== 'localExport' &&
+        phase.kind !== 'localSegments' &&
+        phase.kind !== 'localFallback' && (
+          <Text
+            style={{
+              color: '#6e7681',
+              fontSize: 11,
+              marginTop: 28,
+              lineHeight: 16,
+            }}
+          >
+            Estamos recuperando los fragmentos protegidos desde tu Google
+            Drive y reconstruyendo el archivo. Si falta alguna parte, se
+            generará la versión disponible.
+          </Text>
+        )}
+      {(phase.kind === 'localExport' ||
+        phase.kind === 'localSegments' ||
+        phase.kind === 'localFallback') && (
+        <Text
+          style={{
+            color: '#6e7681',
+            fontSize: 11,
+            marginTop: 28,
+            lineHeight: 16,
+          }}
+        >
+          Estos archivos salen de este dispositivo, no de tu Google Drive.
+          Si falta alguna parte, se copiará únicamente lo que esté
+          disponible aquí.
+        </Text>
+      )}
     </ScrollView>
   );
 }
@@ -1327,7 +1479,7 @@ function LocalExportBlock() {
     >
       <ActivityIndicator color="#c9d1d9" />
       <Text style={{ color: '#c9d1d9', marginLeft: 10, fontSize: 13 }}>
-        Exportando desde el dispositivo…
+        Preparando segmentos guardados en este dispositivo…
       </Text>
     </View>
   );
@@ -1340,6 +1492,65 @@ function LocalExportBlock() {
  * from the device (no Drive verification, no chunk concat). Shares the
  * file via `expo-sharing`, identical to the cloud success path.
  */
+/**
+ * D3 — the salvage result. Presentation only: every verdict was decided
+ * in `localAssembly.ts`, and this block may never soften one. A `failed`
+ * run is shown as failed even when some segments did land, because
+ * without a manifest the folder is not a finished export.
+ *
+ * The copy deliberately says "segments", never "vídeo reconstruido",
+ * "MP4 final" or "grabación completa": these are the original segments,
+ * not a rebuilt recording. Final `.mp4` export remains unimplemented.
+ */
+function LocalSegmentsBlock({ result }: { result: LocalSegmentExportResult }) {
+  const ok = result.manifest_written && result.status !== 'failed';
+  const partial = ok && result.status === 'partial';
+  return (
+    <View
+      style={{
+        marginTop: 4,
+        padding: 12,
+        borderWidth: 1,
+        borderColor: ok ? (partial ? '#9e6a03' : '#238636') : '#f85149',
+        borderRadius: 6,
+        backgroundColor: ok ? (partial ? '#2b1d00' : '#0a2a14') : '#2d0f0f',
+      }}
+    >
+      <Text
+        style={{
+          color: ok ? (partial ? '#e3b341' : '#56d364') : '#ff7b72',
+          fontSize: 13,
+          fontWeight: '600',
+        }}
+      >
+        {!ok
+          ? 'No se pudo completar la copia'
+          : partial
+            ? 'Fragmentos parciales copiados'
+            : 'Fragmentos copiados'}
+      </Text>
+      <Text style={{ color: '#c9d1d9', fontSize: 12, marginTop: 6 }}>
+        {!ok
+          ? 'La copia se interrumpió, así que la carpeta no está terminada. Vuelve a intentarlo.'
+          : `Se copiaron ${result.written_indexes.length} fragmentos de vídeo originales a la carpeta que elegiste.`}
+      </Text>
+      {ok && partial && (
+        <Text style={{ color: '#e3b341', fontSize: 12, marginTop: 6 }}>
+          Faltan {result.missing_indexes.length + result.corrupt_indexes.length}
+          {' '}fragmentos que ya no estaban en el dispositivo o no superaron la
+          verificación. Esto NO es la grabación completa.
+        </Text>
+      )}
+      {ok && (
+        <Text style={{ color: '#8b949e', fontSize: 11, marginTop: 8 }}>
+          Cada fragmento es un vídeo independiente y reproducible. El archivo
+          único final todavía no está disponible.
+        </Text>
+      )}
+    </View>
+  );
+}
+
 function LocalFallbackBlock({ filePath }: { filePath: string }) {
   // The local-fallback path does not carry an `ExportResult`, so the
   // extension has to be derived from the file name. The recording

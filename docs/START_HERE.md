@@ -1,14 +1,26 @@
 # Guardian Cloud — START HERE
 
-⛔ NO APTO PARA RELEASE — por cifrado local, recovery `I5c`, export `.mp4` y cobertura de dispositivos. **Ya no por `GC-AUD-001`.**
+⛔ NO APTO PARA RELEASE — por cifrado local, recovery `I5c`, export `.mp4`, cobertura de dispositivos **y findings de identidad/destino todavía no cerrados**. **Ya no por `GC-AUD-001`.**
 
 Este documento contiene referencias históricas que deben leerse con la fecha y
 el alcance de su evidencia. El estado vigente se reconstruye desde:
 
 * [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md#capacidades-por-nivel-referencia-canónica),
   referencia canónica del estado por capacidad;
+* [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) — límites y findings vigentes;
+* [`RELEASE_CHECKLIST_v0.3.md`](./RELEASE_CHECKLIST_v0.3.md) §0 — invariante de
+  migración de identidad, **bloqueante**;
 * [validación física del vídeo nativo con durable cleanup del 20/08](./audits/GUARDIAN_CLOUD_NATIVE_SEGMENTED_DURABLE_CLEANUP_VALIDATION_2026-08-20.md);
 * [validación física de la integración nativa segmentada del 13/08](./audits/GUARDIAN_CLOUD_NATIVE_SEGMENTED_INTEGRATION_VALIDATION_2026-08-13.md).
+
+> **Lee esto antes que nada.** Entre el 21/08 y el 24/08 aparecieron ocho
+> findings de identidad, destino y herramientas de desarrollo. **Uno está
+> `CLOSED IN HARDWARE`**; los demás permanecen corregidos o abiertos con
+> distintos niveles de validación, y **la tabla canónica define el estado
+> exacto de cada uno**. Todo lo que este documento
+> describe como validado el 20/08 sigue siendo cierto, pero **no cubre nada de
+> ese bloque**. La tabla completa está en
+> [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md#findings-abiertos-de-identidad-destino-y-herramientas).
 
 ### Lo que cambió el 2026-08-20
 
@@ -35,10 +47,47 @@ baseline `v0.3.0-rc.1`, no la rama actual.
 * **Rutas artificiales de fallo del scheduler:** `HARDWARE_HARDENING_PENDING`.
   No bloquean la integración de la rama; **no queda ningún gate bloqueante del
   Escenario 17**.
-* **Validación automática actual:** 360/360 tests; typecheck con los mismos 12
-  errores TypeScript históricos y cero nuevos; Kotlin
-  `:gc-segmented-recorder:compileDebugKotlin` con `BUILD SUCCESSFUL`;
-  `git diff --check` limpio.
+* **Validación automática de aquel corte:** 360/360 tests. *(Cifra histórica del
+  20/08. La vigente está más abajo.)*
+
+### Validación automática vigente (2026-08-26, tras `fc9a20e`)
+
+| Comprobación | Resultado |
+|---|---|
+| Suite completa | **936/936**, en **42 ficheros** |
+| Typecheck | **12 errores históricos, cero nuevos** — **NO** verde |
+| `git diff --check` | Limpio |
+
+La cifra vigente es la de la tabla: **936 tests en 42 ficheros**, sobre el
+árbol posterior a `fc9a20e`. Los **cortes históricos anteriores** fueron 900/900
+en 42 ficheros tras `cb59c7e` y 792/792 en 41 ficheros tras `3c10994`, y ninguno
+describe ya la suite actual. El fichero 41 era
+`startLatencyDecoupling.test.ts`, que aportó 11 tests; el fichero 42 es
+`localAssembly.test.ts`, que aporta los 108 tests de D3. **Del resto de
+incrementos históricos no hay recuento documentado**, y esta guía no se los
+atribuye a nada. `compileDebugKotlin` no se ha reejecutado desde el 20/08.
+
+> Esta línea decía «el salto de 360 a 738 son los ficheros que trajeron los
+> findings del bloque de identidad, no una ampliación de cobertura del vídeo».
+> Retirada el 2026-08-24: las dos cifras contradecían la tabla inmediatamente
+> superior y la atribución no tenía un recuento detrás.
+
+### Findings del 21/08 al 24/08
+
+| Finding | Estado |
+|---|---|
+| GC-AUTH-MIGRATION-001 | **CLOSED IN HARDWARE** — el único cerrado |
+| GC-DEV-RESET-001 | RELEASE BLOCKER · `FIXED IN CODE`, revalidación no requerida |
+| GC-DEST-PAUSE-001 | `FIXED IN CODE` / **`HARDWARE REVALIDATED`** — cross-build, 24/08 |
+| GC-AUTH-001 | `FIXED IN CODE`; identidad PASS en hardware, flujo completo **no alcanzado** |
+| GC-AUTH-SESSION-RECOVERY-001 | **`OPEN`** — prevención (D2-B, D2-C) **validada en banco · evidencia incidental en hardware · validación dirigida PENDIENTE**; supervivencia (D3, salvage local de segmentos) `HARDWARE FUNCTIONAL PASS` el 24/08. **Ninguna cierra el finding** |
+| GC-START-LATENCY-001 | `FIXED IN CODE` / **`HARDWARE VALIDATED`** — 24/08; auth dejó de bloquear el arranque, no se volvió rápida |
+| GC-DEST-STATUS-001 | **`OPEN`** — backend |
+| GC-AUTH-RETRY-CLASSIFICATION-001 | causa **suficiente** demostrada; causalidad con el 22/08 **no** probada |
+
+Detalle y alcance exacto de cada uno en
+[`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md#findings-abiertos-de-identidad-destino-y-herramientas)
+y en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §1–§6.
 
 ### Por qué sigue `NO APTO PARA RELEASE`
 
@@ -51,10 +100,23 @@ Los motivos son ahora otros, y ninguno es la captura de vídeo:
 4. **un solo dispositivo validado**: sin cobertura multi-dispositivo ni
    Android 13+;
 5. **recovery completo de vídeo** no demostrado;
-6. sin AAB de producción, Closed Testing ni usuarios externos.
+6. sin AAB de producción, Closed Testing ni usuarios externos;
+7. **`GC-DEV-RESET-001`** — corregido en código;
+8. **`GC-AUTH-SESSION-RECOVERY-001`** — abierto: la sesión de Supabase
+   desaparece tras una ventana offline prolongada y la evidencia queda sin
+   poder subirse. Desde el 24/08 el vídeo nativo segmentado tiene **salida
+   local** por D3 (`HARDWARE FUNCTIONAL PASS`), pero eso es supervivencia, no
+   corrección: la identidad no se recupera y la subida no se reanuda;
+9. **invariante de migración de identidad** — `RELEASE_CHECKLIST_v0.3.md` §0
+   prohíbe publicar `8615ba6` en un build sin `gc.legacy_probe.v1`.
 
-La validación del 20/08 no cubre ninguno de esos seis puntos y no debe leerse
+La validación del 20/08 no cubre ninguno de esos nueve puntos y no debe leerse
 como si lo hiciera.
+
+> **`GC-DEST-PAUSE-001` salió de esta lista el 2026-08-24**, al completarse su
+> revalidación en hardware. Era el punto 7. No estaba etiquetado como release
+> blocker, así que su cierre no mueve el veredicto: el sistema **sigue
+> `NO APTO PARA RELEASE`** por los nueve motivos de arriba.
 
 ### Baseline técnica histórica (2026-07-30)
 
@@ -276,9 +338,19 @@ Este proyecto puede fallar si:
 
 ---
 
-## 17. Estado actual del sistema
+## 17. Estado del sistema — HISTÓRICO / SUPERSEDED
 
-El MVP core del sistema está validado:
+> **HISTÓRICO / SUPERSEDED — no describe el estado vigente.**
+>
+> Este apartado registra lo que se afirmaba en la baseline `v0.2` / v0.3
+> temprana, **antes** de la auditoría del 2026-07-28. Aquella auditoría retiró
+> la afirmación por no tener registro de prueba detrás. Se conserva en pasado y
+> atado a su baseline; **no** debe citarse como estado actual.
+>
+> Estado vigente: la cabecera de este documento y
+> [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md#capacidades-por-nivel-referencia-canónica).
+
+En aquella baseline se declaró validado el core del MVP:
 
 * chunking en tiempo real
 * subida resiliente
@@ -286,7 +358,11 @@ El MVP core del sistema está validado:
 * subida en background
 * export de evidencia funcional
 
-El sistema ya no es un prototipo.
+Y se concluyó que el sistema **había dejado** de ser un prototipo.
+
+Ninguna de esas dos afirmaciones se sostiene hoy en esos términos. Lo que sí
+está implementado y con qué evidencia se decide capacidad por capacidad en la
+tabla de tres niveles, no aquí.
 
 ---
 

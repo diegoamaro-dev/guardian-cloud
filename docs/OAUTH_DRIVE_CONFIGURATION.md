@@ -6,6 +6,10 @@ Estado a 2026-08-20. Documento de configuración vigente, no histórico.
 > tokens, URLs firmadas ni `remote_reference`. Se registran identificadores
 > públicos, clasificación de scopes y estado de publicación: nada más.
 
+> **El proyecto aloja desde el 2026-08-25 DOS clientes OAuth.** El cuerpo de
+> este documento describe el de **Drive**. El segundo —la audiencia de
+> identidad de A1— se registra en la última sección y **no está en uso**.
+
 ## Estado en Google Auth Platform
 
 Comprobado manualmente en la consola de Google el 2026-08-20:
@@ -130,3 +134,74 @@ que es la vía para confirmar el `error` exacto devuelto por Google.
 > antes de mirar el código, de modo que un `DRIVE_REFRESH_FAILED` se reintenta
 > indefinidamente sin avisar al usuario de que debe reconectar. Registrada en
 > [`KNOWN_DEBT.md`](./KNOWN_DEBT.md).
+
+---
+
+# Segundo cliente OAuth — audiencia de identidad (A1)
+
+Creado el **2026-08-25** en el mismo proyecto. **No está en uso**: ninguna app
+lo referencia y Supabase no lo tiene autorizado.
+
+| Campo | Valor observado |
+|---|---|
+| Nombre | `Guardian Cloud — identity audience (prod)` |
+| Tipo | Web application |
+| Client ID | `285217660535-gqae2dvua9mu52vbrc3hccgmgcb255o5.apps.googleusercontent.com` |
+| Authorized JavaScript origins | vacío |
+| Authorized redirect URIs | vacío |
+| Estado | Enabled |
+
+El `client_secret` **no se usó, no se copió y no se registra**: el flujo nativo
+no lo necesita. El Client ID sí es público —viaja dentro de la app como
+`serverClientId`— y por eso puede constar aquí.
+
+## Para qué existe, y por qué es un cliente distinto
+
+Es la **audiencia** (`aud`) de los `id_token` que emitirá Google en el flujo
+nativo de A1, y es lo que Supabase validará. Documentación de Supabase, verbatim:
+«You have to create OAuth client IDs for both a Web and Android application.
+**The Web client ID is the one used in your Android app.**»
+
+**No reutiliza el cliente de Drive, y no debe hacerlo nunca.** Aquél es un
+cliente confidencial de servidor, con `client_secret` y `redirect_uri`, para un
+consentimiento de almacenamiento (`drive.file`). Éste es la identidad. Mezclarlos
+sería usar un token concedido para una cosa como acreditación de otra.
+
+## Independencia verificada
+
+```
+project number del Client ID nuevo   285217660535
+project number registrado arriba     285217660535   → mismo proyecto
+sufijo del cliente                    gqae2dvua9mu52vbrc3hccgmgcb255o5
+                                      distinto del de Drive · cliente independiente
+```
+
+## Clientes OAuth **Android** — todavía NO creados
+
+**No existe ninguno.** Cuando se creen, el par al que quedarán asociados es:
+
+| | Valor |
+|---|---|
+| package | **`com.guariacloud.app`** |
+| SHA-1 | el del certificado del canal correspondiente (dev / EAS / Play) |
+
+El `applicationId` de producción está **decidido y ya implementado en código**;
+el porqué, las alternativas evaluadas y la razón de que `namespace` siga siendo
+`com.guardiancloud.app` viven en su fuente canónica:
+[`decisions/ADR-ANDROID-APPLICATION-ID.md`](./decisions/ADR-ANDROID-APPLICATION-ID.md).
+**Ese ADR es la fuente de verdad; este documento sólo registra configuración
+observada.**
+
+El Web Client de arriba **no depende del package** —no contiene el nombre y no se
+muestra al usuario—, y por eso pudo crearse antes de resolver la marca.
+
+## Cuestión abierta: `Q-WEBCLIENT-MUTABILITY`
+
+Está **sin verificar** si el Client ID pasa a ser irreemplazable en cuanto exista
+el primer usuario vinculado. Falta determinar a qué se ancla `auth.identities`
+—`provider_id`, `aud` o ambos—, si Supabase admite **añadir** un segundo Client
+ID sin invalidar lo ya vinculado, y si el `sub` de Google varía al cambiar la
+audiencia. Hasta resolverlo, **no se trata como hecho arquitectónico**.
+
+Lo que sí está verificado: el Web Client ID es el `aud` del `id_token` y es lo
+que Supabase valida.

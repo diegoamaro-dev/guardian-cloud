@@ -89,7 +89,7 @@ android {
 
     namespace 'com.guardiancloud.app'
     defaultConfig {
-        applicationId 'com.guardiancloud.app'
+        applicationId 'com.guariacloud.app'
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 1

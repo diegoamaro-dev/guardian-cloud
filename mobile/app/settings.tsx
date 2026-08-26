@@ -27,6 +27,7 @@ import {
   getPreferredDestinationType,
   setPreferredDestinationType,
 } from '@/destinations/preference';
+import { ApiError } from '@/api/client';
 import { claimDriveOAuthCode } from '@/oauth/exchangeGuard';
 // ReliabilityCard — same component the home screen mounts in 'home' mode.
 // Here we mount it in 'settings' mode so it stays visible as a permanent
@@ -39,6 +40,7 @@ import { ReliabilityCard } from '@/components/ReliabilityCard';
 // DEV-only queue wipe — surfaced as a button at the bottom of this screen.
 // Does NOT touch auth/Drive/anything else; only Guardian Cloud queue keys.
 import { clearGuardianQueueDev } from '.';
+import { describeResetRefusal } from '@/dev/reset';
 
 // Mirror of the key written by the home screen after a session is created
 // or recovered. See index.tsx LAST_SESSION_ID_KEY. Kept as a literal on
@@ -111,6 +113,27 @@ function parseCodeFromUrl(url: string): string | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * R5 — the Drive actions create remote state owned by this user (an OAuth
+ * link, a stored refresh token, a real file), so they wait for
+ * `gc.identity.v1` to be durable like every other ownership operation.
+ *
+ * That wait must NOT be silent: the user tapped a button and something has
+ * to answer. But it is also not an error and not a sign-in problem — the
+ * session is fine and the condition clears itself within a moment. So the
+ * copy stays non-technical and suggests the one useful action.
+ *
+ * Nothing else changes: no request is sent, no session is touched, no
+ * identity is created, no evidence is read or written, and there is no new
+ * screen or step.
+ */
+function describeDriveError(err: unknown): string {
+  if (err instanceof ApiError && err.code === 'IDENTITY_NOT_READY') {
+    return 'Preparando conexión segura… Inténtalo de nuevo en unos segundos.';
+  }
+  return err instanceof Error ? err.message : String(err);
 }
 
 export default function SettingsScreen() {
@@ -289,7 +312,7 @@ export default function SettingsScreen() {
           // since we never started one ourselves).
           await refreshState();
         } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
+          const msg = describeDriveError(err);
           setErrorMsg(`No se pudo completar la conexión: ${msg}`);
         } finally {
           setBusy(false);
@@ -317,7 +340,7 @@ export default function SettingsScreen() {
         } catch {
           /* getConnectedDrive failed — fall through to real error */
         }
-        const msg = err instanceof Error ? err.message : String(err);
+        const msg = describeDriveError(err);
         setErrorMsg(`No se pudo completar la conexión: ${msg}`);
       } finally {
         setBusy(false);
@@ -365,7 +388,7 @@ export default function SettingsScreen() {
       // Control returns via the deep-link listener above. We leave `busy`
       // as 'connecting' until then; the listener will flip to 'exchanging'.
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = describeDriveError(err);
       setErrorMsg(msg);
       setBusy(false);
     }
@@ -383,7 +406,7 @@ export default function SettingsScreen() {
         `Archivo de prueba subido correctamente.\nID: ${res.remote_reference}`,
       );
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = describeDriveError(err);
       setErrorMsg(`No se pudo subir el archivo de prueba: ${msg}`);
     } finally {
       setBusy(false);
@@ -873,16 +896,33 @@ export default function SettingsScreen() {
   );
 }
 
+/**
+ * GC-DEV-RESET-001 — DEV-only, and it must stay that way.
+ *
+ * This component is not currently rendered anywhere, but it was written
+ * to be, and `clearGuardianQueueDev` drops `test.pending_retry`: the
+ * chunk files survive on disk while nothing references them any more,
+ * which is unrecoverable from inside the app. The old docblock on that
+ * function claimed "the Settings UI gate is what enforces DEV-only" —
+ * there was no such gate. Now there is one, at the top of the render, so
+ * mounting it in a release build produces nothing at all.
+ *
+ * The refusal itself lives in `clearGuardianQueueDev`, not here: a screen
+ * must not be the thing standing between a dev tool and someone's
+ * evidence.
+ */
 function DevQueueWipeBlock() {
   const [busy, setBusy] = useState(false);
   const [resultMsg, setResultMsg] = useState<string | null>(null);
+
+  if (!__DEV__) return null;
 
   async function handleWipe() {
     Alert.alert(
       'Limpiar cola (DEV)',
       'Borra la cola persistida y el puntero de última sesión. ' +
         'NO toca tu sesión de Google ni el Drive conectado. ' +
-        '¿Continuar?',
+        'Se rechazará si queda evidencia sin subir. ¿Continuar?',
       [
         { text: 'Cancelar', style: 'cancel' },
         {
@@ -892,7 +932,14 @@ function DevQueueWipeBlock() {
             try {
               setBusy(true);
               setResultMsg(null);
-              const { removed } = await clearGuardianQueueDev();
+              const { removed, refused } = await clearGuardianQueueDev();
+              if (refused) {
+                // Not a confirmation the user can override — the tool
+                // declined. Wording comes from the guard, so the screen
+                // never restates the refusal taxonomy.
+                setResultMsg(`Cancelado: ${describeResetRefusal(refused)}`);
+                return;
+              }
               setResultMsg(`OK · borradas ${removed.length} claves`);
             } catch (err) {
               setResultMsg(

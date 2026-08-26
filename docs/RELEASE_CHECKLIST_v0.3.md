@@ -21,6 +21,38 @@ kill, exportar.
 
 ---
 
+## 0. Invariante de migración de identidad — BLOQUEANTE
+
+> **El commit `8615ba6` (4C — captura local-first con identidad degradada) NO
+> PUEDE publicarse en ningún build que no contenga también la corrección
+> GC-AUTH-MIGRATION-001 y el seal `gc.legacy_probe.v1`.**
+
+No es una preferencia de orden de merge. Es la condición de la que depende la
+demostración de seguridad de la migración.
+
+La legacy probe deduce «existió una identidad aquí» a partir de rastros
+durables de captura. Esa deducción es válida porque la guarda
+`TOKEN_MISSING_AT_START` está presente de forma continua desde `22d3f5e` hasta
+`45357c4` y en todos los tags de release, cubriendo audio y vídeo nativo. 4C
+elimina esa guarda: desde `8615ba6`, las cuatro señales pueden escribirse sin
+identidad alguna.
+
+El seal cierra la ventana respondiendo la pregunta **una sola vez**, en un
+instante en el que todo rastro presente procede necesariamente de un build con
+guarda. Si 4C se publica sin el seal, las instalaciones empiezan a acumularse
+dentro de la ventana ambigua, donde un dispositivo que nunca tuvo identidad es
+**indistinguible** de uno que la tuvo y la perdió — de forma permanente y a
+partir del estado local. Ya hay un ejemplar en hardware.
+
+- [ ] Verificar que el build a publicar contiene `gc.legacy_probe.v1`:
+      `git log --oneline -S 'gc.legacy_probe.v1' -- mobile/src/auth/identityMarker.ts`
+- [ ] Si el build contiene `8615ba6` y la comprobación anterior sale vacía:
+      **detener la release.**
+
+Detalle completo en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §2.
+
+---
+
 ## 1. Pre-flight (código)
 
 ### Mobile

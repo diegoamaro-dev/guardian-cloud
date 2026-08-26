@@ -31,6 +31,7 @@
 
 import { Buffer } from 'node:buffer';
 
+import { AppError } from '../errors/AppError.js';
 import { logger } from '../utils/logger.js';
 import {
   getOwnedSession,
@@ -46,7 +47,7 @@ import {
   withDriveRetry,
 } from './drive.service.js';
 
-const MANIFEST_SCHEMA = 'guardian-cloud.manifest.v1';
+const MANIFEST_SCHEMA = 'guardian-cloud.manifest.v2';
 
 /**
  * Triggers for incremental (partial) manifest writes. Mirrored exactly in
@@ -83,12 +84,21 @@ export interface ManifestChunk {
    * shape to Drive internals).
    */
   file_name: string;
+  /**
+   * G3'' — medium of THIS chunk's bytes. Required in v2: every unit of
+   * evidence describes itself, so no consumer has to infer the medium
+   * from the session.
+   *
+   * A v1 manifest carries no per-chunk medium. Its parser propagates the
+   * session-level `mode`, which is authoritative *there* because no
+   * client able to mix media in one session has ever existed.
+   */
+  media: 'video' | 'audio';
 }
 
 export interface SessionManifest {
   schema: typeof MANIFEST_SCHEMA;
   session_id: string;
-  mode: SessionMode;
   destination_type: 'drive';
   created_at: string;
   /**
@@ -99,14 +109,6 @@ export interface SessionManifest {
    * the recovery list's "Protegido" vs "Parcial" badge.
    */
   completed_at: string | null;
-  /**
-   * Container format, only set when derivable safely from `mode`:
-   *   - 'mp4' for mode='video' (video sessions always land as MP4)
-   *   - omitted for mode='audio' (the client sniffs .aac vs .m4a at
-   *     export time; we do not persist the format server-side, so
-   *     guessing here would be unsound).
-   */
-  format?: 'mp4';
   chunk_count: number;
   chunks: ManifestChunk[];
   /**
@@ -192,27 +194,43 @@ export function buildManifest(
   const uploaded = chunks
     .filter((c) => c.status === 'uploaded' && !!c.remote_reference)
     .sort((a, b) => a.chunk_index - b.chunk_index)
-    .map<ManifestChunk>((c) => ({
-      chunk_index: c.chunk_index,
-      hash: c.hash,
-      size: c.size,
-      file_name: chunkFileName(session.id, c.chunk_index, c.hash),
-    }));
+    .map<ManifestChunk>((c) => {
+      // G3'' — v2 describes the medium PER CHUNK, and refuses to guess.
+      // A row whose medium was never declared cannot be described, and
+      // deriving it from `session.mode` would reintroduce exactly the
+      // session-level claim v2 exists to remove. Fail closed.
+      if (c.media !== 'video' && c.media !== 'audio') {
+        throw new AppError(
+          500,
+          'MANIFEST_CHUNK_MEDIA_UNKNOWN',
+          `Cannot describe chunk ${c.chunk_index}: medium not declared`,
+        );
+      }
+      return {
+        chunk_index: c.chunk_index,
+        hash: c.hash,
+        size: c.size,
+        file_name: chunkFileName(session.id, c.chunk_index, c.hash),
+        media: c.media,
+      };
+    });
 
+  // G3'' — v2 carries NO session-level `mode` and NO `format`.
+  //
+  // `sessions.mode` still exists and still means what it always meant:
+  // the medium the capture STARTED with, declared once by the client.
+  // What it cannot do is stand for the medium of every chunk, so it is
+  // not restated here. `format` went with it: it was derived from
+  // `mode`, and had no reader anywhere in the system.
   const manifest: SessionManifest = {
     schema: MANIFEST_SCHEMA,
     session_id: session.id,
-    mode: session.mode,
     destination_type: 'drive',
     created_at: session.created_at,
     completed_at: completedAt,
     chunk_count: uploaded.length,
     chunks: uploaded,
   };
-
-  if (session.mode === 'video') {
-    manifest.format = 'mp4';
-  }
 
   if (options?.isPartial) {
     manifest.is_partial = true;
