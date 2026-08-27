@@ -1,3 +1,27 @@
+> ⚠️ **Documento histórico. No es el estado de validación vigente.**
+>
+> Fotografía de la matriz de escenarios tal como estaba el **2026-08-20**
+> (`6990fb6`). No se mantiene: sus `?`, sus `PASS` y su bloque «Conclusión»
+> describen aquel corte y no deben interpretarse como el estado actual.
+>
+> Los `PASS` conservados en esta matriz no incluyen por sí mismos fecha,
+> dispositivo ni artefacto de evidencia asociado. La auditoría del
+> 2026-07-28 ya documentó problemas de desalineación entre esta matriz y
+> otros registros del proyecto.
+>
+> **Fuentes vigentes:**
+> - [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md) — estado por
+>   capacidad y referencia canónica;
+> - [`TEST_SCENARIOS.md`](./TEST_SCENARIOS.md) — definición vigente de
+>   escenarios;
+> - `docs/VALIDATIONS/` — registros de validación fechados y evidencia
+>   asociada;
+> - [`START_HERE.md`](./START_HERE.md) — estado general y veredicto de
+>   release.
+>
+> Este fichero se conserva para mantener la trazabilidad histórica de
+> auditorías que lo citaron.
+
 # Guardian Cloud — Validation Matrix (MVP)
 
 ## Estado general
