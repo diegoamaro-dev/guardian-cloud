@@ -47,8 +47,15 @@ Fuente: `backend/src/middleware/auth.ts`.
 El único endpoint bajo el prefijo `/auth` es el callback de OAuth de Drive:
 
 ### GET /auth/drive/callback
-Recibe el `code` de Google tras la autorización del usuario. No lleva
-`authMiddleware`: la autenticación viaja en el `state` del flujo OAuth.
+Recibe el `code` de Google tras la autorización del usuario y lo reenvía al
+deep link del móvil. **No autentica**: no lleva `authMiddleware` y **no valida
+`state`** — hoy `state` no se genera. La autenticación del flujo ocurre después,
+en `POST /destinations/drive/connect` con `action: 'exchange'`, que sí exige
+`authMiddleware` y ancla el destino a `req.user.id`.
+
+> Que este flujo no correlacione la respuesta con la petición que la originó
+> está registrado como `GC-OAUTH-NOSTATE-001` en
+> [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §9.
 
 ---
 
