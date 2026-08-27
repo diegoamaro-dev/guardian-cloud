@@ -334,6 +334,20 @@ Android 13+.
 
 ---
 
+
+## Findings abiertos de evidencia y OAuth
+
+Registrados el 2026-08-27. Su ficha completa vive en
+[`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §7–§9; aquí sólo consta su estado.
+
+| Finding | Estado |
+|---|---|
+| `GC-MANIFEST-BESTEFFORT-001` | **`OPEN`** — consecuencia ensayada en hardware el 27/08 para el manifiesto final; el caso sin ningún manifiesto **no** está validado. Sin severidad asignada |
+| `GC-OAUTH-SCHEME-COLLISION-001` | **`OPEN`** — hecho de código verificable; el desvío del deep link se observó en `G3''` **sin artefacto congelado**; explotabilidad no ensayada. Sin severidad asignada |
+| `GC-OAUTH-NOSTATE-001` | **`OPEN`** — trazado en código: `state` no se genera, no se valida y no se usa. El riesgo asociado es **inferido y no validado**. Sin severidad asignada |
+
+---
+
 ## Baseline técnica congelada — `v0.3.0-rc.1` (2026-07-30)
 
 Registro completo: [`releases/v0.3.0-rc.1.md`](./releases/v0.3.0-rc.1.md).

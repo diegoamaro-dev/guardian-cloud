@@ -175,6 +175,44 @@ configuración implicada en [`OAUTH_DRIVE_CONFIGURATION.md`](./OAUTH_DRIVE_CONFI
 
 ---
 
+## Deuda descubierta durante el ensayo de manifiestos (2026-08-27)
+
+### `GC-DEPLOY-RELOAD-001` — la recarga del runtime no es fiable
+
+Al instrumentar el backend desplegado, una escritura en
+`backend/src/services/manifest.service.ts` **no** recargó el proceso en más de
+treinta minutos; un `touch` posterior de `backend/src/index.ts` sí lo recargó en
+segundos. Medido: hijo de `tsx watch` `2562998 → 2596564`, `uptime_s`
+`76125 → 19`. El montaje es ext4 local, los límites de inotify son holgados,
+`tsx` es `4.21.0`, y una prueba directa con `fs.watch` sí recibió el evento.
+
+**La causa no se ha investigado.** El diagnóstico que la resolvería —enumerar
+las rutas vigiladas del descriptor inotify— quedó sin ejecutar. El estado
+actual **se desconoce**: no se ha vuelto a comprobar.
+
+Se registra como baseline conocida, igual que los cuatro fallos del backend de
+esta misma página: sin causa raíz no hay nada que un identificador de defecto
+pudiera identificar. **Sin remediación propuesta.**
+
+Consecuencia práctica mientras siga abierto: tras cambiar código desplegado,
+**demostrar** la recarga —`uptime_s` reiniciado y PID hijo nuevo— en vez de
+suponerla.
+
+### `GC-STORAGE-NAMING-001` — la carpeta de destino conserva el nombre anterior
+
+`ROOT_FOLDER_NAME = 'GuardianCloud'` (`backend/src/services/drive.service.ts:46`)
+y `ROOT_DIR = 'GuardianCloud'` (`backend/src/adapters/webdav.adapter.ts:34`) son
+constantes compiladas, no configuración, mientras el identificador de aplicación
+vigente es `com.guariacloud.app`.
+
+**No hay defecto funcional**: el destino se resuelve por `folder_id` almacenado.
+La deuda es de nomenclatura, y su riesgo aparece sólo si alguien renombra sin
+migración: `ensureRootFolder` busca **por nombre**, de modo que un renombrado
+parcial produciría dos carpetas raíz coexistiendo. Requiere auditoría propia de
+migración, preservando la compatibilidad con la evidencia histórica.
+
+---
+
 ## Lo que NO es deuda y no vive aquí
 
 Los findings del bloque de identidad, destino y herramientas (21/08 – 24/08)

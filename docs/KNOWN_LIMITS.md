@@ -1642,3 +1642,162 @@ Corregirlo cambia comportamiento observable en una ruta de recuperación de dato
 y exige decidir qué hacer con un valor ilegible —conservarlo, aislarlo, o fallar
 cerrado—, lo que es una decisión de producto con su propio criterio de
 validación. Requiere gate propio.
+
+---
+
+# 7. GC-MANIFEST-BESTEFFORT-001 — el fallo del manifiesto no llega al cliente
+
+## Estado
+
+**OPEN.** Sin corregir. Sin decisión de release.
+
+## Hecho demostrado
+
+La generación del manifiesto es *best-effort* por contrato explícito
+(`backend/src/services/manifest.service.ts:9-11`): su fallo **no** impide
+`/complete`, **no** altera la respuesta al cliente y sólo deja un `warn` en el
+log del servidor.
+
+Ensayado en hardware el 2026-08-27 —
+[`VALIDATIONS/GC_MANIFEST_BESTEFFORT_ARMB_2026-08-27.md`](./VALIDATIONS/GC_MANIFEST_BESTEFFORT_ARMB_2026-08-27.md):
+una sesión con 635 chunks subidos y registrados de forma continua (0..634)
+completó con `200`, sin señal alguna al cliente, mientras el manifiesto
+superviviente representaba únicamente 630 (0..629). Los chunks 630..634 están
+subidos y registrados, y quedan fuera de ese manifiesto.
+
+## Grado de certeza
+
+El fallo del manifiesto final se **indujo** mediante instrumentación temporal
+acotada a esa sesión, retirada y verificada después. Lo demostrado es la
+**consecuencia**; **no** se ha demostrado con qué frecuencia un fallo real de
+Drive la produciría.
+
+**No se ha validado** el caso sin ningún manifiesto —chunks remotos existentes
+y sesión no descubrible—. Ese escenario está definido como `Caso 8` en
+[`TEST_SCENARIOS.md`](./TEST_SCENARIOS.md) con estado `DEFINIDO — NO VALIDADO`.
+
+## Impacto
+
+Afecta al descubrimiento cross-device: una sesión completa puede representarse
+como parcial. En ARMA B los bytes no se perdieron: los chunks 630..634
+permanecieron en Drive y registrados en la base de datos. Esto no demuestra el
+resultado de otros modos de fallo. **No se asigna severidad ni carácter
+release-blocking**: no hay ensayo que lo sustente.
+
+## Por qué sigue abierto
+
+Su remediación exige decidir qué debe ocurrir cuando la escritura del
+manifiesto falla, y eso es una decisión de producto con su propio criterio de
+validación. Requiere gate propio.
+
+---
+
+# 8. GC-OAUTH-SCHEME-COLLISION-001 — el scheme del deep link no es exclusivo
+
+## Estado
+
+**OPEN.** Sin corregir.
+
+## Hecho demostrado
+
+`mobile/app.config.ts:61` declara `scheme: 'guardiancloud'` mientras `:72`
+declara `package: 'com.guariacloud.app'`. El scheme **no** se renombró al
+cambiar el identificador de aplicación, de modo que cualquier aplicación
+instalada que registre `guardiancloud://` compite por el deep link con el que
+el backend entrega el `code` de Google
+(`backend/src/routes/destinations.routes.ts:1113-1117`).
+
+Es un hecho de código, verificable hoy en ambos ficheros.
+
+## Grado de certeza
+
+Durante el gate de `G3''` (2026-08-26) se observó que, con dos aplicaciones
+instaladas registrando el mismo scheme, el deep link se entregó a la aplicación
+antigua y el intercambio se completó bajo una identidad distinta de la que
+inició el flujo. **Esa observación no tiene artefacto congelado**: el logcat de
+`G3''` está filtrado por el PID de la aplicación nueva y el log del backend por
+`session_id`, de modo que ninguno la contiene.
+
+**No se ha ensayado** que una aplicación de terceros pueda capturar el `code`
+en un dispositivo de usuario final. **No se asigna severidad ni carácter
+release-blocking.**
+
+## Impacto
+
+En la observación de `G3''`, la aplicación que inició la conexión quedó sin ese
+destino Drive. Si no existe otro destino operativo, esto puede impedir que la
+evidencia salga del dispositivo por esa ruta — afectando al invariante §1 de
+[`PRODUCT_PRINCIPLES`](./PRODUCT_PRINCIPLES.md). El alcance de ese impacto
+fuera del escenario de dos aplicaciones propias no está caracterizado.
+
+## Relación con GC-OAUTH-NOSTATE-001
+
+Son findings **independientes**, con causas distintas y vectores opuestos: aquí
+el `code` de quien inicia el flujo puede llegar a otra aplicación; en §9 un
+`code` ajeno puede llegar a esta aplicación. **Pueden amplificarse mutuamente.**
+Una correlación de respuestas —§9— podría mitigar parte del impacto de esta
+colisión, pero **no la elimina**: no impide que el sistema operativo entregue el
+deep link a otra aplicación. Cualquier afirmación sobre mitigación conjunta
+requiere diseño y validación propios.
+
+---
+
+# 9. GC-OAUTH-NOSTATE-001 — el flujo OAuth no correlaciona la respuesta
+
+## Estado
+
+**OPEN.** Sin corregir.
+
+## Hecho demostrado
+
+Trazado completo del flujo, verificable en el código actual:
+
+```
+mobile/app/settings.tsx:382          startDriveConnect(redirectUri)  — sin `state`
+backend/src/routes/destinations.routes.ts:293
+                                     buildAuthUrl(input.state, …)    — undefined
+backend/src/services/drive.service.ts:106
+                                     if (state) params.set('state', …) — no se pone
+backend/src/routes/destinations.routes.ts:1088-1117
+                                     el callback reenvía el `code` al deep link
+                                     y NO valida `state`
+rama `exchange` de /destinations/drive/connect
+                                     NUNCA lee `input.state`
+backend/src/schemas/destinations.schema.ts:31
+                                     state: z.string().max(128).optional()
+tests que cubran `state` en este flujo:  ninguno
+```
+
+El gate de `G3''` observó `hasState: false` en el log del callback, que es el
+comportamiento esperado de este código, no una anomalía.
+
+`mobile/app/oauth/drive.tsx:117` reenvía un `state` si lo recibe, pero el
+backend lo ignora: la tubería existe y está inerte.
+
+La autenticación del flujo ocurre en el intercambio, bajo `authMiddleware`, y
+ancla el destino a `req.user.id`
+(`backend/src/routes/destinations.routes.ts:283-289`).
+
+## Grado de certeza
+
+Todo lo anterior es **lectura del código y observación de log**. Lo que sigue
+**no** lo es.
+
+**Riesgo inferido, no validado.** Sin correlación entre la respuesta y la
+petición que la originó, un `code` no correlacionado podría ser aceptado por el
+cliente. Eso abre la posibilidad de un CSRF de OAuth o de una sustitución del
+destino. **No se ha ensayado**, **no se ha reproducido** y **no se ha
+demostrado** que el Drive de un tercero pueda quedar vinculado a la cuenta de
+una víctima. **No se asigna severidad ni carácter release-blocking.**
+Comprobarlo requiere un ensayo controlado con su propio gate.
+
+## Discrepancia documental asociada
+
+[`API_SPEC.md`](./API_SPEC.md) afirma que «la autenticación viaja en el `state`
+del flujo OAuth». Esa descripción es falsa respecto a la implementación:
+`state` ni siquiera se genera. Su corrección tiene gate propio.
+
+## Relación con GC-OAUTH-SCHEME-COLLISION-001
+
+Ver §8. Findings independientes, causas distintas, mitigaciones
+potencialmente relacionadas pero **no demostradas como suficientes**.
