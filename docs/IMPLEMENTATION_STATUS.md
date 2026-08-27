@@ -90,7 +90,7 @@ contradiga es incorrecta.
 > audio como `segment_NNNNNN.mp4` y acreditarlos por `sha256`— haciendo que la
 > elegibilidad se decida **por chunk** y exigiendo la firma estructural
 > `segments/<session_id>/segment_NNNNNN.mp4`. **D3 no soporta sesiones mixtas:
-> las rechaza.** Detalle en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §D3.
+> las rechaza.** Detalle en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §5.
 >
 > `G3''` —descripción de la evidencia en backend y manifiesto— está
 > **implementado, versionado, desplegado y validado**, pero **las cuatro cosas
