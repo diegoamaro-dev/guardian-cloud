@@ -90,12 +90,18 @@ NO romper:
 
 ---
 
-## Casos validados
+## Casos documentados como validados — 2026-05-14 (`045f9d9`), sobre `guardian-cloud.manifest.v1`
+
+> Estos casos quedaron documentados como validados en aquella fecha, pero el
+> repositorio actual no conserva un registro de validación enlazado que permita
+> reauditar sus resultados. No acreditan `guardian-cloud.manifest.v2` ni la ruta
+> de vídeo nativo segmentado, posteriores ambos — ver «Limitaciones actuales».
 
 ✅ móvil A → móvil B
 ✅ audio
-✅ vídeo
-✅ partial recovery
+✅ vídeo — ruta legacy post-stop; el grabador nativo segmentado es posterior (2026-08-13)
+✅ partial recovery — reconstrucción desde un conjunto incompleto de chunks;
+   los manifiestos parciales incrementales son posteriores (2026-05-18, `ec7c289`)
 ✅ save/share
 ✅ export normal sigue funcionando
 
@@ -106,4 +112,5 @@ NO romper:
 - sesiones enormes
 - Drive rate limiting extremo
 - recovery con NAS
-- manifests v2
+- manifests v2 — esquema introducido con `142c1f9`; su recuperación
+  cross-device sigue sin validar (ver «Limitaciones actuales»)
