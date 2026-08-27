@@ -83,7 +83,7 @@ contradiga es incorrecta.
 |---|---|
 | Recuperación completa del vídeo nativo | No consta validación integrada; no se declara implementada o validada por la evidencia actual |
 | Exportación `.mp4` | No implementada ni validada |
-| Continuous Protection — continuidad `VIDEO_AUDIO → AUDIO_ONLY` al perder el primer plano | **Capacidad: no implementada ni validada.** Contrato aceptado el 2026-08-25. **Infraestructura parcial y precondiciones ya publicadas**, sin cambio de comportamiento observable: `8983bad` añadió la metadata durable `evidence_closed`, `6c6489c` desacopló el camino de **lectura** de terminalidad hacia `/complete`, y `fc9a20e` añadió `media` por chunk y la clasificación **fail-closed** de D3. La **escritura** sigue acoplada y la transición no existe: minimizar durante vídeo cierra la sesión igual que antes. Decide [`decisions/ADR-CONTINUOUS-PROTECTION.md`](./decisions/ADR-CONTINUOUS-PROTECTION.md); su criterio de prueba es el escenario 18 de [`TEST_SCENARIOS.md`](./TEST_SCENARIOS.md), que sigue `DEFINIDO` |
+| Continuous Protection — continuidad `VIDEO_AUDIO → AUDIO_ONLY` al perder el primer plano | **Capacidad: no implementada ni validada.** Contrato aceptado el 2026-08-25. **Infraestructura parcial y precondiciones ya publicadas**, sin cambio de comportamiento observable: `8983bad` añadió la metadata durable `evidence_closed`, `6c6489c` desacopló el camino de **lectura** de terminalidad hacia `/complete`, `fc9a20e` añadió `media` por chunk y la clasificación **fail-closed** de D3, y `142c1f9` publicó el contrato de `media` por chunk en backend y manifiesto. La **escritura** sigue acoplada y la transición no existe: minimizar durante vídeo cierra la sesión igual que antes. Decide [`decisions/ADR-CONTINUOUS-PROTECTION.md`](./decisions/ADR-CONTINUOUS-PROTECTION.md); su criterio de prueba es el escenario 18 de [`TEST_SCENARIOS.md`](./TEST_SCENARIOS.md), que sigue `DEFINIDO` |
 
 > **`fc9a20e` es una precondición de INTEGRIDAD, no Continuous Protection
 > funcionando.** Retira un modo de fallo de D3 —habría podido copiar bytes de
@@ -606,7 +606,9 @@ the migration.
 
 ## Cross-device recovery
 
-Estado: VALIDADO EN CONDICIONES REALES
+Estado: VALIDADO EN CONDICIONES REALES el 2026-05-14 (`045f9d9`), sobre
+`guardian-cloud.manifest.v1`. Esa validación **no acredita**
+`guardian-cloud.manifest.v2`, introducido posteriormente con `142c1f9`.
 
 Capacidades:
 - discovery cross-device
@@ -618,7 +620,9 @@ Capacidades:
 
 ## Incremental manifests and partial cross-device recovery (v0.3.4)
 
-Status: ✅ validated on real device
+Status: ✅ validated on real device — 2026-05-18 (`ec7c289`), on
+`guardian-cloud.manifest.v1`. This validation does **not** cover
+`guardian-cloud.manifest.v2`.
 
 Guardian Cloud now writes incremental Drive manifests during recording/upload, not only after session completion.
 
@@ -665,7 +669,10 @@ Now:
 - Mobile worker is unchanged.
 - Export pipeline is unchanged.
 - Drive OAuth is unchanged.
-- Final complete manifest still overwrites the partial manifest on `/complete`.
+- On `/complete`, the final manifest overwrites the partial manifest **when
+  the final write succeeds**. If that best-effort write fails, the last
+  incremental manifest remains — see
+  [`VALIDATIONS/GC_MANIFEST_BESTEFFORT_ARMB_2026-08-27.md`](./VALIDATIONS/GC_MANIFEST_BESTEFFORT_ARMB_2026-08-27.md).
 
 ### Partial recovery behavior
 
@@ -693,7 +700,13 @@ Real-device test passed:
 - partial session appeared
 - partial recovery/export worked
 
-This closes the gap where evidence chunks survived remotely but were not discoverable after local state loss.
+This **narrows, but does not close**, the gap where evidence chunks survive
+remotely but are not discoverable after local state loss. Once an
+incremental manifest exists, the session can be discovered from that saved
+state; however, a surviving incremental manifest does **not** guarantee
+coverage of every uploaded chunk if the final manifest write fails. This
+limitation was validated on hardware in
+[`VALIDATIONS/GC_MANIFEST_BESTEFFORT_ARMB_2026-08-27.md`](./VALIDATIONS/GC_MANIFEST_BESTEFFORT_ARMB_2026-08-27.md).
 
 ### Legacy post-stop video upload pipeline optimization (validated)
 
