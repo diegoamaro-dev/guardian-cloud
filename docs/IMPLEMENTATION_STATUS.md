@@ -93,19 +93,26 @@ contradiga es incorrecta.
 > las rechaza.** Detalle en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §D3.
 >
 > `G3''` —descripción de la evidencia en backend y manifiesto— está
-> **implementado y validado EN EL ÁRBOL DE TRABAJO**. Las tres cosas hay que
-> mantenerlas separadas:
+> **implementado, versionado, desplegado y validado**, pero **las cuatro cosas
+> son distintas** y la última tiene un alcance estrecho:
 >
 > ```
-> IMPLEMENTADO Y VALIDADO EN EL ÁRBOL   sí
-> VERSIONADO / PUBLICADO                 NO — no existe commit de G3''
-> DESPLEGADO                             NO — el mini servidor sigue con el
->                                        backend anterior, la migración 0005
->                                        no se ha aplicado y no hay ningún
->                                        manifiesto v2 en producción
+> IMPLEMENTADO              sí
+> VERSIONADO / PUBLICADO    sí — 142c1f9, integrado en main con f3bb913
+> DESPLEGADO                sí — migración 0005 aplicada · PostgREST reconoce
+>                                media · el backend en servicio escribe
+>                                guardian-cloud.manifest.v2
+> VALIDADO FUNCIONALMENTE   sí, EXCLUSIVAMENTE para media='audio'
+>                                17/17 chunks · manifiesto v2 observado
+>                                ver VALIDATIONS/G3II_PER_CHUNK_MEDIA_2026-08-26.md
 > ```
 >
-> Qué contiene el árbol: `media` opcional por chunk en `POST /chunks`,
+> **`media='video'` NO fue validado funcionalmente.** Tampoco background, kill,
+> pérdida de red, reinicio, export, ni la integridad de los bytes en Drive
+> contra sus hashes. El registro de validación acota lo comprobado; **desplegado
+> no equivale a validado**.
+>
+> Qué contiene lo desplegado: `media` opcional por chunk en `POST /chunks`,
 > persistencia nullable donde la ausencia significa «no declarado» y nunca se
 > infiere, `guardian-cloud.manifest.v2` con `chunks[].media` obligatorio y sin
 > `mode` ni `format` de sesión, lectura read-only de v1 —cuyo `mode` histórico
@@ -120,7 +127,11 @@ contradiga es incorrecta.
 > —una sesión mixta se **rechaza**—, y no toca D3, `/complete`, terminalidad,
 > background, worker ni cleanup.
 >
-> **`G4` sigue BLOQUEADO** mientras `G3''` no esté versionado y desplegado.
+> **`G4` sigue BLOQUEADO.** La condición que lo bloqueaba antes —que `G3''` no
+> estuviera versionado ni desplegado— **ya no aplica**, pero el bloqueo persiste
+> por su otra causa, la que este gate nunca abordó: **`VIDEO_AUDIO → AUDIO_ONLY`
+> sigue sin implementarse**, ningún productor puede crear evidencia mixta, y §7
+> del ADR continúa prohibiendo producirla.
 > Contrato en [`API_SPEC.md`](./API_SPEC.md) §Manifiesto de evidencia.
 
 > **D3 `LOCAL SEGMENT SALVAGE` no pertenece a este nivel y no es un export

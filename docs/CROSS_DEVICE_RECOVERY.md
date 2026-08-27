@@ -77,11 +77,15 @@ NO romper:
 - recovery depende de Google Drive conectado
 - no streaming reconstruction
 - export sigue memory-bound
-- manifest v1 únicamente **en el backend desplegado**. El árbol de trabajo
-  escribe `guardian-cloud.manifest.v2` y sigue leyendo v1 read-only, pero eso
-  **no está versionado ni desplegado**: el mini servidor sigue emitiendo v1.
-  Detalle del contrato en [`API_SPEC.md`](./API_SPEC.md) §Manifiesto de
-  evidencia
+- **coexisten manifiestos v1 y v2 en Drive.** El backend desplegado escribe
+  `guardian-cloud.manifest.v2` —escritura **observada** en la validación de
+  `G3''`— y sigue leyendo v1 read-only, pero **los manifiestos v1 históricos
+  permanecen** en el Drive de los usuarios. **La recuperación cross-device
+  usando un manifiesto v2 no se ha validado**, y la lectura de v1 tampoco se
+  ejercitó en esa validación. Detalle del contrato en
+  [`API_SPEC.md`](./API_SPEC.md) §Manifiesto de evidencia; alcance de lo
+  validado en
+  [`VALIDATIONS/G3II_PER_CHUNK_MEDIA_2026-08-26.md`](./VALIDATIONS/G3II_PER_CHUNK_MEDIA_2026-08-26.md)
 - no NAS recovery todavía
 
 ---

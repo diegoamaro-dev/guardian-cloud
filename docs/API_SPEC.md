@@ -150,12 +150,15 @@ Body (`chunkBodySchema`, `routes/chunks.routes.ts:41-48`):
 | `remote_reference` | `string \| null` | opcional |
 | `media` | `'video' \| 'audio'` | **opcional** — ver abajo |
 
-> **`media` — implementado y validado EN EL ÁRBOL DE TRABAJO. NO versionado,
-> NO publicado, NO desplegado.** El backend que corre hoy en el mini servidor
-> es anterior a este campo: lo recibe y lo **descarta** —su esquema es un
-> `z.object` sin `.strict()`—, de modo que un cliente que lo envíe registra
-> chunks exactamente igual que antes. Esta fila describe el contrato del
-> árbol, no el que está sirviendo peticiones.
+> **`media` — versionado, desplegado y en servicio.** Integrado en `main` con
+> `142c1f9`, publicado en `f3bb913`; la migración `0005` está aplicada y el
+> backend que atiende peticiones persiste el campo. Esta fila describe el
+> contrato que está sirviendo.
+>
+> **Validado funcionalmente sólo para `media='audio'`**: 17 chunks, todos
+> persistidos con ese valor —
+> [`VALIDATIONS/G3II_PER_CHUNK_MEDIA_2026-08-26.md`](./VALIDATIONS/G3II_PER_CHUNK_MEDIA_2026-08-26.md).
+> **`media='video'` no se ejercitó** en esa validación.
 >
 > El medio es una propiedad **de la unidad de evidencia**, no de la sesión:
 > `sessions.mode` declara con qué medio **empezó** la captura, y eso no basta
@@ -273,8 +276,8 @@ Lista manifests recuperables del usuario.
 }
 ```
 
-> **`mode` en esta respuesta es DERIVADO, no reafirmado** *(árbol de trabajo;
-> el backend desplegado todavía lo copia de la fila de sesión)*. Sale del medio
+> **`mode` en esta respuesta es DERIVADO, no reafirmado** *(desplegado; este
+> endpoint **no se ejercitó** en la validación de `G3''`)*. Sale del medio
 > de los chunks cuando todos coinciden. Si no coincidieran se **omite** y la
 > sesión **sigue listándose**: aquí el medio dibuja un icono, y ocultar una
 > sesión cuyos bytes existen sería peor que no dibujarlo. La negativa dura vive
@@ -285,8 +288,8 @@ Lista manifests recuperables del usuario.
 
 Devuelve un manifest concreto.
 
-> **Fallo cerrado ante evidencia heterogénea** *(árbol de trabajo; el backend
-> desplegado no tiene este comportamiento)*. Cuando los chunks de la sesión no
+> **Fallo cerrado ante evidencia heterogénea** *(desplegado; **sin ejercitar** —
+> ver la nota final de este bloque)*. Cuando los chunks de la sesión no
 > comparten un solo medio, el endpoint responde:
 >
 > ```
@@ -310,8 +313,11 @@ Devuelve un manifest concreto.
 
 ## Manifiesto de evidencia — v1 y v2
 
-*Implementado y validado **en el árbol de trabajo**. **No** versionado, **no**
-publicado, **no** desplegado: el mini servidor sigue escribiendo v1.*
+*Versionado en `142c1f9`, publicado en `f3bb913` y **desplegado**: el backend en
+servicio escribe `guardian-cloud.manifest.v2`. Su escritura fue **observada** en
+la validación de `G3''` — un manifiesto v2 real, con 17 entradas y `media` en
+todas. **La lectura de v1 y el fallo cerrado ante evidencia heterogénea no se
+ejercitaron.***
 
 El manifiesto es un fichero en el Drive del usuario, `{session_id}_manifest.json`.
 **No es contrato con el cliente**: la app nunca lo parsea — consume la respuesta
@@ -320,7 +326,7 @@ entre dispositivos.
 
 | | `guardian-cloud.manifest.v1` | `guardian-cloud.manifest.v2` |
 |---|---|---|
-| lo escribe | **el backend desplegado** | **el árbol de trabajo** |
+| lo escribe | backend **histórico, anterior a `f3bb913`** | **backend desplegado, desde `f3bb913`** |
 | se lee | sí, read-only | sí |
 | `mode` de sesión | presente y autoritativo | **ausente** |
 | `format` | `'mp4'` si `mode==='video'` | **ausente** |
