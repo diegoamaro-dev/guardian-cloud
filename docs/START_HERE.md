@@ -50,22 +50,26 @@ baseline `v0.3.0-rc.1`, no la rama actual.
 * **Validación automática de aquel corte:** 360/360 tests. *(Cifra histórica del
   20/08. La vigente está más abajo.)*
 
-### Validación automática vigente (2026-08-26, tras `fc9a20e`)
+### Validación automática (2026-08-27, sobre `main@63099d8`)
 
 | Comprobación | Resultado |
 |---|---|
-| Suite completa | **936/936**, en **42 ficheros** |
-| Typecheck | **12 errores históricos, cero nuevos** — **NO** verde |
+| Suite **móvil** (`mobile/`) | **936/936** en **42 ficheros** — reverificada el 2026-08-27 |
+| Typecheck **móvil** | **12 errores** — **NO** verde |
+| Suite **backend** (`backend/`, 9 ficheros) | **no medida en este corte** — `KNOWN_DEBT.md` registra 4 fallos preexistentes |
+| Typecheck **backend** | **no medido en este corte** |
 | `git diff --check` | Limpio |
 
-La cifra vigente es la de la tabla: **936 tests en 42 ficheros**, sobre el
-árbol posterior a `fc9a20e`. Los **cortes históricos anteriores** fueron 900/900
-en 42 ficheros tras `cb59c7e` y 792/792 en 41 ficheros tras `3c10994`, y ninguno
-describe ya la suite actual. El fichero 41 era
-`startLatencyDecoupling.test.ts`, que aportó 11 tests; el fichero 42 es
-`localAssembly.test.ts`, que aporta los 108 tests de D3. **Del resto de
-incrementos históricos no hay recuento documentado**, y esta guía no se los
-atribuye a nada. `compileDebugKotlin` no se ha reejecutado desde el 20/08.
+La cifra vigente es la de la tabla: **936 tests móviles en 42 ficheros**,
+medidos el 2026-08-27 sobre el mismo objeto `tree` de `mobile/` que publica
+`main@63099d8`. La medición anterior, del 2026-08-26 tras `fc9a20e`, dio la
+misma cifra. Los **cortes históricos anteriores** fueron 900/900 en 42 ficheros
+tras `cb59c7e` y 792/792 en 41 ficheros tras `3c10994`, y ninguno describe ya
+la suite actual. El fichero 41 era `startLatencyDecoupling.test.ts`, que aportó
+11 tests; el fichero 42 es `localAssembly.test.ts`, que aporta los 108 tests de
+D3. **Del resto de incrementos históricos no hay recuento documentado**, y esta
+guía no se los atribuye a nada. `compileDebugKotlin` no se ha reejecutado desde
+el 20/08.
 
 > Esta línea decía «el salto de 360 a 738 son los ficheros que trajeron los
 > findings del bloque de identidad, no una ampliación de cobertura del vídeo».
