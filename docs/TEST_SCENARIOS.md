@@ -45,7 +45,7 @@ marca el nivel que se puede acreditar, no el máximo alcanzable.
 | 11–13 — Chunks corruptos y export sin chunks válidos | `PROBADO EN TESTS` | `exportFromChunkRefs` |
 | 14 — UI de export bajo fallo | `PROBADO EN TESTS` | `exportRunner` |
 | 15 — Uso bajo estrés | `DEFINIDO` · **HARDWARE PENDIENTE** | Sin corrida registrada con el artefacto vigente |
-| 16 — Recuperación por usuario | `HARDWARE_VALIDATED` **parcial** | Recovery de una sesión pendiente tras restaurar Drive, 20/08 · `recoveryVerdict`, `exportFromChunkRefs`. Los casos 2–7 de este escenario **no** están validados en hardware |
+| 16 — Recuperación por usuario | `HARDWARE_VALIDATED` **parcial** | Recovery de una sesión pendiente tras restaurar Drive, 20/08 · `recoveryVerdict`, `exportFromChunkRefs`. Los casos 2–8 de este escenario **no** están validados en hardware como casos formales. El caso 9 se definió después, a partir de un estado observado en hardware el 2026-08-27 durante H4; esa observación **no** es una ejecución formal del caso |
 | 17 — Vídeo nativo con durable cleanup | `HARDWARE_VALIDATED` en su **ruta normal** | Validación 20/08 · puntos 5–8 en `HARDWARE_HARDENING_PENDING` |
 | 18 — Transición segura a segundo plano | `DEFINIDO` | Sin cobertura. Su criterio es `BACKGROUND TRANSITION SAFETY` y se acreditará en el gate G5 de Continuous Protection |
 
@@ -355,6 +355,62 @@ Esperado:
 - archivo accesible
 - Android SAF operativo
 - share sheet operativo
+
+---
+
+### Caso 8 — Descubrimiento con chunks remotos y sin ningún manifiesto
+
+**Precondición del ensayo**, a construir deliberadamente: una sesión cuyos
+chunks están en Drive y registrados en la base de datos, y para la cual **no
+existe ningún** `{session_id}_manifest.json` en Drive. Este caso **no afirma
+que el sistema produzca ese estado por sí solo**; establece la precondición
+para poder observar qué hace el descubrimiento ante ella.
+
+1. construir esa precondición
+2. abrir recovery desde un contexto sin estado local
+
+Registrar:
+- si la sesión aparece o no en la lista de recuperables
+- si el usuario recibe alguna señal de que existe evidencia remota
+- estado de los chunks en Drive y de sus filas en la base de datos
+
+`DEFINIDO — NO VALIDADO`. Sin corrida.
+
+Este caso mide **el camino de descubrimiento** ante esa precondición. **No**
+establece si el sistema puede llegar a ese estado en producción ni con qué
+frecuencia: esa es una cuestión causal distinta, y sigue sin validar. Tampoco
+define el comportamiento deseado.
+
+Distinto del **Caso 4**: allí el manifiesto existía al descubrir y desapareció
+al abrir el detalle; aquí **nunca existió**, y el camino ejercitado es el de
+descubrimiento, no el de detalle.
+
+---
+
+### Caso 9 — Manifiesto superviviente con cobertura incompleta
+
+**Definido por su estado, no por su mecanismo**: una sesión **completada** cuyo
+manifiesto en Drive declara **menos chunks de los que subió y registró**.
+
+1. partir de esa situación
+2. abrir recovery desde un contexto sin estado local
+
+Registrar:
+- cómo aparece la sesión en la lista de recuperables
+- `chunk_count` declarado frente a chunks realmente subidos y registrados
+- si el usuario percibe la diferencia
+
+`DEFINIDO — ESTADO OBSERVADO EN H4`.
+
+El estado descrito **fue observado** el 2026-08-27 en
+[`VALIDATIONS/GC_MANIFEST_BESTEFFORT_ARMB_2026-08-27.md`](./VALIDATIONS/GC_MANIFEST_BESTEFFORT_ARMB_2026-08-27.md):
+una sesión con 635 chunks subidos y un manifiesto superviviente que
+representaba 630.
+
+Aquella observación **no constituye una ejecución formal de este caso**. H4
+validaba otra hipótesis, alcanzó el estado por una vía inducida y no recorrió
+los pasos aquí definidos. Este caso queda `DEFINIDO`: describe el estado y qué
+registrar, no un resultado esperado ni un comportamiento deseado.
 
 ---
 
