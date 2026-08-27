@@ -217,11 +217,19 @@ Referencias nominales. **`DISCOVERED/OBSERVED — NOT REMEDIATED IN THIS GATE`.*
 - `GC-OAUTH-SCHEME-COLLISION-001`
 - `GC-OAUTH-NOSTATE-001`
 - `GC-MANIFEST-BESTEFFORT-001`
-- `destinationResolved` — observabilidad
 - OAuth «Abriendo Google…» — refresco al recuperar el primer plano
 
 Su descripción, evaluación y remediación corresponden a gates propios. **Este
 documento no los desarrolla ni los corrige.**
+
+> **`destinationResolved` no fue descubierto aquí.** Su semántica —un *race
+> guard* que puede valer `true` sin destino conectado— ya estaba documentada
+> desde el 2026-08-21 (`3fae4f6`) en
+> [`KNOWN_LIMITS.md`](../KNOWN_LIMITS.md) §3. Esta validación lo observó
+> **tres veces, siempre en su caso nominal**, con Drive conectado y sin
+> ninguna pausa de destino. No reprodujo el caso previamente documentado de
+> `destinationResolved: true` coexistiendo con Drive desconectado y una pausa
+> de destino activa.
 
 ---
 
