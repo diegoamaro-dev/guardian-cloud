@@ -266,15 +266,19 @@ Archivo `manifest.json` asociado a cada sesión:
 * tamaño
 * metadata básica (modo, formato)
 
-> **Dirección aprobada · NO implementada.** Hoy el modo es un atributo **de
-> sesión**: toda la evidencia de una sesión se describe con un único tipo. El
-> contrato de Continuous Protection exige que el tipo y la fase puedan
-> describirse **por unidad de evidencia** y nunca inferirse de un modo global, y
-> **prohíbe** que el manifiesto o el backend describan evidencia mixta como si
-> fuera exclusivamente vídeo. Es condición **bloqueante**: hasta que el contrato
-> de sesión admita fases, no puede producirse evidencia mixta. El cambio
-> correspondiente en el backend requiere gate propio y no está hecho. Ver
-> [`decisions/ADR-CONTINUOUS-PROTECTION.md`](./decisions/ADR-CONTINUOUS-PROTECTION.md) §7.
+> **Descripción por unidad de evidencia — DESPLEGADA. Producción de evidencia
+> mixta — NO IMPLEMENTADA.** La descripción del medio de la evidencia ya **no
+> depende de un único tipo declarado a nivel de sesión**: el backend en servicio
+> persiste `media` para cada chunk y el manifiesto que escribe
+> —`guardian-cloud.manifest.v2`— declara el medio por unidad de evidencia, sin
+> `mode` ni `format` de sesión. Versionado en `142c1f9`, integrado en `main` con
+> `f3bb913`; **validado funcionalmente sólo para `media='audio'`**;
+> `media='video'` **no se ejercitó**. El contrato **prohíbe** que el manifiesto o
+> el backend describan evidencia mixta como si fuera exclusivamente vídeo. Que el
+> contrato ya pueda describirla **no habilita su producción**: ningún productor la
+> genera, porque `VIDEO_AUDIO → AUDIO_ONLY` sigue **sin implementar**. Ver
+> [`decisions/ADR-CONTINUOUS-PROTECTION.md`](./decisions/ADR-CONTINUOUS-PROTECTION.md)
+> §7.
 
 #### Chunks
 
