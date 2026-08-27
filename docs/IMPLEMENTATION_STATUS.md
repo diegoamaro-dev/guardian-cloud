@@ -25,7 +25,7 @@
 
 Fuentes de continuidad y evidencia:
 
-* [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) — límites vigentes y findings §1–§6;
+* [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) — límites vigentes y findings;
 * [`RELEASE_CHECKLIST_v0.3.md`](./RELEASE_CHECKLIST_v0.3.md) §0 — invariante de migración de identidad, bloqueante;
 * [validación física del vídeo nativo con durable cleanup del 20/08](./audits/GUARDIAN_CLOUD_NATIVE_SEGMENTED_DURABLE_CLEANUP_VALIDATION_2026-08-20.md);
 * [validación física de la integración nativa segmentada del 13/08](./audits/GUARDIAN_CLOUD_NATIVE_SEGMENTED_INTEGRATION_VALIDATION_2026-08-13.md);
