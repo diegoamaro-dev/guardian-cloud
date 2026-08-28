@@ -47,10 +47,6 @@ import {
   type RecoverableSession,
 } from '@/api/recovery';
 import { ApiError } from '@/api/client';
-// Shared with `app/recover/[id].tsx` through a pure, unit-tested module
-// so the list and the detail screen cannot claim different things about
-// the same session.
-import { recoveryListLabel } from '@/recovery/recoveryVerdict';
 
 type ScreenState =
   | { kind: 'loading' }
@@ -59,14 +55,10 @@ type ScreenState =
   | { kind: 'empty' }
   | { kind: 'list'; sessions: RecoverableSession[] };
 
-function formatDate(iso: string | null): string {
-  // Manifests written during recording (before /complete) carry a null
-  // `completed_at`. Render an explicit em-dash so the row still looks
-  // structured — the badge on the same card carries the semantic load.
-  if (iso === null) return '—';
+function formatDate(iso: string): string {
   // Locale-aware human format; fallback to the raw ISO if Date parsing
-  // fails for any reason (corrupt manifest snuck past the validator,
-  // exotic device locale config). Either way the screen does not throw.
+  // fails for any reason (exotic device locale config, unexpected Drive
+  // value). Either way the screen does not throw.
   try {
     const d = new Date(iso);
     if (Number.isNaN(d.getTime())) return iso;
@@ -74,10 +66,6 @@ function formatDate(iso: string | null): string {
   } catch {
     return iso;
   }
-}
-
-function modeIcon(mode: 'audio' | 'video'): string {
-  return mode === 'video' ? '🎥' : '🎤';
 }
 
 export default function RecoverScreen() {
@@ -173,9 +161,8 @@ export default function RecoverScreen() {
           lineHeight: 18,
         }}
       >
-        Sesiones respaldadas en tu Google Drive. Aparecen aquí incluso si
-        las grabaste desde otro dispositivo, siempre que sea la misma cuenta
-        de Drive.
+        Sesiones encontradas en tu Google Drive. Se comprobarán al
+        abrirlas.
       </Text>
 
       {state.kind === 'loading' && (
@@ -302,11 +289,11 @@ export default function RecoverScreen() {
 
       {state.kind === 'list' &&
         state.sessions.map((s) => {
-          // `protection_status` classifies the manifest/upload lifecycle
-          // (derived from `is_partial`, `completed_at` and uploaded
-          // evidence), never whether the recording itself ran to the
-          // end. The label says exactly that and no more.
-          const protection = recoveryListLabel(s.protection_status);
+          // Compact discovery has not read the manifest, so this row
+          // states only what the Drive listing knows: a file exists and
+          // when it was last written. No medium, no chunk count, no
+          // protection badge — each would be an invention here. They
+          // arrive, validated, when the user opens the row.
           return (
             <View
               key={s.session_id}
@@ -319,53 +306,25 @@ export default function RecoverScreen() {
                 marginBottom: 10,
               }}
             >
-              <View
+              <Text
                 style={{
-                  flexDirection: 'row',
-                  alignItems: 'center',
-                  marginBottom: 6,
+                  color: '#8b949e',
+                  fontSize: 11,
+                  marginBottom: 2,
                 }}
               >
-                <Text style={{ fontSize: 18, marginRight: 8 }}>
-                  {modeIcon(s.mode)}
-                </Text>
-                <Text
-                  style={{
-                    color: '#c9d1d9',
-                    fontSize: 14,
-                    fontWeight: '600',
-                    flexShrink: 1,
-                  }}
-                >
-                  {formatDate(s.completed_at)}
-                </Text>
-              </View>
-              <View
+                Última actualización
+              </Text>
+              <Text
                 style={{
-                  flexDirection: 'row',
-                  alignItems: 'center',
+                  color: '#c9d1d9',
+                  fontSize: 14,
+                  fontWeight: '600',
                   marginBottom: 12,
                 }}
               >
-                <View
-                  style={{
-                    width: 8,
-                    height: 8,
-                    borderRadius: 4,
-                    backgroundColor: protection.color,
-                    marginRight: 8,
-                  }}
-                />
-                <Text
-                  style={{
-                    color: protection.color,
-                    fontSize: 12,
-                    fontWeight: '600',
-                  }}
-                >
-                  {protection.label}
-                </Text>
-              </View>
+                {formatDate(s.reference_date)}
+              </Text>
               <Pressable
                 onPress={() => handleRecover(s.manifest_file_id)}
                 style={{

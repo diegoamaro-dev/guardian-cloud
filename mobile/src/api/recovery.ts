@@ -20,36 +20,38 @@
 
 import { apiFetch } from './client';
 
-export type ProtectionStatus = 'complete' | 'partial';
-export type RecoverableMode = 'audio' | 'video';
-
 /**
- * Mirrors `RecoverableSession` in `backend/src/services/recovery.service.ts`.
- * Kept as a manual copy (no shared types package) on purpose — the
- * boundary between mobile and backend stays explicit, and a future
- * schema change forces a deliberate edit on both sides.
+ * Mirrors `CompactRecoverableSession` in
+ * `backend/src/services/recovery.service.ts`. Kept as a manual copy (no
+ * shared types package) on purpose — the boundary between mobile and
+ * backend stays explicit, and a future schema change forces a deliberate
+ * edit on both sides.
+ *
+ * This app asks for `?view=compact` (see below), so it receives the
+ * metadata-only shape: no medium, no chunk count, no completion time, no
+ * protection status. Those live inside the manifest, which discovery
+ * never reads — `getRecoveryManifest` fetches and validates it when the
+ * user opens a session.
+ *
+ * A row means: "a manifest file exists for this session, last written at
+ * `reference_date`." Nothing more, because nothing more was read.
  */
 export interface RecoverableSession {
   session_id: string;
-  mode: RecoverableMode;
-  created_at: string;
   /**
-   * Completion timestamp. ISO string for sessions that reached
-   * /complete server-side. `null` for partial manifests written
-   * incrementally during recording (the session was interrupted before
-   * /complete fired — e.g. app killed mid-recording, uninstalled, then
-   * reinstalled). The "Parcial" badge derives from `protection_status`,
-   * not from this field directly.
-   */
-  completed_at: string | null;
-  chunk_count: number;
-  protection_status: ProtectionStatus;
-  /**
-   * Drive file_id of the manifest. Opaque to the UI — kept for COMMIT 3
-   * so a tap on "Recuperar" can deterministically address the manifest
-   * that was vetted at discovery time, with no re-list race.
+   * Drive file_id of the manifest. Opaque to the UI — a tap passes it to
+   * `getRecoveryManifest`, so the detail addresses exactly the file
+   * discovery saw, with no re-list race.
    */
   manifest_file_id: string;
+  /**
+   * When the manifest was last written, from Drive's `modifiedTime`.
+   *
+   * A REFERENCE date. It is NOT `completed_at` and must not be rendered
+   * as one: for a session still recording it is the last incremental
+   * write.
+   */
+  reference_date: string;
 }
 
 export interface DiscoveryResponse {
@@ -59,6 +61,13 @@ export interface DiscoveryResponse {
 
 /**
  * One-shot fetch of the recoverable-sessions list.
+ *
+ * Asks for `?view=compact` EXPLICITLY. Without it the endpoint returns
+ * its historical shape, which is downloaded and parsed manifest by
+ * manifest — the listing that stopped loading at ~10 s once the folder
+ * grew past a dozen files (GC-RECOVERY-MANIFEST-LIST-LATENCY-001). The
+ * parameter is opt-in precisely so APKs already in the field keep
+ * receiving the shape they were written against.
  *
  * Returns `{ drive_not_connected: true, manifests: [] }` (NOT an error)
  * when the user has not connected Drive on this account — the screen
@@ -70,7 +79,7 @@ export interface DiscoveryResponse {
 export function getRecoverableManifests(
   signal?: AbortSignal,
 ): Promise<DiscoveryResponse> {
-  return apiFetch<DiscoveryResponse>('/recovery/manifests', {
+  return apiFetch<DiscoveryResponse>('/recovery/manifests?view=compact', {
     method: 'GET',
     ...(signal ? { signal } : {}),
   });

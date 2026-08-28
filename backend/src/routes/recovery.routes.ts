@@ -30,6 +30,8 @@ import {
   downloadManifestChunk,
   getManifestByFileId,
   listDriveManifests,
+  listDriveManifestsCompact,
+  parseDiscoveryView,
 } from '../services/recovery.service.js';
 
 const router = Router();
@@ -41,7 +43,31 @@ router.get(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       if (!req.user) throw new UnauthorizedError();
-      const result = await listDriveManifests(req.user.id);
+
+      // GC-RECOVERY-MANIFEST-LIST-LATENCY-001 — `view` is OPT-IN.
+      //
+      // No `view` → the historical response, byte-for-byte what it was
+      // before this option existed. APKs already in the field parse that
+      // shape and must keep receiving it; a faster endpoint that returns
+      // fewer fields to a client written against the old one would make
+      // that client render values it never received.
+      //
+      // `view=compact` → metadata-only discovery candidates, zero
+      // manifest downloads. Anything else is a 400: see
+      // `parseDiscoveryView` for why an unknown value must not fall back.
+      const view = parseDiscoveryView(req.query.view);
+      if (view === null) {
+        throw new AppError(
+          400,
+          'INVALID_VIEW',
+          "Unknown 'view'. Omit it for the full listing, or pass 'compact'.",
+        );
+      }
+
+      const result =
+        view === 'compact'
+          ? await listDriveManifestsCompact(req.user.id)
+          : await listDriveManifests(req.user.id);
       res.status(200).json(result);
     } catch (err) {
       // `listDriveManifests` is documented as never-throwing, but the

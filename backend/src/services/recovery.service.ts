@@ -153,7 +153,17 @@ function deriveHomogeneousMedia(
  * validate `session_id` inside a parsed manifest.
  */
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const MANIFEST_NAME_REGEX = /^[0-9a-f-]{36}_manifest\.json$/i;
+/**
+ * Manifest filename. The capture group yields the session_id, which the
+ * COMPACT discovery path reads from the name instead of from the body.
+ *
+ * The accepted set is UNCHANGED — adding a group does not alter what
+ * matches, and the historical path's `.test()` is unaffected. This
+ * pattern is looser than `UUID_REGEX` and would accept, say, 36 dashes;
+ * that was true before this change too. Narrowing it is a separate
+ * decision, deliberately not taken here.
+ */
+const MANIFEST_NAME_REGEX = /^([0-9a-f-]{36})_manifest\.json$/i;
 /**
  * Deterministic chunk filename pattern. Must match the formula written
  * by `manifest.service.ts:chunkFileName` and `destinations.routes.ts`
@@ -529,6 +539,241 @@ export async function listDriveManifests(
       deduped: manifests.length,
     },
     'GC_DISCOVERY_OK',
+  );
+
+  return { drive_not_connected: false, manifests };
+}
+
+// ===========================================================================
+// COMPACT DISCOVERY — opt-in, metadata only
+// ===========================================================================
+//
+// GC-RECOVERY-MANIFEST-LIST-LATENCY-001.
+//
+// The historical listing above downloads and parses EVERY manifest in the
+// folder, in series, to fill fields the list screen does not render. Cost
+// grows linearly with the folder — measured ~0.8 s per manifest, 56-65 s
+// at 75 of them — against the mobile client's fixed 10 s timeout, so the
+// list stopped loading once the folder passed roughly a dozen files.
+//
+// This path answers the only question discovery actually has to answer —
+// "which sessions have a manifest in Drive?" — using the folder listing
+// alone. One Drive call. Zero manifest downloads.
+//
+// It is OPT-IN (`?view=compact`) and the historical response above is
+// untouched, because APKs already in the field parse that shape. A client
+// that does not ask for compact must keep getting exactly what it got
+// before this existed.
+//
+// What a compact row is, and is not:
+//
+//   IS      a discovery CANDIDATE: a file exists with this name, last
+//           written at this time. Both facts come from the listing.
+//   IS NOT  a validated manifest. Nothing here has been parsed, so
+//           nothing here may claim a medium, a chunk count, a completion
+//           time or a protection status.
+//
+// Hard validation stays exactly where it already was: `getManifestByFileId`
+// when the user opens a row, and the chunk download + sha256 check on
+// export. Neither is touched.
+
+/**
+ * Compact discovery projection. Every field is derivable from Drive file
+ * metadata; none requires reading a manifest body.
+ */
+export interface CompactRecoverableSession {
+  /** Captured from the file NAME, which is `${session.id}_manifest.json`. */
+  session_id: string;
+  /** Drive file_id. Opaque; it is what the detail screen addresses. */
+  manifest_file_id: string;
+  /**
+   * Drive's `modifiedTime` — when the manifest was last written.
+   *
+   * A REFERENCE date, and it must be labelled as one. It is NOT
+   * `completed_at`: for a session still recording it is the last
+   * incremental write. Presenting it as a completion time would state
+   * something this path never read.
+   */
+  reference_date: string;
+}
+
+export interface CompactDiscoveryResult {
+  drive_not_connected: boolean;
+  manifests: CompactRecoverableSession[];
+}
+
+/** The two shapes `GET /recovery/manifests` can return. */
+export type DiscoveryView = 'historical' | 'compact';
+
+/**
+ * Resolve the `view` query parameter.
+ *
+ * Absent → `historical`, so a client that predates this option keeps the
+ * response it was written against. `compact` → the metadata-only shape.
+ * ANYTHING else → `null`, and the caller answers 400.
+ *
+ * The refusal is deliberate: silently falling back on an unknown value
+ * would let a typo (`?view=compat`) return the historical shape to a
+ * client expecting the compact one, and the mismatch would surface as
+ * missing fields rather than as an error.
+ */
+export function parseDiscoveryView(raw: unknown): DiscoveryView | null {
+  if (raw === undefined) return 'historical';
+  if (raw === 'compact') return 'compact';
+  return null;
+}
+
+interface CompactCandidate {
+  session_id: string;
+  manifest_file_id: string;
+  modifiedTime: string;
+}
+
+/**
+ * One entry per session_id, newest `modifiedTime` winning, sorted newest
+ * first.
+ *
+ * Drive permits two files to share a name in one folder, so the same
+ * `{session_id}_manifest.json` can appear more than once — observed in
+ * the field. Both describe the same session; the newest is the one that
+ * matters and the rest collapse into it. That is the same rule the
+ * historical path applies, with the key read from the name instead of
+ * from the parsed body.
+ *
+ * Exposed for unit testing.
+ */
+export function dedupAndSortCompact(
+  candidates: CompactCandidate[],
+): CompactRecoverableSession[] {
+  const bySession = new Map<string, CompactCandidate>();
+  for (const cand of candidates) {
+    const existing = bySession.get(cand.session_id);
+    if (!existing || cand.modifiedTime > existing.modifiedTime) {
+      bySession.set(cand.session_id, cand);
+    }
+  }
+
+  const out: CompactRecoverableSession[] = [];
+  for (const cand of bySession.values()) {
+    out.push({
+      session_id: cand.session_id,
+      manifest_file_id: cand.manifest_file_id,
+      reference_date: cand.modifiedTime,
+    });
+  }
+
+  // Newest first, by the only date this path knows. ISO strings sort
+  // lexically.
+  out.sort((a, b) => {
+    if (a.reference_date < b.reference_date) return 1;
+    if (a.reference_date > b.reference_date) return -1;
+    return 0;
+  });
+  return out;
+}
+
+/**
+ * Compact discovery entry point. Never throws — same failure contract as
+ * `listDriveManifests`: Drive-not-connected and any other failure both
+ * fold into a deterministic response.
+ *
+ * The destination preamble is duplicated from `listDriveManifests` rather
+ * than extracted: the historical path is consumed by APKs already in the
+ * field and this change does not touch a line of it.
+ */
+export async function listDriveManifestsCompact(
+  userId: string,
+): Promise<CompactDiscoveryResult> {
+  let dest;
+  try {
+    dest = await getDestinationWithSecretForUser(userId, 'drive');
+  } catch (err) {
+    logger.warn(
+      {
+        op: 'recovery.discover_compact',
+        userId,
+        reason: 'destination_lookup_failed',
+        err: err instanceof Error ? err.message : String(err),
+      },
+      'GC_DISCOVERY_FAILED',
+    );
+    return { drive_not_connected: true, manifests: [] };
+  }
+
+  if (!dest || dest.status !== 'connected' || !dest.refresh_token) {
+    logger.info(
+      {
+        op: 'recovery.discover_compact',
+        userId,
+        reason: dest ? `drive_status_${dest.status}` : 'no_drive_destination',
+      },
+      'GC_DISCOVERY_DRIVE_NOT_CONNECTED',
+    );
+    return { drive_not_connected: true, manifests: [] };
+  }
+
+  const refreshToken = dest.refresh_token;
+  const folderId = dest.folder_id;
+  if (!folderId) {
+    // Same rule as the historical path: discovery never creates folders.
+    logger.info(
+      { op: 'recovery.discover_compact', userId, reason: 'no_folder_id' },
+      'GC_DISCOVERY_EMPTY',
+    );
+    return { drive_not_connected: false, manifests: [] };
+  }
+
+  let candidates: CompactCandidate[];
+  try {
+    candidates = await withDriveRetry(refreshToken, async (accessToken) => {
+      // The ONLY Drive call in this path. Pagination limits are the
+      // existing ones — unchanged.
+      const files = await listFilesInFolder(accessToken, folderId, {
+        nameContains: '_manifest.json',
+        pageSize: 100,
+        maxPages: 10,
+      });
+
+      // Regex-tighten on top of Drive's substring match, and capture the
+      // session_id from the name. `something_manifest.json_old` matches
+      // the substring filter but is not a manifest of ours. The accepted
+      // set is exactly the historical one; only the capture is new.
+      const out: CompactCandidate[] = [];
+      for (const f of files) {
+        const match = MANIFEST_NAME_REGEX.exec(f.name);
+        if (!match) continue;
+        out.push({
+          session_id: match[1] as string,
+          manifest_file_id: f.id,
+          modifiedTime: f.modifiedTime,
+        });
+      }
+      return out;
+    });
+  } catch (err) {
+    logger.warn(
+      {
+        op: 'recovery.discover_compact',
+        userId,
+        reason: 'drive_list_failed',
+        err: err instanceof Error ? err.message : String(err),
+      },
+      'GC_DISCOVERY_FAILED',
+    );
+    return { drive_not_connected: false, manifests: [] };
+  }
+
+  const manifests = dedupAndSortCompact(candidates);
+
+  logger.info(
+    {
+      op: 'recovery.discover_compact',
+      userId,
+      raw: candidates.length,
+      deduped: manifests.length,
+      downloads: 0,
+    },
+    'GC_DISCOVERY_COMPACT_OK',
   );
 
   return { drive_not_connected: false, manifests };
