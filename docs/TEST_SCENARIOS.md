@@ -48,6 +48,7 @@ marca el nivel que se puede acreditar, no el máximo alcanzable.
 | 16 — Recuperación por usuario | `HARDWARE_VALIDATED` **parcial** | Recovery de una sesión pendiente tras restaurar Drive, 20/08 · `recoveryVerdict`, `exportFromChunkRefs`. Los casos 2–8 de este escenario **no** están validados en hardware como casos formales. El caso 9 se definió después, a partir de un estado observado en hardware el 2026-08-27 durante H4; esa observación **no** es una ejecución formal del caso |
 | 17 — Vídeo nativo con durable cleanup | `HARDWARE_VALIDATED` en su **ruta normal** | Validación 20/08 · puntos 5–8 en `HARDWARE_HARDENING_PENDING` |
 | 18 — Transición segura a segundo plano | `DEFINIDO` | Sin cobertura. Su criterio es `BACKGROUND TRANSITION SAFETY` y se acreditará en el gate G5 de Continuous Protection |
+| 19 — Descubrimiento compacto y rollout | `DEFINIDO` | Cubierto por pruebas automáticas con Drive mockeado (`recoveryCompactDiscovery`, `recoveryCompactList`). **Ninguno de sus cinco casos se ha ejecutado**: exigen Drive real, despliegue y dispositivo |
 
 #### Escenario 18 — Transición segura a segundo plano
 
@@ -478,3 +479,63 @@ evidencia.
 
 Registrar commit exacto, dispositivo, versión Android, resultados observables y
 evidencias antes de cambiar cualquiera de estos estados.
+
+---
+
+## Escenario 19 — Descubrimiento compacto y rollout
+
+Introducido por `GC-RECOVERY-COMPACT-DISCOVERY-001` (commit `26c0966`). El
+cambio está implementado y con pruebas automáticas **sobre Drive mockeado**;
+todo lo que sigue exige Drive real, despliegue o dispositivo, y **nada de ello
+se ha ejecutado**.
+
+El orden importa: el paso 2 va **antes** que el 3. Desplegar el backend antes de
+instalar la APK nueva no rompería nada —el contrato por defecto se conserva—
+pero deja sin comprobar precisamente la compatibilidad que lo justifica.
+
+| # | Caso | Estado |
+|---|---|---|
+| 1 | **APK nueva → backend viejo.** La app pide `?view=compact` contra un backend que no lo conoce. Registrar qué responde y qué muestra la pantalla | `DEFINIDO — NO VALIDADO` |
+| 2 | **APK antigua → backend nuevo.** Sin `view`, debe recibir el contrato histórico de siete campos y renderizar como siempre. Es la compatibilidad que justifica que compact sea opt-in | `DEFINIDO — NO VALIDADO` |
+| 3 | **Compact sobre Drive real.** Ejecutar `?view=compact` contra la carpeta real y verificar el listado contra la propia carpeta. Criterio detallado abajo | `DEFINIDO — NO VALIDADO` |
+| 4 | **Medición de latencia.** `responseTime` en el log del backend para ambos caminos sobre el mismo dataset. Línea base del camino histórico ya registrada: 56 594 ms y 64 666 ms con 75 manifiestos | `DEFINIDO — NO VALIDADO` |
+| 5 | **Paginación con más de 100 resultados.** `pageSize` es 100, así que una carpeta mayor obliga a `files.list` a varias requests. Comprobar que el listado sigue completo y que **sigue sin descargar cuerpos** | `DEFINIDO — NO VALIDADO` |
+
+### Caso 3 — criterio detallado
+
+**El oráculo es la carpeta de Drive, no el listado histórico.** Verificar sobre
+Drive real:
+
+* que compact devuelve **un candidato por cada `session_id` distinto** entre los
+  nombres de manifiesto aceptados de la carpeta, **después de deduplicar** — no
+  uno por fichero: Drive admite varias entradas con el mismo nombre, y de cada
+  grupo gana la de **`modifiedTime` más reciente**;
+* que **`manifest_file_id`** se conserva y coincide con el id real del fichero
+  que ganó esa deduplicación;
+* que **`reference_date`** corresponde al `modifiedTime` de ese mismo fichero;
+* que el listado queda ordenado por **`reference_date` descendente**;
+* que **no se descargan cuerpos de manifiesto** durante el discovery compact,
+  *si la instrumentación disponible permite observarlo*.
+
+> **El camino histórico sirve como comparación DIAGNÓSTICA, nunca como oráculo
+> de igualdad de conjuntos.** Los dos conjuntos **pueden diferir por diseño**:
+> el histórico descarga y valida el cuerpo, compact sólo usa nombre y metadata.
+> Un fichero con nombre aceptado y cuerpo inválido aparece en compact y el
+> histórico lo omite; un nombre degenerado, o uno cuyo `session_id` no coincida
+> con el del cuerpo, también puede divergir. Está documentado en
+> [`API_SPEC.md`](./API_SPEC.md) §Recovery y registrado como riesgo abierto en
+> [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md).
+>
+> **Cualquier diferencia se registra y se explica** en términos de *candidate
+> discovery* frente a *manifest validation*. **No se considera fallo
+> automáticamente.** Sólo es fallo si la diferencia no admite explicación por
+> esa separación.
+
+**Qué NO acredita este escenario aunque los cinco casos pasen:** que el
+manifiesto de una sesión listada sea válido, que sus chunks estén completos, ni
+que la evidencia sea recuperable. Compact es descubrimiento de candidatos; la
+validación vive en el detalle y en el export, y se acredita en el Escenario 16.
+
+**Relación con `ARMA C`:** el caso 3 es el que permitiría observar si la sesión
+`1ce18e76-3ff9-45a6-a77b-1dd7c2dd3711` está **ausente** del descubrimiento, que
+es la única premisa de `ARMA C` que sigue sin observarse.

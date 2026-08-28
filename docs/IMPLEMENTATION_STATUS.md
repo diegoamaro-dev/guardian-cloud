@@ -672,8 +672,24 @@ Before this change:
 
 Now:
 - partial manifests make interrupted sessions discoverable
-- recovery can show them as partial
+- recovery can show them as partial — **en el contrato histórico del endpoint;
+  ver la nota siguiente sobre dónde lo hace la app**
 - uploaded evidence can be exported even if the original app install is gone
+
+> **Dónde se distingue parcial de completa, desde `GC-RECOVERY-COMPACT-DISCOVERY-001`.**
+> El endpoint **sigue emitiendo `protection_status`** en su respuesta por
+> defecto, así que la frase de arriba sigue siendo cierta a nivel de API. Lo que
+> cambia es el cliente: la app pide `?view=compact`, cuya respuesta se construye
+> sólo con metadata de Drive y **no** clasifica. En la app, esa distinción se
+> determina **al abrir la sesión**, donde el manifiesto sí se descarga y valida.
+>
+> Lo que **no** cambia: la sesión sigue siendo igual de descubrible, y el export
+> sigue reconstruyendo desde los chunks que existan. Es información que cambia
+> de sitio dentro de la app, no que se pierda. Contrato en
+> [`API_SPEC.md`](./API_SPEC.md) §Recovery.
+>
+> **Nada de esto está validado en dispositivo:** el cambio está commiteado, no
+> desplegado ni instalado. Ver el registro de más abajo.
 
 ### Architecture
 
@@ -763,3 +779,73 @@ scheduler.
 
 Audio live-stream chunking remains independent and optimized separately
 (32 KB disk-backed audio chunks).
+
+---
+
+## `GC-RECOVERY-COMPACT-DISCOVERY-001` — descubrimiento compacto opt-in
+
+Commit **`26c09660b7fb49f74f4e63d0130ac8b134bf1831`**, sobre `main`.
+
+**Estado: `IMPLEMENTADO / PROBADO EN SOFTWARE`. Sin ninguna validación en
+Drive real, en dispositivo ni en despliegue.**
+
+### Qué problema aborda
+
+`GET /recovery/manifests` descargaba y parseaba **todos** los manifiestos de la
+carpeta, en serie, para rellenar campos que la pantalla de listado no pinta. El
+coste crecía con la carpeta —serie observada en el log del backend: 1 manifiesto
+→ 1,2 s; 10 → 7,6 s; 19 → 12,8 s; 75 → 56–65 s— frente al timeout fijo de 10 s
+del cliente móvil, de modo que la lista **dejaba de cargarse** una vez la
+carpeta pasaba de una docena larga de ficheros. Registrado como
+`GC-RECOVERY-MANIFEST-LIST-LATENCY-001`; **sin severidad asignada**.
+
+### Implementado y probado en software
+
+| | |
+|---|---|
+| `?view=compact` opt-in | Devuelve `session_id`, `manifest_file_id`, `reference_date` |
+| Contrato por defecto | **Conservado sin cambios**: sin `view` se sigue devolviendo la forma histórica de siete campos, descargando y parseando cuerpos |
+| `view` desconocido | **Contrato: `400 INVALID_VIEW`**, sin fallback silencioso. Evidencia **parcial**: `parseDiscoveryView` está cubierta por pruebas unitarias que demuestran que ningún valor desconocido cae a la forma histórica; el mapeo de `null` a HTTP `400` está implementado en la ruta y **verificado por inspección**, no por prueba. **No hay cobertura HTTP extremo a extremo con JWT válido** — ver riesgos abiertos |
+| Cero descargas en compact | Demostrado **con mocks**: 75 ficheros, `downloadFile` no invocado ni una vez |
+| Tests backend | `recoveryCompactDiscovery.test.ts` — 19, incluidos los del contrato histórico y su clasificación `partial`/`complete` |
+| Tests móvil | `recoveryCompactList.test.ts` — 11, a nivel de fuente |
+| UX compact | La fila no afirma protección, integridad ni validación; muestra fecha de referencia y una sola acción |
+| Validación dura | **Intacta**: `getManifestByFileId` y la verificación `sha256` de la descarga de chunks no se tocan |
+
+### NO validado — nada de esto se ha ejecutado
+
+```
+Drive real                                    no ejecutado
+latencia real tras el cambio                  no medida
+nº real de requests paginadas de files.list
+  sobre el dataset real                       no medido
+APK nueva en dispositivo                      no construida ni instalada
+APK antigua contra el backend nuevo           no probado
+rollout                                       no realizado
+ausencia de 1ce18e76-… en el descubrimiento   no observada
+```
+
+**Ninguna cifra de las de arriba es un `PASS` de hardware o de staging.** La
+serie de latencias citada es la del comportamiento **anterior**, medida en el
+log del backend; no hay ninguna medición del comportamiento nuevo.
+
+### Relación con ARMA C
+
+La **premisa 11** de `ARMA C` —que la sesión `1ce18e76-…` esté **ausente** del
+descubrimiento— quedó establecida estructuralmente pero **no observada**, porque
+la lista no cargaba. Su cierre depende de ejecutar el rollout y mirar la lista;
+hasta entonces `ARMA C` sigue en `NEEDS_MORE_EVIDENCE`.
+
+### Riesgos que siguen abiertos
+
+* el camino histórico **`O(N)` sigue vivo** por compatibilidad;
+* el patrón de nombre histórico admite nombres degenerados de 36 caracteres,
+  que en compact se publicarían como `session_id` no canónico;
+* compact puede listar un candidato cuyo nombre no coincida con el `session_id`
+  del cuerpo — los dos caminos pueden divergir en ese caso;
+* un candidato inválido aparece y falla al abrirse, por diseño;
+* `400 INVALID_VIEW` **no** tiene cobertura HTTP con JWT válido: probarlo exige
+  que `authMiddleware` busque el JWKS por red, que es lo que hace fallar por
+  timeout a los cuatro tests de integración preexistentes.
+
+**Este registro no mueve el veredicto `NO APTO PARA RELEASE`.**

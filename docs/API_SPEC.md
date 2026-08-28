@@ -266,6 +266,11 @@ Restricciones de diseño que siguen vigentes:
 
 Lista manifests recuperables del usuario.
 
+**Sin el parámetro `view`**, el contrato es el de siempre, sin cambios. Se
+conserva así por compatibilidad con las APK ya instaladas, que parsean esta
+forma. Sigue devolviendo los siete campos históricos, y sigue construyéndose
+descargando y parseando el cuerpo de cada manifiesto:
+
 ```json
 {
   "drive_not_connected": false,
@@ -290,6 +295,75 @@ Lista manifests recuperables del usuario.
 > sesión cuyos bytes existen sería peor que no dibujarlo. La negativa dura vive
 > en el endpoint siguiente, donde una respuesta equivocada produciría un
 > artefacto falso en lugar de un glifo equivocado.
+
+### GET /recovery/manifests?view=compact
+
+Variante **opt-in**, añadida por `GC-RECOVERY-COMPACT-DISCOVERY-001`
+(commit `26c0966`). Es **descubrimiento de candidatos**: responde qué
+sesiones tienen un manifiesto en Drive, no qué contiene cada uno.
+
+```json
+{
+  "drive_not_connected": false,
+  "manifests": [
+    {
+      "session_id": "uuid-derivado-del-nombre-de-fichero",
+      "manifest_file_id": "drive_file_id",
+      "reference_date": "modifiedTime de Drive"
+    }
+  ]
+}
+```
+
+| campo | origen |
+|---|---|
+| `session_id` | del **nombre** del fichero, `{session_id}_manifest.json` |
+| `manifest_file_id` | `id` de la entrada de Drive · opaco para la UI |
+| `reference_date` | `modifiedTime` de la entrada de Drive |
+
+**Qué NO implica una fila de esta respuesta:**
+
+* **no** implica que el manifiesto se haya leído;
+* **no** implica integridad verificada;
+* **no** implica que todos los chunks estén disponibles;
+* **no** implica recuperabilidad demostrada.
+
+Afirma exactamente dos cosas, ambas ciertas por construcción porque salen del
+propio listado: **existe un fichero con ese nombre, y ésta es la última vez que
+se escribió**.
+
+`reference_date` **no es `completed_at`**: para una sesión aún en curso es su
+último manifiesto incremental. Debe presentarse etiquetado como fecha de
+referencia. Es además la clave de orden —descendente— y el criterio de
+desempate cuando dos ficheros de Drive comparten nombre, cosa que Drive permite.
+
+`manifest_file_id` es la identidad con la que se abre el detalle. **La
+validación del manifiesto sigue en `getManifestByFileId`**, y la validación
+efectiva de la evidencia —presencia de chunks y `sha256`— permanece donde
+estaba, en el flujo de recuperación/export. Compact no cambia ninguno de los dos.
+
+Consecuencia deliberada: un fichero con nombre válido y contenido inválido
+**aparece** como candidato, en lugar de omitirse en silencio; al abrirlo,
+`GET /recovery/manifests/:manifest_file_id` responde `404 MANIFEST_INVALID`.
+
+**Coste.** Consulta **paginada** de metadata de Drive, con **cero descargas de
+cuerpos de manifiesto**. En detalle: una invocación a `listFilesInFolder`, que
+internamente pagina hasta `maxPages`, de modo que `files.list` puede realizar
+**varias** requests según el tamaño de la carpeta; lo que sí es invariante del
+camino compact es que **no ejecuta ningún `downloadFile` de manifiesto**.
+
+#### Valores de `view`
+
+| valor | comportamiento |
+|---|---|
+| ausente | contrato histórico, arriba |
+| `compact` | esta variante |
+| cualquier otro | **`400 INVALID_VIEW`** |
+
+Un valor desconocido **no hace fallback silencioso**: devolver la forma
+histórica ante `?view=compat` le entregaría a un cliente que espera la compacta
+una respuesta distinta, y el desajuste aparecería como campos ausentes en lugar
+de como error.
 
 ### GET /recovery/manifests/:manifest_file_id
 
