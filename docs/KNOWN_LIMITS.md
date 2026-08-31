@@ -1588,10 +1588,15 @@ aserciones acotadas por rama.
 
 ## `GC-QUEUE-PARSE-WIPE-001` — un JSON ilegible sustituye la cola por un array vacío
 
-**Estado: `OPEN`. Sin remediation propuesta.** Descubierto por lectura estática
+**Estado: `FIXED IN CODE / AUTOMATED TESTS`.** Corregido en
+`eb8634045d8da8fe219120ec671ca12c8f54e1f6`. Descubierto por lectura estática
 durante el preflight de G1 (2026-08-25).
 
-### Ruta exacta
+> **NO está `CLOSED`.** La validación en hardware sigue **pendiente**: el
+> defecto nació de lectura estática y su activación no se ha observado nunca en
+> dispositivo, ni antes ni después de la corrección.
+
+### Ruta exacta — comportamiento HISTÓRICO, ya corregido
 
 `mobile/app/index.tsx`, dentro de `queueMutate`:
 
@@ -1636,12 +1641,49 @@ borraba la cola ahí y que eso destruía evidencia a mitad de emisión. La rama 
 dispositivo, no se ha reproducido, y **no se afirma probabilidad, frecuencia ni
 impacto real**. Lo verificado es la estructura del código, no que haya ocurrido.
 
-### Por qué sigue abierto
+### Corrección
 
-Corregirlo cambia comportamiento observable en una ruta de recuperación de datos
-y exige decidir qué hacer con un valor ilegible —conservarlo, aislarlo, o fallar
-cerrado—, lo que es una decisión de producto con su propio criterio de
-validación. Requiere gate propio.
+Se decidió **aislar**: preservar los bytes ilegibles antes de reiniciar la cola,
+nunca sobrescribirlos. `queueMutate` sólo alcanza `queue = []` tras una
+preservación **nueva y verificada**, o tras reconocer exactamente los mismos
+bytes ya preservados. Tres ramas:
+
+```
+salvage vacío      preservar literal en gc.queue.salvage.v1 · releer ·
+                   comparar · sólo entonces continuar
+existing === raw   ya acreditado en un intento anterior cuyo callback o
+                   persistencia final no completó → transición idempotente,
+                   SIN reescribir la ranura
+existing !== raw   corrupción distinta con la ranura ocupada → fail closed:
+                   ni se sobrescribe el salvage ni se toca PENDING_RETRY_KEY
+```
+
+Si la escritura del salvage o su relectura fallan, se re-lanza y
+`PENDING_RETRY_KEY` queda intacto — la misma postura de fallo cerrado que la
+rama vecina de `getItem` ya practicaba ante `CursorWindow`.
+
+**`gc.queue.salvage.v1` no es una cola ni una segunda fuente de verdad.**
+Worker, retry y recovery no la consumen; una prueba de fuente lo verifica
+barriendo `mobile/src` y `mobile/app`. `GC_QUEUE` sigue siendo la única fuente
+operativa del trabajo pendiente.
+
+Evidencia, en su nivel exacto y sin ascender: **44/44** pruebas focalizadas de
+`queue.test.ts`, **958/958** en la suite móvil (43 ficheros) y typecheck en
+**12** errores heredados, sin drift. Son dimensiones de *implementación* y
+*pruebas automáticas*; ninguna acredita validación.
+
+### Lo que sigue abierto
+
+1. **Nada vacía la ranura.** No existe mecanismo normal que limpie
+   `gc.queue.salvage.v1` tras una corrupción preservada.
+2. **Una corrupción con bytes distintos y la ranura ocupada falla cerrado**, y
+   bloquea las mutaciones de cola hasta que alguien intervenga. Es el coste
+   aceptado de la política de ranura única.
+3. **El DEV reset no limpia la clave** — `mobile/src/dev/reset.ts` no la conoce.
+   Deuda de tooling, no de producto.
+4. **El salvage preserva, no recupera.** Saca los bytes del camino de
+   destrucción; no los reinyecta en la cola ni los sube.
+5. **Sin validación en hardware.**
 
 ---
 

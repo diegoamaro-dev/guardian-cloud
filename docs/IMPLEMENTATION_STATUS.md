@@ -8,11 +8,11 @@
 | Producto usado para la revalidación de `GC-DEST-PAUSE-001` | **`22a9b26`** (APK release `2b3be062…`) |
 | Producto usado para la validación de `GC-START-LATENCY-001` | **`e643b01`** (APK release `1cb80fea…`) |
 | Producto usado para la validación de **D3 local segment salvage** | **`cb59c7e`** (APK release `8151c338…`) |
-| Última suite automática registrada | **2026-08-26**, tras **`fc9a20e`** — 936/936 en 42 ficheros · typecheck 12, sin drift |
+| Última suite automática registrada | **2026-08-31**, tras **`eb86340`** — 958/958 en 43 ficheros · typecheck 12, sin drift |
 
 > Las fechas y los commits son distintos a propósito, y no deben fundirse. La
-> suite vigente —936/936 en 42 ficheros— se midió sobre el árbol posterior a
-> `fc9a20e`; las tres validaciones de hardware se hicieron en dispositivo, no
+> suite vigente —958/958 en 43 ficheros— se midió sobre el árbol posterior a
+> `eb86340`; las tres validaciones de hardware se hicieron en dispositivo, no
 > corriendo la suite, y cada una sobre **su propio APK**:
 > `GC-DEST-PAUSE-001` sobre `22a9b26`, `GC-START-LATENCY-001` sobre `e643b01` y
 > **D3** sobre `cb59c7e`. **Ninguna cifra de tests describe un APK.**
@@ -294,13 +294,23 @@ asimetría es deuda documental conocida, no un descuido de este documento.
 
 ### Validación automática actual
 
-Ejecutada el 2026-08-26 sobre el árbol posterior a `fc9a20e`.
+Ejecutada el 2026-08-31 sobre el árbol posterior a `eb86340`.
 
 | Comprobación | Resultado |
 |---|---|
-| Suite completa | **936/936**, en **42 ficheros** |
+| Suite completa | **958/958**, en **43 ficheros** |
 | Typecheck | **12 errores TypeScript históricos, cero nuevos** — typecheck **NO** verde |
 | `git diff --check` | Limpio |
+
+> **La cifra reconcilia dos incrementos, no uno.** El salto desde la anterior
+> registrada no es atribuible a un solo commit:
+>
+> ```
+> 936 / 42   corte anterior de este documento, tras fc9a20e
+> +11 / +1   26c0966 — recoveryCompactList.test.ts, no documentado en su momento
+> +11 / +0   eb86340 — GC-QUEUE-PARSE-WIPE-001, en queue.test.ts
+> 958 / 43   medido el 2026-08-31
+> ```
 
 > Cortes anteriores: **360/360** el 20/08, **781/781 en 40 ficheros** el 23/08
 > sobre `34412a0` y **792/792 en 41 ficheros** el 24/08 tras `3c10994`. El
@@ -345,6 +355,22 @@ Registrados el 2026-08-27. Su ficha completa vive en
 | `GC-MANIFEST-BESTEFFORT-001` | **`OPEN`** — consecuencia ensayada en hardware el 27/08 para el manifiesto final; el caso sin ningún manifiesto **no** está validado. Sin severidad asignada |
 | `GC-OAUTH-SCHEME-COLLISION-001` | **`OPEN`** — hecho de código verificable; el desvío del deep link se observó en `G3''` **sin artefacto congelado**; explotabilidad no ensayada. Sin severidad asignada |
 | `GC-OAUTH-NOSTATE-001` | **`OPEN`** — trazado en código: `state` no se genera, no se valida y no se usa. El riesgo asociado es **inferido y no validado**. Sin severidad asignada |
+
+---
+
+## Findings de durabilidad de la cola
+
+Su ficha completa vive en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §6; aquí sólo
+consta su estado.
+
+| Finding | Estado |
+|---|---|
+| `GC-QUEUE-PARSE-WIPE-001` | **`FIXED IN CODE / AUTOMATED TESTS`** — corregido en `eb8634045d8da8fe219120ec671ca12c8f54e1f6`. Un valor de cola ilegible se **preserva verbatim y verificado** en `gc.queue.salvage.v1` antes de reiniciar la cola, en vez de ser sobrescrito por el array vacío; los mismos bytes ya salvados permiten reintentar sin reescribir la ranura. **NO `CLOSED`: validación en hardware pendiente.** Limitación principal: una corrupción con bytes **distintos** y la ranura ocupada **falla cerrado** y bloquea las mutaciones de cola hasta intervención |
+
+> Este finding no figuraba en este documento mientras estuvo `OPEN`. La omisión
+> era una asimetría documental, corregida aquí al existir implementación real.
+> `gc.queue.salvage.v1` **no es una cola ni una segunda fuente de verdad**:
+> `GC_QUEUE` sigue siendo la única.
 
 ---
 
