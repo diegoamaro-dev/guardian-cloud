@@ -588,3 +588,226 @@ describe("G3' — chunk writers stamp their medium", () => {
     expect(JSON.parse(raw as string)[0].chunks[0].media).toBe('audio');
   });
 });
+
+/**
+ * GC-QUEUE-PARSE-WIPE-001 — an unparseable queue value must be preserved
+ * before the queue is reset, never overwritten by the empty array.
+ *
+ * The salvage slot is a side store, not a queue: it is written at most
+ * once, read by nothing in the upload path, and its failure modes all
+ * leave PENDING_RETRY_KEY exactly as it was found.
+ */
+const SALVAGE_KEY = 'gc.queue.salvage.v1';
+const CORRUPT = '{"session_id":"aaaa","chunks":[{"chunk_ind';
+
+/** The mock's backing Map, exposed by the AsyncStorage factory above. */
+function store(): Map<string, string> {
+  return (AsyncStorage as unknown as { __store__: Map<string, string> })
+    .__store__;
+}
+
+describe('GC-QUEUE-PARSE-WIPE-001 — unparseable queue value', () => {
+  it('preserves the original bytes VERBATIM in the salvage slot', async () => {
+    await AsyncStorage.setItem(PENDING_RETRY_KEY, CORRUPT);
+
+    await queueMutate((q) => q.push(emptyEntry()));
+
+    expect(await AsyncStorage.getItem(SALVAGE_KEY)).toBe(CORRUPT);
+  });
+
+  it('writes the salvage BEFORE it touches PENDING_RETRY_KEY', async () => {
+    await AsyncStorage.setItem(PENDING_RETRY_KEY, CORRUPT);
+    vi.clearAllMocks();
+
+    await queueMutate((q) => q.push(emptyEntry()));
+
+    const writes = (
+      AsyncStorage.setItem as unknown as {
+        mock: { calls: [string, string][] };
+      }
+    ).mock.calls.map((c) => c[0]);
+    expect(writes[0]).toBe(SALVAGE_KEY);
+    expect(writes).toContain(PENDING_RETRY_KEY);
+    expect(writes.indexOf(SALVAGE_KEY)).toBeLessThan(
+      writes.indexOf(PENDING_RETRY_KEY),
+    );
+  });
+
+  it('applies the mutation and persists the fresh queue — capture continues', async () => {
+    await AsyncStorage.setItem(PENDING_RETRY_KEY, CORRUPT);
+
+    await queueMutate((q) => q.push(emptyEntry()));
+
+    const q = await queueRead();
+    expect(q).toHaveLength(1);
+    expect(q[0]!.session_id).toBe(SID);
+  });
+
+  it('DIFFERENT bytes with the slot occupied fail closed: neither blob is destroyed', async () => {
+    const earlier = '<<<earlier salvage, not yet recovered>>>';
+    await AsyncStorage.setItem(SALVAGE_KEY, earlier);
+    await AsyncStorage.setItem(PENDING_RETRY_KEY, CORRUPT);
+
+    await expect(
+      queueMutate((q) => q.push(emptyEntry())),
+    ).rejects.toThrow(/different salvage/i);
+
+    expect(await AsyncStorage.getItem(SALVAGE_KEY)).toBe(earlier);
+    expect(await AsyncStorage.getItem(PENDING_RETRY_KEY)).toBe(CORRUPT);
+  });
+
+  /** setItem keys observed since the last vi.clearAllMocks(). */
+  function writtenKeys(): string[] {
+    return (
+      AsyncStorage.setItem as unknown as {
+        mock: { calls: [string, string][] };
+      }
+    ).mock.calls.map((c) => c[0]);
+  }
+
+  it('a CALLBACK failure after salvage does not block the retry', async () => {
+    await AsyncStorage.setItem(PENDING_RETRY_KEY, CORRUPT);
+
+    // Attempt 1 — the salvage lands and verifies; the mutation blows up.
+    await expect(
+      queueMutate(() => {
+        throw new Error('callback exploded');
+      }),
+    ).rejects.toThrow(/callback exploded/);
+
+    expect(await AsyncStorage.getItem(PENDING_RETRY_KEY)).toBe(CORRUPT);
+    expect(await AsyncStorage.getItem(SALVAGE_KEY)).toBe(CORRUPT);
+
+    // Attempt 2 — same bytes, already preserved: retry, do NOT re-write.
+    vi.clearAllMocks();
+    await queueMutate((q) => q.push(emptyEntry()));
+
+    expect(writtenKeys()).not.toContain(SALVAGE_KEY);
+    expect(writtenKeys()).toContain(PENDING_RETRY_KEY);
+    expect(await AsyncStorage.getItem(SALVAGE_KEY)).toBe(CORRUPT);
+    expect(await queueRead()).toHaveLength(1);
+  });
+
+  it('a failed FINAL persist after salvage does not block the retry', async () => {
+    await AsyncStorage.setItem(PENDING_RETRY_KEY, CORRUPT);
+    const si = AsyncStorage.setItem as unknown as {
+      mockImplementationOnce: (
+        f: (k: string, v: string) => Promise<void>,
+      ) => void;
+    };
+    // Call order inside one queueMutate: 1st setItem is the salvage,
+    // 2nd is the final queue persist. Let the first through, fail the
+    // second.
+    si.mockImplementationOnce(async (k: string, v: string) => {
+      store().set(k, v);
+    });
+    si.mockImplementationOnce(async () => {
+      throw new Error('persist failed');
+    });
+
+    await expect(
+      queueMutate((q) => q.push(emptyEntry())),
+    ).rejects.toThrow(/persist failed/);
+
+    expect(await AsyncStorage.getItem(PENDING_RETRY_KEY)).toBe(CORRUPT);
+    expect(await AsyncStorage.getItem(SALVAGE_KEY)).toBe(CORRUPT);
+
+    // Attempt 2 — the salvage is already accredited; retry succeeds.
+    vi.clearAllMocks();
+    await queueMutate((q) => q.push(emptyEntry()));
+
+    expect(writtenKeys()).not.toContain(SALVAGE_KEY);
+    expect(writtenKeys()).toContain(PENDING_RETRY_KEY);
+    expect(await queueRead()).toHaveLength(1);
+  });
+
+  it('a failed salvage WRITE leaves the original untouched', async () => {
+    await AsyncStorage.setItem(PENDING_RETRY_KEY, CORRUPT);
+    (
+      AsyncStorage.setItem as unknown as {
+        mockImplementationOnce: (f: () => Promise<void>) => void;
+      }
+    ).mockImplementationOnce(async () => {
+      throw new Error('disk full');
+    });
+
+    await expect(
+      queueMutate((q) => q.push(emptyEntry())),
+    ).rejects.toThrow(/disk full/);
+
+    expect(await AsyncStorage.getItem(PENDING_RETRY_KEY)).toBe(CORRUPT);
+    expect(await AsyncStorage.getItem(SALVAGE_KEY)).toBeNull();
+  });
+
+  it('a salvage that reads back DIFFERENT leaves the original untouched', async () => {
+    await AsyncStorage.setItem(PENDING_RETRY_KEY, CORRUPT);
+    // Simulate a truncated write: the value lands, but not intact.
+    (
+      AsyncStorage.setItem as unknown as {
+        mockImplementationOnce: (
+          f: (k: string, v: string) => Promise<void>,
+        ) => void;
+      }
+    ).mockImplementationOnce(async (k: string, v: string) => {
+      store().set(k, v.slice(0, -3));
+    });
+
+    await expect(
+      queueMutate((q) => q.push(emptyEntry())),
+    ).rejects.toThrow(/could not be verified/i);
+
+    expect(await AsyncStorage.getItem(PENDING_RETRY_KEY)).toBe(CORRUPT);
+  });
+
+  it('a PARSEABLE value is untouched by any of this — no regression', async () => {
+    await queueAppendNewSession(emptyEntry());
+    await queueMutate((q) => {
+      q[0]!.complete_attempts = 7;
+    });
+
+    expect((await queueRead())[0]!.complete_attempts).toBe(7);
+    expect(await AsyncStorage.getItem(SALVAGE_KEY)).toBeNull();
+  });
+
+  it('an ABSENT value starts empty without writing any salvage', async () => {
+    expect(await AsyncStorage.getItem(PENDING_RETRY_KEY)).toBeNull();
+
+    await queueMutate((q) => q.push(emptyEntry()));
+
+    expect(await queueRead()).toHaveLength(1);
+    expect(await AsyncStorage.getItem(SALVAGE_KEY)).toBeNull();
+  });
+
+  it('no module outside app/index.tsx knows the salvage key', async () => {
+    // Criteria 9 + 10: the worker, retry, recovery, cleanup and export
+    // paths must not consume it, and it must not become a second source
+    // of truth. Asserted at SOURCE level, following the precedent of
+    // reliabilitySurfaces / recoveryCompactList: cheaper and stronger
+    // than instrumenting every consumer.
+    const { readFileSync, readdirSync, statSync } = await import('node:fs');
+    const { fileURLToPath } = await import('node:url');
+    const root = fileURLToPath(new URL('..', import.meta.url).href);
+
+    const offenders: string[] = [];
+    const walk = (dir: string) => {
+      for (const name of readdirSync(dir)) {
+        const full = `${dir}/${name}`;
+        if (statSync(full).isDirectory()) {
+          if (name === 'node_modules' || name === 'tests') continue;
+          walk(full);
+          continue;
+        }
+        if (!/\.(ts|tsx)$/.test(name)) continue;
+        if (full.endsWith('app/index.tsx')) continue;
+        const src = readFileSync(full, 'utf8');
+        if (src.includes(SALVAGE_KEY) || src.includes('QUEUE_SALVAGE_KEY')) {
+          offenders.push(full.slice(root.length));
+        }
+      }
+    };
+    walk(`${root}src`);
+    walk(`${root}app`);
+
+    expect(offenders).toEqual([]);
+  });
+});

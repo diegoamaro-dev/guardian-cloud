@@ -194,6 +194,32 @@ import { humanizeFailure } from '@/errors/humanError';
 export const PENDING_RETRY_KEY = 'test.pending_retry';
 
 /**
+ * Side slot for a queue value that could not be parsed.
+ *
+ * GC-QUEUE-PARSE-WIPE-001. Holds the ORIGINAL string verbatim — no
+ * envelope, no timestamp, no history — so a recovery tool can compare it
+ * byte for byte against what was stored.
+ *
+ * It is NOT a queue and must never become one. No worker, retry,
+ * recovery, cleanup or UI path reads it; PENDING_RETRY_KEY remains the
+ * only operational source of truth.
+ *
+ * Never overwritten. An occupied slot is compared against the value
+ * being salvaged:
+ *
+ *   same bytes      already preserved on an earlier attempt that did not
+ *                   reach the final persist — the transition retries,
+ *                   idempotently, without writing the slot again
+ *   different bytes a genuinely new corruption while an earlier salvage
+ *                   is still unrecovered — fails closed
+ *
+ * Nothing clears it yet — after a corruption the slot stays occupied
+ * indefinitely, and `mobile/src/dev/reset.ts` does not know about it.
+ * Both are recorded limitations, not oversights.
+ */
+const QUEUE_SALVAGE_KEY = 'gc.queue.salvage.v1';
+
+/**
  * Last known session_id on this device. Persisted as a side observation
  * (never read by the upload pipeline, never gates recovery) purely so the
  * Settings screen can offer a "Exportar última sesión" shortcut without
@@ -941,6 +967,58 @@ export async function queueMutate<T>(
             queue = [parsed as unknown as PendingQueueEntry];
           }
         } catch {
+          // GC-QUEUE-PARSE-WIPE-001 — this branch used to set `queue = []`
+          // and the setItem below then persisted that empty array over the
+          // original bytes. Every entry it held — including sessions with
+          // chunks not yet confirmed off-device — stopped being referenced
+          // by the source of truth.
+          //
+          // We now PRESERVE before we reset. The unreadable string is
+          // copied verbatim to a single side slot, read back, and compared;
+          // only a VERIFIED copy authorises starting from an empty queue.
+          // If preservation cannot be verified we re-throw and leave
+          // PENDING_RETRY_KEY untouched — the same fail-closed posture the
+          // getItem branch above already takes for CursorWindow.
+          //
+          // The slot is never overwritten. An occupied slot is compared
+          // against the bytes in hand:
+          //
+          //   different bytes — a genuinely new corruption while an
+          //     earlier salvage is still unrecovered. Fail closed rather
+          //     than destroy either blob.
+          //
+          //   same bytes — these were already preserved and verified on
+          //     an earlier attempt whose callback or final persist did
+          //     not complete. PENDING_RETRY_KEY still holds them, which
+          //     is exactly why we are here again. Treating that as a
+          //     second corruption would turn one transient failure into
+          //     a permanent block on every queue mutation, with the
+          //     evidence already safe. So the transition simply retries,
+          //     idempotently, without touching the slot.
+          const existing = await AsyncStorage.getItem(QUEUE_SALVAGE_KEY);
+          if (existing !== null && existing !== raw) {
+            console.log('GC_QUEUE_SALVAGE_OCCUPIED', {
+              raw_len: raw.length,
+              existing_len: existing.length,
+            });
+            throw new Error(
+              'queue value unreadable and a different salvage is still present',
+            );
+          }
+          if (existing === null) {
+            await AsyncStorage.setItem(QUEUE_SALVAGE_KEY, raw);
+            const readBack = await AsyncStorage.getItem(QUEUE_SALVAGE_KEY);
+            if (readBack !== raw) {
+              console.log('GC_QUEUE_SALVAGE_FAILED', {
+                raw_len: raw.length,
+                read_back_len: readBack === null ? null : readBack.length,
+              });
+              throw new Error('queue salvage could not be verified');
+            }
+            console.log('GC_QUEUE_SALVAGED', { raw_len: raw.length });
+          } else {
+            console.log('GC_QUEUE_SALVAGE_ALREADY', { raw_len: raw.length });
+          }
           queue = [];
         }
       }
