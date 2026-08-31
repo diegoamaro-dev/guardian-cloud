@@ -149,8 +149,9 @@ configuración implicada en [`OAUTH_DRIVE_CONFIGURATION.md`](./OAUTH_DRIVE_CONFI
   > obligatorio** — describe el motor histórico y el porqué de varias guardas.
 - Existing failing tests need review after the recovery flow is stabilized.
   **RESOLVED (2026-08-23)** — la suite **estaba** en 781/781 sin tests saltados
-  en esa fecha; hoy va por 936/936, y la cifra vigente vive arriba. El typecheck
-  sigue en 12 errores heredados, que es deuda aparte y está arriba.
+  en esa fecha; la cifra vigente vive en
+  [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md). El typecheck sigue
+  en 12 errores heredados, que es deuda aparte y está arriba.
 - Logs should be reduced before release.
 - Export flow has no entry point from the home screen yet (reachable only via direct route `/session/:id`). A Historial brick should list past sessions and link in (see `TODO(export-history)`).
   **RESOLVED** — `mobile/app/history.tsx` existe (382 líneas) y

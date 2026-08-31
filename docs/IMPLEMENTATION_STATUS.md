@@ -4,7 +4,7 @@
 
 | Qué | Cuándo / sobre qué |
 |---|---|
-| Estado documental vigente | **2026-08-26** |
+| Estado documental vigente | **2026-08-31** |
 | Producto usado para la revalidación de `GC-DEST-PAUSE-001` | **`22a9b26`** (APK release `2b3be062…`) |
 | Producto usado para la validación de `GC-START-LATENCY-001` | **`e643b01`** (APK release `1cb80fea…`) |
 | Producto usado para la validación de **D3 local segment salvage** | **`cb59c7e`** (APK release `8151c338…`) |
