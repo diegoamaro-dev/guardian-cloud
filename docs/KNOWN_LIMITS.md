@@ -965,6 +965,7 @@ deben confundirse: D2-B y D2-C **previenen** que la credencial se destruya; D3
 D2-B = IMPLEMENTED / VALIDATED IN TEST BENCH   upgrade a @supabase/supabase-js 2.112.3
 D2-C = IMPLEMENTED / VALIDATED IN TEST BENCH   clasificador de rate limit del refresh
 D3   = IMPLEMENTED / HARDWARE FUNCTIONAL PASS  salvage local de segmentos (2026-08-24)
+GC-AUTH-RECOVERABLE-IDENTITY-PRIMITIVE-001 = PASS / OBSERVADO EN PoC DESECHABLE (2026-09-16) · NO INTEGRADA
 GC-AUTH-SESSION-RECOVERY-001 = OPEN
 GC-START-LATENCY-001         = FIXED IN CODE / HARDWARE VALIDATED   (2026-08-24, §6)
 ```
@@ -976,6 +977,12 @@ del incidente del 2026-08-22.**
 **D3 no cierra este finding**, ni siquiera habiendo pasado en hardware: no
 recupera la identidad, no restaura ownership, no reanuda la subida y no produce
 un `.mp4` final reconstruido.
+
+**La primitiva de identidad recuperable tampoco lo cierra.** Su `PASS` es de
+una pieza de Supabase observada en un proyecto desechable, no del producto: la
+app no la usa, así que en un dispositivo la identidad sigue sin recuperarse.
+Registro completo en `GC-AUTH-RECOVERABLE-IDENTITY-PRIMITIVE-001`, dentro de
+esta misma sección.
 
 ---
 
@@ -1391,6 +1398,128 @@ cifras de arriba.
 
 ---
 
+## `GC-AUTH-RECOVERABLE-IDENTITY-PRIMITIVE-001` — primitiva de identidad recuperable
+
+```
+GC-AUTH-RECOVERABLE-IDENTITY-PRIMITIVE-001 = PASS / OBSERVADO EN PoC DESECHABLE   (2026-09-16)
+integración en Guardian Cloud              = NO IMPLEMENTADA
+GC-AUTH-SESSION-RECOVERY-001               = OPEN
+```
+
+**Qué acredita la etiqueta, y nada más.** Que una primitiva de Supabase cumplió
+los criterios fijados antes de la corrida **en un proyecto Supabase desechable,
+desde un cliente de prueba en Node**. No acredita nada sobre la app, sobre un
+dispositivo ni sobre el proyecto de producción. No es una validación en
+hardware ni en banco, y no cambia el estado de este finding.
+
+### Qué se quería demostrar
+
+Una sola cosa: que un usuario anónimo que vincula un email puede, tras perder
+todas sus sesiones, volver a entrar por email desde un cliente sin sesión y
+recuperar **exactamente el mismo `user.id`**. Es la base de la prevención
+elegida para este finding: email con OTP, opcional y posterior a la captura.
+
+**No es recuperación retroactiva.** Una identidad anónima que ya se perdió sin
+email vinculado, como la del incidente del 22/08, sigue sin poder recuperarse.
+
+### Montaje
+
+- Proyecto desechable `guaria-auth-test`: usuarios anónimos, email con
+  confirmación, Secure Email Change y Manual Linking activados; OTP de 8 dígitos
+  y 3600 s; plantillas por defecto.
+- `@supabase/supabase-js` 2.112.3 —la versión de la app— con `persistSession`,
+  `autoRefreshToken` y `detectSessionInUrl` desactivados.
+- Script de prueba **fuera del repositorio**, auditado estáticamente antes de
+  ejecutarse (SHA-256 `6a68ad3c…`): **una** llamada a `signInWithOtp` con
+  `shouldCreateUser: false` y **una** a `verifyOtp` con `type: 'email'`, sin
+  reintentos ni fallback. No accede a la base de datos.
+- Checkpoints de solo lectura sobre `auth.*`, ejecutados a mano por el operador
+  en el SQL Editor.
+- Criterios PASS / FAIL / STOP fijados antes de ejecutar.
+
+### Resultado
+
+**Primera mitad** — 2026-09-16, hacia las 10:28 UTC. El usuario anónimo A pasó
+a tener email —`is_anonymous = false`, email confirmado— **conservando el mismo
+`user.id`**. El script no llegó a verificar ese cambio: su `verifyOtp` recibió
+`otp_expired`, y el cambio lo completó un `GET` ajeno. Ver el hallazgo separado,
+a continuación.
+
+**Segunda mitad** — 2026-09-16, entre las 21:33 y las 21:53 UTC:
+
+| Paso | Observado |
+|---|---|
+| Precondición, tras revocar todas las sesiones de A | 1 usuario, que es A · 0 sesiones · 0 refresh tokens activos · 0 one-time tokens |
+| Cliente nuevo | `getSession()` → `null` |
+| `signInWithOtp({ shouldCreateUser: false })` | sin error |
+| Checkpoints 3 y 4, antes de verificar | `tokens_vivos = 1` |
+| `verifyOtp({ type: 'email' })` | sin error |
+| Usuario obtenido | **el mismo `user.id` que A** · `is_anonymous = false` · identity `email` |
+| Estado posterior | 1 usuario · **exactamente 1 sesión, UA `node`** · 0 one-time tokens · 1 refresh token activo · 0 rotados |
+
+Se cumplen los siete criterios PASS. Ningún FAIL ni STOP, y ninguna observación
+adicional: ni `CONSUMER ACTIVE` ni `CONCURRENT TOKEN CONSUMPTION`.
+
+**Evidencia.** Valores observados por el operador y comunicados en la sesión de
+trabajo. La salida íntegra del script no se adjuntó y no hay paquete de
+evidencia. No se registran tokens, enlaces, claves, IPs ni direcciones de
+email.
+
+### Lo que NO demuestra
+
+- **Nada sobre producción.** Allí Manual Linking está **desactivado**, y la
+  documentación de Supabase lo exige para esta conversión. No se ha probado ni
+  modificado.
+- **Nada sobre la app.** No hay integración: ni UI para vincular el email, ni
+  entrada por OTP, ni persistencia de la sesión recuperada, ni reconexión con el
+  ownership del backend, ni reanudación de la subida.
+- **No se ha ejecutado la prueba negativa**: que `shouldCreateUser: false` no
+  cree un usuario ante un email que no existe.
+- **Alcance de una corrida**: un proyecto, un buzón, un cliente, flujo
+  implícito.
+
+---
+
+## Hallazgo separado — un `GET` ajeno consumió el enlace en la primera mitad
+
+**No forma parte del `PASS` de la primitiva ni lo invalida**: en la segunda
+mitad no se reprodujo —el estado posterior tuvo una única sesión, la del
+script—. Queda registrado aparte porque cualquier integración que dependa de un
+enlace en el correo tendrá que contar con él. **No tiene identificador propio.**
+
+**Observado** el 2026-09-16:
+
+- a las 10:28:03.830 UTC, un `GET /auth/v1/verify` que **no hizo el script**,
+  presentado como Chrome sobre Windows, recibió `303`;
+- el `POST` de verificación del script recibió `403 otp_expired`;
+- a las 10:28:04 UTC, A tenía el email confirmado y **una segunda sesión**
+  creada con ese mismo User-Agent;
+- esa sesión salía por la misma red que la del script —comparación hecha sin
+  registrar direcciones—;
+- en la captura posterior, las dos sesiones tenían `refreshed_at` nulo, había 2
+  refresh tokens activos y 0 rotados, y ningún one-time token vivo.
+
+**Inferido:** el consumidor sale por la misma red, no necesariamente desde la
+misma máquina; la redirección le entregó los tokens de esa segunda sesión; a la
+hora de la captura no los había usado.
+
+**No probado:** qué componente hizo el `GET` y si conserva los tokens. No se
+atribuye a ningún producto.
+
+**Contención:** antes de la segunda mitad se borraron todas las sesiones de A y
+se verificaron 0 sesiones y 0 refresh tokens activos.
+
+**Para quien integre:** el código de 8 dígitos y el enlace del correo son el
+**mismo token**, así que consumir el enlace también invalida el código. Y un
+`303` de `/verify` no prueba éxito: GoTrue responde `303` también cuando la
+verificación falla.
+
+El token de verificación de la primera mitad apareció en logs y en la
+terminal. Se trata como material de autenticación expuesto, ya consumido, y no
+se reproduce en ningún documento.
+
+---
+
 ## Lo que sigue abierto
 
 - **Validación DIRIGIDA en hardware de la prevención.** El banco prueba la
@@ -1420,6 +1549,11 @@ cifras de arriba.
   usarla. Es evidencia preservada, no recuperación.
 - **La causa histórica del 22/08 sigue sin demostrar**, y ninguna prueba futura
   puede demostrarla.
+- **Identidad recuperable en el producto.** La primitiva pasó en un proyecto
+  desechable, pero la app no la integra: no ofrece vincular un email ni entrar
+  por OTP, y nada reconecta una identidad recuperada con la evidencia pendiente.
+  Contra producción no se ha probado, y allí Manual Linking sigue desactivado.
+  Sigue pendiente la prueba negativa de `shouldCreateUser: false`.
 
 ---
 
