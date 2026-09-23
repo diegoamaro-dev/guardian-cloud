@@ -1509,14 +1509,195 @@ atribuye a ningún producto.
 **Contención:** antes de la segunda mitad se borraron todas las sesiones de A y
 se verificaron 0 sesiones y 0 refresh tokens activos.
 
-**Para quien integre:** el código de 8 dígitos y el enlace del correo son el
-**mismo token**, así que consumir el enlace también invalida el código. Y un
-`303` de `/verify` no prueba éxito: GoTrue responde `303` también cuando la
-verificación falla.
+**Para quien integre**, con el nivel de evidencia separado:
+
+* **OBSERVADO (2026-09-16).** Un `303` de `/verify` **no prueba éxito**: GoTrue
+  responde `303` también cuando la verificación falla.
+* **RESPALDADO POR CÓDIGO FUENTE OFICIAL ACTUAL · NO OBSERVADO EN NUESTRO
+  PROYECTO.** El código y el token del enlace **no son el mismo valor**: el
+  enlace transporta el **hash** y el usuario teclea el **código**. Ambos
+  direccionan el **mismo one-time token** —la misma columna `recovery_token`—,
+  de lo que se sigue, por **INFERENCIA**, que consumir uno invalide el otro.
+  Fuentes y frontera de versión en la subsección de G2, más abajo.
+* **OBSERVADO (2026-09-23).** El correo que esta cadena recibió **no contenía
+  ningún código**: sólo el enlace. La longitud de OTP configurada acredita la
+  configuración del servidor, **no** el contenido del correo.
+* **NO DEMOSTRADO.** Qué hace falta para que un correo entregue el código, y qué
+  forma exacta de `verifyOtp` le corresponde. Pendiente de una investigación
+  documental del contrato real; **este documento no lo afirma**.
 
 El token de verificación de la primera mitad apareció en logs y en la
 terminal. Se trata como material de autenticación expuesto, ya consumido, y no
 se reproduce en ningún documento.
+
+---
+
+## `GC-AUTH-RECOVERABLE-IDENTITY-INTEGRATION-001` · G2 — cerrada INCONCLUSIVE
+
+```
+G2                            = INCONCLUSIVE / corrida agotada   (2026-09-18)
+G2-FP                         = SI                               (2026-09-23)
+GC-AUTH-SESSION-RECOVERY-001  = OPEN
+```
+
+**Qué acredita esta entrada, y nada más.** Que una corrida de la cadena de
+integración terminó sin veredicto y que su causa histórica ya no es
+discriminable. No cambia el estado del finding, no asciende ni retira el `PASS`
+de la primitiva del 2026-09-16, y no acredita nada sobre la app ni sobre
+producción.
+
+### Qué ocurrió
+
+El 2026-09-18, G2 —recuperación de identidad por OTP desde un cliente sin
+sesión, en el proyecto desechable— terminó en `STOP / WRONG OR EXPIRED TOKEN`:
+`verifyOtp` respondió `otp_expired` sobre un token que el checkpoint declaraba
+vivo.
+
+### Qué se estableció el 2026-09-23, y con qué fuerza
+
+Diagnóstico `G2-FP`, local y sin red: comparación de huellas SHA-256 entre el
+token del enlace del correo y el `token_hash` almacenado, calculado por SQL de
+solo lectura y sólo tras la caducidad del token.
+
+```
+B = DB = SI
+```
+
+* **Evidencia.** El token del enlace del buzón es el
+  `one_time_tokens.token_hash` almacenado del usuario de la cadena
+  —`ac20eed5-6cba-43ca-a186-eee779cb7223`, `token_type = recovery_token`—, y éste
+  sigue siendo idéntico a `users.recovery_token`: `iguales = true`, 56 hex en
+  minúsculas, emitido a las **2026-09-18 08:15:35 UTC**. Un `SI` es evidencia
+  criptográfica abrumadora, no igualdad demostrada; un `NO` habría sido
+  concluyente.
+* **Evidencia.** Esa fila **sobrevivió intacta cinco días** y seguía coincidiendo
+  con `users.recovery_token`, de modo que el token **nunca se consumió con
+  éxito**. La hipótesis del consumo por un tercero —el `GET` ajeno del
+  2026-09-16, registrado más arriba— queda desfavorecida.
+* **Evidencia.** El `parseLink` de G2 y el de la herramienta de diagnóstico son
+  **idénticos byte a byte**: `sha256 f63e9211…4646e2f8`, 419 bytes.
+* **Evidencia.** El script de la corrida `PASS` del 2026-09-16, SHA-256
+  `6a68ad3c…`, emite exactamente la misma llamada que G2:
+  `verifyOtp({ token_hash, type: 'email' })`, con el token extraído del enlace
+  por el mismo `parseLink`. El contrato que G2 ejercitó **ya había funcionado en
+  este mismo proyecto desechable dos días antes**.
+
+### Qué NO se pudo establecer
+
+* **El instante del `verifyOtp` histórico.** Los Auth Logs del proyecto tienen
+  retención de 1 día —plan Free— y estaban agotados al consultarlos el
+  2026-09-23.
+* **Qué bytes recibió aquella llamada.** El script no escribe a disco y no quedó
+  registro. Que el enlace pegado fuera el del correo de las 10:15 CEST es
+  inferencia, no evidencia.
+* **En consecuencia, la causa.** Caducidad literal y «enlace equivocado del
+  buzón» siguen ambas vivas, y ninguna es discriminable con evidencia existente.
+  Un desajuste de `type` queda descartado por la comparación con el 16/09.
+
+### Defecto de protocolo detectado en G2, y requisito que impone
+
+El checkpoint de G2 era `select count(*) from auth.one_time_tokens;`. Contaba
+filas: **no filtraba por usuario, ni por tipo, ni por caducidad**. G2 tampoco
+conservó el segundo checkpoint previo al pegado ni el aviso de inmediatez que sí
+tenía la corrida del 16/09. **Ninguna corrida futura de esta cadena es válida sin
+checkpoints por usuario/tipo/caducidad e instantes registrados en el momento.**
+
+### Contenido del correo, y una prueba histórica que no se pudo ejecutar
+
+* **OBSERVADO (2026-09-23).** El correo del 2026-09-18, 10:15 CEST, usado por G2
+  y por `G2-FP`, contiene únicamente «Your sign-in link» y el enlace «Sign in».
+  **No contiene ningún código OTP de 8 dígitos.** El montaje del 2026-09-16
+  registra que el proyecto usa plantillas por defecto.
+* **RESPALDADO POR CÓDIGO FUENTE OFICIAL ACTUAL · NO OBSERVADO EN NUESTRO
+  PROYECTO.** La relación `sha224(email ‖ código) == token_hash`. Ver la
+  subsección siguiente para la fuente exacta. Es compatible con los 56 hex
+  medidos —longitud de un SHA-224—, pero **nosotros no la hemos observado en
+  ninguna corrida**: respaldo en código fuente **no es** evidencia experimental
+  propia.
+* **NO EJECUTADO.** La herramienta local `fp2-otp-formula.mjs` —SHA-256
+  `d3c68427…`, sin red, eco anulado, una sola comparación fijada de antemano—
+  quedó **preparada y sin ejecutar**, fuera del repositorio: de sus tres entradas
+  falta el código, que no existe en el correo. La prueba histórica es **no
+  ejecutable por ausencia de material**, y eso **no es un resultado negativo de
+  la fórmula**: la fórmula sigue sin probar en ninguno de los dos sentidos. No se
+  reconstruyó, ni se derivó, ni se adivinó ningún código, y no se probó ninguna
+  variante.
+
+### Contrato oficial de OTP por email — investigación documental del 2026-09-23
+
+**Frontera de versión, que condiciona todo lo que sigue.** El código fuente
+citado es el de la rama `master` de `supabase/auth` **consultada el 2026-09-23**.
+No es un tag fijado, y **no conocemos la versión exacta de Auth desplegada en
+nuestro proyecto Supabase el 2026-09-18**. Nada de esta subsección acredita el
+comportamiento de aquella corrida.
+
+**DOCUMENTACIÓN OFICIAL — Email OTP y Magic Link comparten implementación.** Se
+emiten por el mismo método, `signInWithOtp`; lo que llega al usuario lo decide la
+**plantilla de correo**, y para entregar un OTP la plantilla debe incluir
+`{{ .Token }}`.
+
+**DOCUMENTACIÓN OFICIAL — qué es cada variable de plantilla**, y son tres cosas
+distintas:
+
+| Variable | Qué contiene |
+|---|---|
+| `{{ .Token }}` | el **OTP que teclea el usuario** (6 dígitos por defecto; este proyecto lo tiene en 8) |
+| `{{ .TokenHash }}` | la **representación hash** de ese token |
+| `{{ .ConfirmationURL }}` | el **enlace ya construido** |
+
+**CÓDIGO FUENTE OFICIAL — el parámetro `token` del enlace NO es el OTP.** La URL
+se arma con `token=<params.Token>&type=…&redirect_to=…`, y en el camino de magic
+link `params.Token` es `user.RecoveryToken`, es decir **el hash**. El campo
+`token` de `verifyOtp({ email, token, type })`, en cambio, es **el código que
+teclea el usuario**. Mismo nombre, valores distintos: no deben confundirse.
+
+**DOCUMENTACIÓN OFICIAL — forma de verificación del código:**
+
+```js
+verifyOtp({ email, token, type: 'email' })
+```
+
+**CÓDIGO FUENTE OFICIAL — derivación del hash**, en `internal/crypto/crypto.go`:
+
+```go
+func GenerateTokenHash(emailOrPhone, otp string) string {
+	return fmt.Sprintf("%x", sha256.Sum224([]byte(emailOrPhone+otp)))
+}
+```
+
+SHA-224 sobre la concatenación directa, sin separador, en hex. En `verify.go`, una
+petición con `token` calcula `GenerateTokenHash(p.Email, p.Token)`, y el tipo
+`email` contrasta ese hash contra `confirmation_token` **y** contra
+`recovery_token`. Nuestra fila es `recovery_token`.
+
+**Fuentes:** `supabase.com/docs/guides/auth/auth-email-passwordless`,
+`supabase.com/docs/guides/auth/auth-email-templates`,
+`supabase.com/docs/reference/javascript/auth-verifyotp`, y en `supabase/auth@master`
+los ficheros `internal/crypto/crypto.go`, `internal/api/verify.go` y
+`internal/mailer/templatemailer/templatemailer.go`.
+
+**Lo que esta subsección NO cambia.** Respaldo documental o en código fuente **no
+es evidencia experimental nuestra**: `fp2-otp-formula.mjs` sigue `NO EJECUTADO`,
+la fórmula sigue **sin observar** en este proyecto, G2 sigue `INCONCLUSIVE`, la
+integración en Guardian Cloud sigue **NO IMPLEMENTADA** y
+`GC-AUTH-SESSION-RECOVERY-001` sigue `OPEN`.
+
+### Decisiones registradas (2026-09-23)
+
+1. **No se repite `G0 → G1 → G2-REVOKE → G2`.** No existe razón técnica que lo
+   exija: el contrato está demostrado en este proyecto por la corrida del 16/09.
+2. **G2 no se usa para invalidar el `PASS` del 2026-09-16**, que conserva
+   exactamente su alcance documentado.
+3. **La fila congelada del 2026-09-18 puede ser sustituida** para validar el
+   camino del código OTP de 8 dígitos. Sus valores estructurales quedan
+   registrados aquí; la fila en sí es prescindible.
+
+### Lo que esto no hace
+
+`GC-AUTH-SESSION-RECOVERY-001` **sigue `OPEN`**. La identidad del incidente del
+22/08 sigue sin recuperarse, la subida sigue sin reanudarse y el ownership sigue
+sin restaurarse. Nada de esta entrada está integrado en la app ni probado contra
+producción.
 
 ---
 
