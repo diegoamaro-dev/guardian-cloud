@@ -1686,6 +1686,63 @@ la fórmula sigue **sin observar** en este proyecto, G2 sigue `INCONCLUSIVE`, la
 integración en Guardian Cloud sigue **NO IMPLEMENTADA** y
 `GC-AUTH-SESSION-RECOVERY-001` sigue `OPEN`.
 
+### Fase 0 de OTP-1 — lectura del 2026-09-24
+
+Lectura de configuración en el proyecto desechable, hecha por el operador. **No
+se guardó ni se modificó nada**: ni SMTP, ni plantilla, ni ajuste alguno.
+
+```
+OTP-1 = BLOCKED BY PRECONDITION   (2026-09-24)
+```
+
+**OBSERVADO (2026-09-24), en `guaria-auth-test`:**
+
+* `Email OTP Expiration` = **3600 s**.
+* `Email OTP Length` = **8** dígitos.
+* El **preview** de la plantilla Magic Link muestra «Your sign-in link» con el
+  enlace «Sign in».
+* El **Source** de la plantilla y su edición **aparecen bloqueados** en el estado
+  actual del dashboard, y la interfaz ofrece configurar **custom SMTP**.
+
+**OBSERVADO (2026-09-23), ya registrado más arriba:** el correo real del
+2026-09-18 **no contenía ningún código**.
+
+**INFERIDO.** Que la plantilla efectiva coincide con la plantilla por defecto y
+**no imprime `{{ .Token }}`**. Lo sostienen dos observaciones convergentes —el
+preview reproduce literalmente el texto de `defaultMagicLinkMail` del código
+fuente, y el correo entregado no traía código—, pero **el Source no se ha
+inspeccionado**: la presencia o ausencia literal de `{{ .Token }}` **no está
+observada**.
+
+**DOCUMENTADO (changelog de Supabase, 2026-06-03).** Los proyectos **free creados
+a partir del 2026-06-03 que usan el SMTP por defecto** no pueden modificar sus
+plantillas de Auth. La restricción **sólo** aplica a esa combinación: con SMTP
+propio, o en plan de pago, la personalización sigue disponible. Motivo declarado:
+abuso del correo gratuito para enviar phishing.
+
+**DOCUMENTADO.** El SMTP por defecto sólo entrega a direcciones del equipo del
+proyecto, está limitado a **2 correos/hora** y Supabase lo declara **no apto para
+producción**, sin SLA. Esto aplica **igual al enlace que al código**. Por tanto,
+para el diseño de producción de Guaria Auth se debe asumir un proveedor SMTP
+propio o adecuado; el camino del código OTP **no introduce** esa dependencia
+frente al Magic Link.
+
+**DOCUMENTADO.** La guía de plantillas advierte de proveedores que **prefetchean
+las URL** y consumen el token al instante —cita Microsoft Defender for Office
+365—, y **recomienda el OTP por correo** frente al enlace. Es respaldo oficial del
+modo de fallo que este documento registra como hallazgo del 2026-09-16.
+
+**INFERIDO.** Que el bloqueo observado se deba a esa política: el proyecto se montó
+para la corrida del 2026-09-16, posterior al 2026-06-03. **La fecha de creación
+del proyecto no está observada.**
+
+**NO VERIFICADO.** Si la restricción alcanza también a la Management API.
+
+**Consecuencia acotada.** OTP-1 no puede ejecutarse mientras el correo no entregue
+el código, y ninguna vía para conseguirlo está autorizada ni acreditada. Lo que
+la longitud de 8 dígitos acredita es la configuración del servidor; **no** que el
+usuario reciba un código.
+
 ### Decisiones registradas (2026-09-23)
 
 1. **No se repite `G0 → G1 → G2-REVOKE → G2`.** No existe razón técnica que lo
