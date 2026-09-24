@@ -1582,6 +1582,10 @@ B = DB = SI
   por el mismo `parseLink`. El contrato que G2 ejercitó **ya había funcionado en
   este mismo proyecto desechable dos días antes**.
 
+Paquete de evidencia, con los scripts identificados por hash:
+`2026-09-23-gc-auth-integration-g2-closure/PROVENANCE.md`. No contiene token,
+`token_hash`, huella, URL, código ni dirección de correo.
+
 ### Qué NO se pudo establecer
 
 * **El instante del `verifyOtp` histórico.** Los Auth Logs del proyecto tienen
