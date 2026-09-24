@@ -2,6 +2,15 @@ import type { ExpoConfig, ConfigContext } from 'expo/config';
 import { withAndroidManifest, withDangerousMod } from '@expo/config-plugins';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
+import { resolveBuildVariant } from './src/config/buildVariant';
+
+/**
+ * E1 — bench builds are named and packaged apart from production.
+ *
+ * The rule lives in `src/config/buildVariant.ts` so it is testable and
+ * exists once. Nothing else in this file branches on the environment.
+ */
+const buildVariant = resolveBuildVariant(process.env.EXPO_PUBLIC_GC_ENV);
 
 /**
  * Android Network Security Config — homelab/LAN cleartext exception.
@@ -55,7 +64,7 @@ const NETWORK_SECURITY_CONFIG_XML = `<?xml version="1.0" encoding="utf-8"?>
  */
 export default ({ config }: ConfigContext): ExpoConfig => ({
   ...config,
-  name: 'Guardian Cloud',
+  name: buildVariant.name,
   slug: 'guardian-cloud',
   owner: 'amarus',
   scheme: 'guardiancloud',
@@ -69,7 +78,7 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
     bundleIdentifier: 'com.guardiancloud.app',
   },
   android: {
-    package: 'com.guariacloud.app',
+    package: buildVariant.androidPackage,
     adaptiveIcon: {
       foregroundImage: './assets/foreground.png',
       backgroundColor: '#000000',

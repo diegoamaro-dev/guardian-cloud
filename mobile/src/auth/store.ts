@@ -449,3 +449,176 @@ export async function getOwnershipAccessToken(): Promise<OwnershipToken | null> 
     return null;
   }
 }
+
+// ------------------------------------------- E1 · deferred identity link
+/**
+ * E1 — attaching an email to the EXISTING anonymous identity, after
+ * capture, without creating a second one.
+ *
+ * Why this lives here: `store.ts` is already the single authority on the
+ * session, and linking is a session operation. Putting it anywhere else
+ * would create a second module that talks to `supabase.auth`.
+ *
+ * What this deliberately does NOT do, and must never do:
+ *
+ *   · it does not touch `GC_QUEUE`, `queueMutate` or any queue entry;
+ *   · it does not read or write the pause key, and it never calls
+ *     `notifyClientAuth` — a link that fails is an Auth-local event and
+ *     has no business pausing or resuming the upload worker;
+ *   · it does not sign in, sign out, mint, or clear anything;
+ *   · it does not throw. A capture is never at risk because a link
+ *     attempt went wrong.
+ *
+ * Confirmation is NOT performed here. `updateUser({ email })` asks
+ * Supabase to send a confirmation; the identity is only linked once the
+ * user confirms it. Until then the state is `pending`, and nothing in
+ * the product may claim the evidence is recoverable.
+ */
+
+/** What the app is allowed to say about this identity's email. */
+export type IdentityLinkState =
+  /** Anonymous, nothing requested. */
+  | 'none'
+  /** A confirmation was requested and has NOT been confirmed yet. */
+  | 'pending'
+  /** Confirmed by the user and observed on the session. */
+  | 'linked';
+
+/**
+ * The ONE definition of "linked", derived from the session's user.
+ *
+ * `linked` demands a confirmed email on a non-anonymous user. A pending
+ * `new_email` is never enough: E1's invariant 9 says the UI may not
+ * claim protection the system has not verified, and this is where that
+ * claim is decided.
+ */
+export function deriveIdentityLinkState(user: User | null): IdentityLinkState {
+  if (!user) return 'none';
+  const pending = (user as { new_email?: unknown }).new_email;
+  if (typeof pending === 'string' && pending.length > 0) return 'pending';
+  const confirmedAt = (user as { email_confirmed_at?: unknown })
+    .email_confirmed_at;
+  const confirmed =
+    !!user.email && !!confirmedAt && user.is_anonymous !== true;
+  return confirmed ? 'linked' : 'none';
+}
+
+export type LinkEmailFailure =
+  /** Rejected locally, before any network call. */
+  | 'invalid_email'
+  /** No usable session: there is no identity to link an email to. */
+  | 'no_session'
+  /** The request could not reach Supabase. Retryable by the user. */
+  | 'network'
+  /** Supabase answered and rejected the request. */
+  | 'auth_non_retryable'
+  /** Anything we could not classify. */
+  | 'failed'
+  /**
+   * The update came back with a DIFFERENT user id. That would mean a
+   * second identity exists and the evidence already uploaded belongs to
+   * the old one. Reported, never silently accepted.
+   */
+  | 'identity_changed'
+  /**
+   * The update reported no error but returned NO user, so the identity
+   * that came back cannot be compared with the one that went in.
+   *
+   * E1 exists to acredit that `user.id` survives. Absence of evidence is
+   * not preservation: answering `ok` here would let the gate pass on a
+   * comparison that never happened. We do not mint, we do not call
+   * `getUser()` to paper over it, and we do not retry — the run is simply
+   * not evidenced and the operator decides what to do next.
+   */
+  | 'no_user_returned';
+
+export type LinkEmailResult =
+  | { ok: true; state: IdentityLinkState; userId: string | null }
+  | { ok: false; reason: LinkEmailFailure; name: string | null };
+
+/** Shape check only. Address validity is Supabase's to decide. */
+function normalizeEmail(raw: string): string | null {
+  const email = raw.trim().toLowerCase();
+  if (email.split('@').length !== 2) return null;
+  const [local, domain] = email.split('@');
+  if (!local || !domain || /\s/.test(email) || !domain.includes('.')) {
+    return null;
+  }
+  return email;
+}
+
+/**
+ * Requests an email to be attached to the current identity.
+ *
+ * NEVER REJECTS. Every failure is a value.
+ */
+export async function linkEmail(rawEmail: string): Promise<LinkEmailResult> {
+  const email = normalizeEmail(rawEmail);
+  if (!email) return { ok: false, reason: 'invalid_email', name: null };
+
+  try {
+    // The identity we are about to modify, read once. The comparison
+    // afterwards is the whole point: E1 is only meaningful if the id
+    // survives.
+    const probe = await supabase.auth.getSession();
+    if (probe.error) {
+      const reason: LinkEmailFailure = isAuthRetryableFetchError(probe.error)
+        ? 'network'
+        : isAuthApiError(probe.error)
+          ? 'auth_non_retryable'
+          : 'failed';
+      return { ok: false, reason, name: probe.error.name ?? null };
+    }
+    const userIdBefore = probe.data.session?.user?.id ?? null;
+    if (!userIdBefore) return { ok: false, reason: 'no_session', name: null };
+
+    const { data, error } = await supabase.auth.updateUser({ email });
+
+    if (error) {
+      const reason: LinkEmailFailure = isAuthRetryableFetchError(error)
+        ? 'network'
+        : isAuthApiError(error)
+          ? 'auth_non_retryable'
+          : 'failed';
+      // Metadata only: a class name, never a message and never an
+      // address. And deliberately NO pause, NO queue write, NO drain.
+      console.log('GC_IDENTITY_LINK_FAILED', { reason, name: error.name ?? null });
+      return { ok: false, reason, name: error.name ?? null };
+    }
+
+    const user = data?.user ?? null;
+    const userIdAfter = user?.id ?? null;
+    if (!userIdAfter) {
+      // No user came back: there is nothing to compare against, so the
+      // preservation of the identity is UNEVIDENCED. Not an error from
+      // Supabase, and not a success either.
+      console.log('GC_IDENTITY_LINK_UNEVIDENCED', {
+        sub_prefix: userIdBefore.slice(0, 8),
+      });
+      return { ok: false, reason: 'no_user_returned', name: null };
+    }
+    if (userIdAfter !== userIdBefore) {
+      console.log('GC_IDENTITY_LINK_ID_CHANGED', {
+        before_prefix: userIdBefore.slice(0, 8),
+        after_prefix: userIdAfter.slice(0, 8),
+      });
+      return { ok: false, reason: 'identity_changed', name: null };
+    }
+
+    const state = deriveIdentityLinkState(user);
+    console.log('GC_IDENTITY_LINK_REQUESTED', {
+      sub_prefix: userIdBefore.slice(0, 8),
+      state,
+    });
+    // Reflect the updated user so the screen can render `pending`. The
+    // session, its tokens and their refresh remain supabase-js's.
+    useAuthStore.setState({ user });
+    return { ok: true, state, userId: userIdAfter };
+  } catch (err) {
+    return {
+      ok: false,
+      reason: 'failed',
+      name: err instanceof Error ? err.name : null,
+    };
+  }
+}
