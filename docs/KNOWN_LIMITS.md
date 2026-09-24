@@ -1743,6 +1743,37 @@ el código, y ninguna vía para conseguirlo está autorizada ni acreditada. Lo q
 la longitud de 8 dígitos acredita es la configuración del servidor; **no** que el
 usuario reciba un código.
 
+### Instrumentación de OTP-1 — v3 congelada, NO EJECUTADA (2026-09-24)
+
+```
+otp-1-recover.mjs
+SHA-256   0fdb84d6814f66d61c8b2f71e4e4f96c7fca8a4363d45d3348f0d5a93494d17b
+revisión estática   PASS        node --check   PASS
+estado              NO EJECUTADO
+v1 f53ac624… · v2 1df3b288…     OBSOLETAS · no deben ejecutarse
+OTP-1               BLOCKED BY PRECONDITION
+```
+
+**Qué acredita esta entrada, y nada más.** Que existe una herramienta de banco,
+fuera del repositorio, revisada línea a línea y congelada por hash. **Revisión
+estática no es evidencia experimental**: no se ha ejecutado, no ha hablado con
+Auth, no ha enviado ningún correo y no ha tocado el proyecto desechable.
+
+Propiedades verificadas en esa revisión, por lectura del código: cliente con
+`persistSession`, `autoRefreshToken` y `detectSessionInUrl` en `false`;
+`shouldCreateUser:false`; **máximo tres llamadas Auth de red** —una
+`signInWithOtp` y hasta dos `verifyOtp`, la segunda sólo tras éxito para
+comprobar el uso único—; cero fallback de `type`; cero navegación de enlaces y
+ningún `GET` deliberado contra `/verify`; **lectura única** del código, sin
+segunda oportunidad; y una **precondición instrumentada de identidad del email**
+—comparación de huellas SHA-256 contra la que devuelve el SQL de solo lectura—
+que detiene la corrida antes de `signInWithOtp` si el email tecleado no es el
+del sujeto. Email, huella, código y tokens no se imprimen ni entran en el
+artefacto.
+
+**Sigue sin ejecutarse por la precondición de Fase 0**: el correo no entrega
+código. Nada de lo anterior cambia el estado de ningún finding.
+
 ### Decisiones registradas (2026-09-23)
 
 1. **No se repite `G0 → G1 → G2-REVOKE → G2`.** No existe razón técnica que lo

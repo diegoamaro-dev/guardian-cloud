@@ -539,3 +539,288 @@ validación vive en el detalle y en el export, y se acredita en el Escenario 16.
 **Relación con `ARMA C`:** el caso 3 es el que permitiría observar si la sesión
 `1ce18e76-3ff9-45a6-a77b-1dd7c2dd3711` está **ausente** del descubrimiento, que
 es la única premisa de `ARMA C` que sigue sin observarse.
+
+---
+
+## OTP-1 — gate de banco: recuperación de identidad por OTP textual
+
+> **No es un escenario de producto y no entra en la escalera de cuatro niveles
+> de este documento.** Es un gate de banco sobre un **proyecto Supabase
+> desechable**, `guaria-auth-test`, dentro de la investigación
+> `GC-AUTH-RECOVERABLE-IDENTITY-INTEGRATION-001`. No toca Guardian Cloud: ni
+> `GC_QUEUE`, ni worker, ni recovery, ni uploader, ni UI.
+>
+> Estado: **`DEFINIDO · BLOCKED BY PRECONDITION`** (2026-09-24). Registro del
+> gate y su contexto en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §5.
+
+Esta sección es **autocontenida a propósito**: debe bastar para reproducir la
+corrida sin la conversación en la que se diseñó.
+
+### Objetivo exacto
+
+> ¿Un cliente **sin sesión** recupera exactamente el `user.id` del sujeto A
+> usando **email + código OTP de 8 dígitos**, mediante
+> `verifyOtp({ email, token, type: 'email' })`, **sin navegar ningún enlace**?
+
+Sujeto A: `ac20eed5-6cba-43ca-a186-eee779cb7223`. La variable experimental es
+**una sola**: magic link navegable → OTP textual entregado por `{{ .Token }}`.
+El transporte de correo **no** se cambia.
+
+### Precondición que hoy lo mantiene BLOCKED
+
+El correo de este proyecto **no entrega código**: la plantilla efectiva es la de
+serie y sólo trae el enlace. Cambiarla exige, en un proyecto free creado después
+del 2026-06-03 que usa el SMTP por defecto, o bien SMTP propio o bien plan de
+pago. **Decisión tomada:** plan de pago temporal, para no introducir a la vez un
+proveedor de correo distinto. Detalle y fuentes en `KNOWN_LIMITS.md` §5.
+
+**Mientras el correo no entregue código, OTP-1 no se ejecuta.**
+
+### Qué NO demuestra OTP-1, ni siquiera con `PASS`
+
+* Que el `GET` ajeno fuera la causa demostrada del fallo del 2026-09-18.
+* Que `GC-AUTH-SESSION-RECOVERY-001` esté cerrado. **Sigue `OPEN`.**
+* Nada sobre producción, sobre custom SMTP ni sobre la app.
+* Que el OTP sea la decisión final de producto.
+
+La **única** conclusión permitida con `PASS` es, literalmente:
+
+> «En esta corrida hosted y bajo estas condiciones, la recuperación mediante OTP
+> textual funciona y el modo de fallo observado en la corrida del 18/09 no se
+> reproduce por esta vía.»
+
+### Ejecutor congelado
+
+```
+otp-1-recover.mjs
+SHA-256  0fdb84d6814f66d61c8b2f71e4e4f96c7fca8a4363d45d3348f0d5a93494d17b
+```
+
+**`v1 f53ac624…` y `v2 1df3b288…` son OBSOLETAS y no son autorizables.** El
+ejecutor vive fuera del repositorio; se verifica su hash **en el mismo terminal**
+desde el que se va a ejecutar, inmediatamente antes de la corrida. Un hash
+distinto es STOP.
+
+### Preparación previa
+
+Todas se verifican y se anotan antes de empezar; si una falla, **STOP**.
+
+| # | Precondición |
+|---|---|
+| P1 | El selector del dashboard dice `guaria-auth-test` |
+| P2 | Plan temporal que permita editar plantillas. **Los datos de pago los introduce el operador** |
+| P3 | `Email OTP Expiration` = 3600 s · `Email OTP Length` = 8, releídos y anotados |
+| P4 | La dirección del sujeto es **miembro del equipo** del proyecto: el SMTP por defecto rechaza las demás |
+| P5 | Cuota libre: el SMTP por defecto admite **2 correos/hora** |
+| P6 | `S1` conforme (abajo) |
+| P7 | Hash del ejecutor idéntico al congelado |
+| P8 | Buzón sin previsualización de enlaces; el correo se abre en **texto plano** |
+| P9 | Node ≥ 17 y terminal real: el ejecutor es interactivo |
+
+**Plantilla mínima**, sólo código y sin enlace —es lo que hace estructuralmente
+imposible que un tercero consuma el token—, **pendiente de autorización
+específica** antes de aplicarse:
+
+```html
+<h2>Your sign-in code</h2>
+
+<p>Enter this code to sign in. It expires shortly and can only be used once.</p>
+<p>{{ .Token }}</p>
+```
+
+### `S1` — estado previo, sólo lectura
+
+```sql
+select u.is_anonymous,
+       (u.email is not null)                                  as has_email,
+       encode(sha256(convert_to(lower(u.email),'UTF8')),'hex') as email_fp,
+       (select count(*) from auth.sessions s where s.user_id = u.id) as sesiones,
+       (select count(*) from auth.one_time_tokens t
+         where t.user_id = u.id and t.token_type = 'recovery_token') as ott_recovery
+from auth.users u
+where u.id = 'ac20eed5-6cba-43ca-a186-eee779cb7223';
+```
+
+Conforme si `is_anonymous = false`, `has_email = true` y `sesiones = 0`.
+
+**Función exacta de `email_fp`.** Es la **precondición instrumentada de identidad
+del email**: el ejecutor calcula `sha256(lower(trim(email tecleado)))` y exige
+**igualdad exacta** con este valor. Si no coinciden, la corrida se detiene
+**antes de `signInWithOtp`** y no se realiza ninguna llamada Auth de red. **No se
+prueba ninguna variante de normalización.** Sirve para que el email usado no sea
+un supuesto; no es un contrato de producto.
+
+### `S2` — checkpoint, sólo lectura, **exclusivamente instrumental**
+
+Se ejecuta con el **mismo** código ya tecleado en el ejecutor, sustituyendo
+`<CODIGO>`:
+
+```sql
+select count(*) over ()                                   as filas,
+       t.token_type,
+       t.created_at                                       as ott_created_at,
+       u.recovery_sent_at,
+       now()                                              as now_utc,
+       extract(epoch from (now() - u.recovery_sent_at))::int as elapsed_s,
+       t.token_hash = encode(sha224(convert_to(u.email || '<CODIGO>','UTF8')),'hex')
+                                                          as code_matches
+from auth.one_time_tokens t
+join auth.users u on u.id = t.user_id
+where t.user_id = 'ac20eed5-6cba-43ca-a186-eee779cb7223'
+  and t.token_type = 'recovery_token';
+```
+
+`code_matches` existe **sólo** para saber, antes de llamar, que el código
+tecleado es el correcto, y así poder distinguir un rechazo del servidor de un
+error de transcripción. **La relación `sha224(email ‖ código)` es instrumentación
+de banco y no puede convertirse en contrato de producto** — ver la prohibición
+al final.
+
+### `S3` — estado posterior, sólo lectura
+
+```sql
+select (select count(*) from auth.one_time_tokens t
+         where t.user_id = u.id and t.token_type = 'recovery_token') as ott_vivos,
+       (select count(*) from auth.sessions s where s.user_id = u.id)  as sesiones,
+       (select count(*) from auth.users)                              as usuarios_total,
+       u.is_anonymous
+from auth.users u
+where u.id = 'ac20eed5-6cba-43ca-a186-eee779cb7223';
+```
+
+### Puerta temporal de 300 s
+
+```
+elapsed_at_verify = elapsed_s (de S2) + (instante del verify − instante de la respuesta de S2)
+puerta:  elapsed_at_verify ≤ 300 s
+```
+
+Se mide con el `now()` **del servidor** y con intervalos locales; el reloj
+absoluto del cliente no se usa como autoridad. Frente a una expiración
+configurada de 3600 s, los 300 s dejan margen para cualquier desfase razonable.
+
+**Interpretación:** la puerta **no** clasifica el resultado; sirve para que, si
+el servidor responde `otp_expired`, se sepa que no fue por agotamiento de la
+ventana. Si la puerta no se cumple, **no se llama a `verifyOtp`** y la corrida es
+STOP.
+
+### Orden operativo exacto
+
+```
+1  aplicar la plantilla y guardar                          [autorización propia]
+2  cliente nuevo · getSession() == null                    [local, sin red]
+3  ejecutar S1 e introducir sus valores
+4  introducir el email (eco anulado) y el email_fp de S1 → acreditación
+5  signInWithOtp({ email, shouldCreateUser:false })        · UNA llamada
+6  llega el correo · abrirlo en TEXTO PLANO · leer el código
+7  teclear el código (eco anulado) · LECTURA ÚNICA
+8  ejecutar S2 con ESE MISMO código e introducir sus valores
+9  puerta temporal
+10 verifyOtp({ email, token, type:'email' })               · UN intento
+11 ejecutar S3
+12 comprobación de reutilización / single-use              · sólo tras éxito
+```
+
+Llamada exacta del paso 10:
+
+```js
+const { data, error } = await client.auth.verifyOtp({ email, token: code, type: 'email' })
+```
+
+Cero reintentos. Cero fallback de `type`. Cero navegación de enlaces. Ningún
+`GET` deliberado contra `/verify`.
+
+### Matriz de resultados — congelada
+
+| # | Observación | Veredicto |
+|---|---|---|
+| 1 | `signInWithOtp` devuelve error —cuota, rate limit, `otp_disabled`— | **STOP** |
+| 2 | **Puerta no cumplida**: `elapsed_at_verify > 300 s`, `filas ≠ 1`, `token_type` inesperado, `code_matches = false`, código sin formato, o email no acreditado → no se llama a `verifyOtp` | **STOP** |
+| 3 | Código correcto · `elapsed ≤ 300 s` · `code_matches = true` · fila presente y sin consumir en `S2` y en `S3` → `otp_expired` | **INCONCLUSO** + hallazgo independiente obligatorio |
+| 4 | `otp_expired` y `S3` muestra la fila ausente o consumida | **STOP** — contaminación |
+| 5 | Otro error de Auth en `verifyOtp` | **STOP** |
+| 6 | Éxito · `user.id == A` · `is_anonymous = false` · `S3` compatible con consumo · reutilización rechazada | **PASS** |
+| 7 | Éxito con `user.id` distinto, o usuario nuevo en `S3` | **FAIL** |
+| 8 | Éxito con estado posterior incompatible: fila no consumida, 0 o más de 1 sesión | **INCONCLUSO** |
+| 9 | Reutilización rechazada | observación **EXPECTED / CONFIRMED**; no genera un segundo PASS |
+| 10 | Reutilización **concede segunda sesión** | **FAIL grave** + hallazgo de seguridad |
+| 11 | Desviación de protocolo: dos intentos, enlace navegado, fallback de `type`, instrumentación ausente | **STOP**, corrida nula |
+
+**`otp_expired` nunca se promociona a FAIL automáticamente.** GoTrue devuelve el
+mismo código para «no encontrado» y para «caducado», así que sin poder demostrar
+qué condición lo produjo, el resultado es INCONCLUSO, no FAIL.
+
+### PASS / FAIL / STOP
+
+* **PASS** exige, simultáneamente: se genera el OTP · el valor introducido
+  coincide exactamente con el recibido · no se navega ningún enlace de Auth · no
+  existe ningún `GET` deliberado de nuestra instrumentación contra la URL de
+  verificación · `verifyOtp` acepta el OTP · se recupera exactamente A ·
+  `is_anonymous = false` · se obtiene exactamente la sesión esperada · el estado
+  posterior es compatible con el consumo correcto del OTP · el intento de
+  reutilización es rechazado.
+* **FAIL** sólo en las ramas 7 y 10: respuestas inequívocamente negativas.
+* **STOP** en las ramas 1, 2, 4, 5 y 11: la corrida no llegó a responder.
+* **INCONCLUSO** en las ramas 3 y 8.
+
+### Límite de llamadas Auth por corrida
+
+**Máximo 3 llamadas de red**: una `signInWithOtp` y hasta dos `verifyOtp` —la
+segunda sólo tras éxito, para el uso único—. `getSession()` es local y no genera
+tráfico. Serán 0 si se aborta antes del paso 5, 1 si falla la puerta o el
+formato del código, 2 si `verifyOtp` devuelve error.
+
+### Lectura única de las entradas sensibles
+
+**Cada entrada sensible se lee una sola vez, con el eco anulado**: URL, `anon
+key`, email, `email_fp` y código. Si el código no tiene exactamente 8 dígitos,
+la corrida **termina**: no se vuelve a pedir, no se ejecuta `S2` y no se llama a
+`verifyOtp`. Corregir a mano una entrada sensible durante el experimento está
+prohibido.
+
+### Secretos y artefactos
+
+**No se imprimen, no se escriben y no se registran**: email completo, huella del
+email, código OTP, `token_hash` o cualquier derivado, access token, refresh
+token, `anon key`, URL del proyecto y mensajes de error del servidor —de los
+errores sólo se conservan `name`, `code` y `status`—.
+
+**Evidencia que se conserva** de la corrida, en un paquete propio bajo el archivo
+de evidencia, con su `PROVENANCE.md`: la salida del ejecutor sin valores
+sensibles, el artefacto JSON que él mismo escribe, los valores estructurales de
+`S1`, `S2` y `S3`, los instantes e intervalos, el cálculo de la puerta, la
+plantilla aplicada, el hash del ejecutor y el veredicto con la rama de la matriz
+que lo sustenta.
+
+### Cleanup, en este orden
+
+1. Cerrar la pestaña del SQL Editor y limpiar el portapapeles.
+2. **Revertir la plantilla** a la de serie y guardar. **Antes** de bajar el plan:
+   no está verificado qué ocurre con una plantilla personalizada tras la bajada.
+3. Anotar la sesión creada, si la hubo. **No se revoca** dentro de esta corrida.
+4. Bajar el plan y verificar en facturación que la bajada consta.
+5. Registrar los instantes de los pasos 2 y 4.
+
+### Limitaciones conocidas
+
+* El ejecutor resuelve `@supabase/supabase-js` desde el `node_modules` instalado
+  de `mobile/`, en lectura, para usar la misma versión que la app (2.112.3). No
+  instala ni modifica nada.
+* El máximo de llamadas Auth es **por construcción del código, no observado en
+  red**: no hay captura de tráfico.
+* Sólo se usan intervalos locales y el `now()` del servidor; se supone deriva
+  despreciable durante la corrida.
+* El artefacto se escribe en el directorio de trabajo actual.
+* Un éxito con `user` nulo cae en la rama 8 —INCONCLUSO—; el veredicto lo sella
+  una persona con `S3`, nunca el script.
+* La corrida **sustituye** la fila `recovery_token` congelada del 2026-09-18, ya
+  registrada en `KNOWN_LIMITS.md` §5.
+* La versión de Auth desplegada en el proyecto no se conoce: la corrida la
+  ejercita, no la acredita.
+
+### Prohibición explícita
+
+**Ni los timestamps locales ni la relación `sha224(email ‖ código)` pueden
+convertirse en contrato de producto.** Son instrumentación de este banco. El
+producto no calcula huellas de tokens, no deduce caducidades de relojes locales
+y no depende de detalles internos de GoTrue.
