@@ -150,16 +150,31 @@ android {
      * flavor**. Con el valor en los dos sitios, Gradle resolvería bien —el
      * flavor gana— pero cualquier herramienta que leyera `defaultConfig`
      * primero vería `com.guariacloud.app` también para banco, en silencio.
+     *
+     * ## El scheme del deep link también es por flavor
+     *
+     * `gcDeepLinkScheme` sustituye al literal que tenía el
+     * `<intent-filter>` de `src/main/AndroidManifest.xml`. Se hace con
+     * `manifestPlaceholders` y no con un manifest en `src/bench/`
+     * porque un `<intent-filter>` de flavor **se suma** al de `main` en
+     * vez de reemplazarlo: banco acabaría registrando los dos schemes,
+     * que es justo el defecto a evitar. El placeholder resuelve a un
+     * único valor por variante, sin reglas de merge.
+     *
+     * `exp+guardian-cloud` sigue literal y compartido a propósito: es el
+     * scheme del Dev Client de Expo, no del producto.
      */
     flavorDimensions = ['env']
     productFlavors {
         production {
             dimension 'env'
             applicationId 'com.guariacloud.app'
+            manifestPlaceholders = [gcDeepLinkScheme: 'guardiancloud']
         }
         bench {
             dimension 'env'
             applicationId 'com.guariacloud.app.bench'
+            manifestPlaceholders = [gcDeepLinkScheme: 'guardiancloudbench']
         }
     }
 

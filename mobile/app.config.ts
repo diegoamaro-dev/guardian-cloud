@@ -67,7 +67,14 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
   name: buildVariant.name,
   slug: 'guardian-cloud',
   owner: 'amarus',
-  scheme: 'guardiancloud',
+  /**
+   * Scheme de producto, por variante. `expo-linking` lo lee de aquí
+   * —`ExpoLinking.createURL` en `app/settings.tsx`—, mientras el nativo
+   * lo recibe por `manifestPlaceholders`. Las dos caras salen de
+   * `buildVariant`, que es la única fuente, y una prueba estática exige
+   * que coincidan.
+   */
+  scheme: buildVariant.deepLinkScheme,
   version: '0.1.0',
   orientation: 'portrait',
   userInterfaceStyle: 'automatic',

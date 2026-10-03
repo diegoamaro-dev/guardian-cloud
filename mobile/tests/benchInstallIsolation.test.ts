@@ -22,8 +22,10 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+
+import { resolveBuildVariant } from '@/config/buildVariant';
 
 const read = (rel: string): string =>
   readFileSync(resolve(__dirname, '..', rel), 'utf8');
@@ -180,6 +182,88 @@ describe('E1 · identidad nativa de banco — distinta, por configuración', () 
     for (const flavor of ['production', 'bench']) {
       expect(gradleBlock(FLAVORS, flavor)).toContain("dimension 'env'");
     }
+  });
+});
+
+/**
+ * E1 · scheme del deep link por variante.
+ *
+ * Dos aplicaciones instaladas que registran el mismo scheme compiten por
+ * el deep link con el que el backend entrega el `code` de OAuth, y ya se
+ * observó una entrega a la aplicación equivocada — `KNOWN_LIMITS.md` §8.
+ * Esto NO cierra ese finding: sólo elimina la colisión entre nuestros dos
+ * flavors.
+ *
+ * El scheme viaja por dos caminos distintos —`manifestPlaceholders` hacia
+ * el nativo, `app.config.ts` hacia `expo-linking`— y los dos salen de
+ * `buildVariant`. La prueba que importa es la de coherencia: es la clase
+ * de desajuste JS↔nativo que ya nos costó un gate con `applicationId`.
+ */
+describe('E1 · scheme del deep link — exclusivo por variante', () => {
+  const MANIFEST = read('android/app/src/main/AndroidManifest.xml');
+
+  /** El `manifestPlaceholders` del flavor indicado. */
+  function flavorScheme(flavor: string): string | null {
+    return (
+      gradleBlock(FLAVORS, flavor).match(
+        /manifestPlaceholders\s*=\s*\[\s*gcDeepLinkScheme:\s*'([^']+)'\s*\]/,
+      )?.[1] ?? null
+    );
+  }
+
+  it('el manifest no fija ningún scheme de producto literal', () => {
+    expect(MANIFEST).toContain('android:scheme="${gcDeepLinkScheme}"');
+    // Si alguien lo vuelve a escribir a mano, banco heredaría el de
+    // producción sin que nada falle. Esto lo hace fallar.
+    expect(MANIFEST).not.toContain('android:scheme="guardiancloud"');
+  });
+
+  it('el scheme del Dev Client sigue compartido y literal', () => {
+    // Decisión explícita de este gate: `exp+guardian-cloud` no es scheme
+    // de producto y no se parametriza.
+    expect(MANIFEST).toContain('android:scheme="exp+guardian-cloud"');
+  });
+
+  it('cada flavor declara su scheme, y son distintos', () => {
+    expect(flavorScheme('production')).toBe('guardiancloud');
+    expect(flavorScheme('bench')).toBe('guardiancloudbench');
+    expect(flavorScheme('bench')).not.toBe(flavorScheme('production'));
+  });
+
+  it('el scheme nativo y el que ve expo-linking son el mismo', () => {
+    // El contrato de verdad: `buildVariant` es la única fuente, y el
+    // placeholder de cada flavor tiene que coincidir con lo que esa
+    // fuente devuelve para el entorno homónimo.
+    expect(resolveBuildVariant('production').deepLinkScheme).toBe(
+      flavorScheme('production'),
+    );
+    expect(resolveBuildVariant('bench').deepLinkScheme).toBe(
+      flavorScheme('bench'),
+    );
+  });
+
+  it('app.config.ts deriva el scheme de buildVariant, no de un literal', () => {
+    const appConfig = read('app.config.ts');
+    expect(appConfig).toContain('scheme: buildVariant.deepLinkScheme');
+    expect(appConfig).not.toContain("scheme: 'guardiancloud'");
+  });
+
+  it('el foreground service no lleva el scheme de producto escrito a mano', () => {
+    // Un literal aquí enviaría al operador desde la notificación de
+    // banco a la aplicación de producción, que es la única que registra
+    // ese scheme.
+    const service = read('src/recording/backgroundService.ts');
+    expect(service).not.toContain("'guardiancloud://'");
+    expect(service).toContain('deepLinkScheme');
+  });
+
+  it('no existe un AndroidManifest.xml de flavor que pueda sumar schemes', () => {
+    // La vía aditiva es el defecto que este diseño evita: un
+    // `<intent-filter>` de flavor se suma al de `main` en vez de
+    // reemplazarlo, y banco acabaría registrando los dos.
+    expect(existsSync(resolve(__dirname, '..', 'android/app/src/bench/AndroidManifest.xml'))).toBe(
+      false,
+    );
   });
 });
 

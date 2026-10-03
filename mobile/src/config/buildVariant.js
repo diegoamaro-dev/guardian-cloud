@@ -38,6 +38,27 @@
 const PRODUCTION_APP_NAME = 'Guardian Cloud';
 const PRODUCTION_ANDROID_PACKAGE = 'com.guariacloud.app';
 
+/**
+ * Scheme de producto del deep link, por entorno.
+ *
+ * Valores COMPLETOS y explícitos, no derivados por sufijo: el de banco
+ * tiene que coincidir carácter a carácter con el `manifestPlaceholders`
+ * del flavor homónimo en `android/app/build.gradle`, y una prueba
+ * estática exige esa igualdad. Derivarlo invitaría a que las dos caras
+ * divergieran sin que nada fallara.
+ *
+ * Por qué importa que banco tenga el suyo: dos aplicaciones instaladas
+ * que registran el mismo scheme compiten por el deep link con el que el
+ * backend entrega el `code` de OAuth, y ya se observó una entrega a la
+ * aplicación equivocada — `KNOWN_LIMITS.md` §8. Con un scheme por
+ * variante, el callback de banco sólo puede llegar a banco.
+ *
+ * `exp+guardian-cloud` NO se toca y sigue compartido: es el scheme del
+ * Dev Client de Expo, no del producto.
+ */
+const PRODUCTION_DEEP_LINK_SCHEME = 'guardiancloud';
+const BENCH_DEEP_LINK_SCHEME = 'guardiancloudbench';
+
 /** The only two accepted declarations. There is no third, and no empty. */
 const BUILD_ENVIRONMENTS = /** @type {const} */ (['production', 'bench']);
 
@@ -69,7 +90,7 @@ class UndeclaredBuildEnvironmentError extends Error {
  * native file.
  *
  * @param {string | undefined} gcEnv
- * @returns {{ name: string, androidPackage: string, isBench: boolean }}
+ * @returns {{ name: string, androidPackage: string, isBench: boolean, deepLinkScheme: string }}
  */
 function resolveBuildVariant(gcEnv) {
   if (
@@ -85,12 +106,17 @@ function resolveBuildVariant(gcEnv) {
     androidPackage: isBench
       ? `${PRODUCTION_ANDROID_PACKAGE}.bench`
       : PRODUCTION_ANDROID_PACKAGE,
+    deepLinkScheme: isBench
+      ? BENCH_DEEP_LINK_SCHEME
+      : PRODUCTION_DEEP_LINK_SCHEME,
   };
 }
 
 module.exports = {
   PRODUCTION_APP_NAME,
   PRODUCTION_ANDROID_PACKAGE,
+  PRODUCTION_DEEP_LINK_SCHEME,
+  BENCH_DEEP_LINK_SCHEME,
   BUILD_ENVIRONMENTS,
   UndeclaredBuildEnvironmentError,
   resolveBuildVariant,

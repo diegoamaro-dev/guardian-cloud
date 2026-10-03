@@ -2161,18 +2161,57 @@ validación. Requiere gate propio.
 
 ## Estado
 
-**OPEN.** Sin corregir.
+**OPEN.** Sin corregir. Desde el 2026-10-03 **ya no se manifiesta entre nuestros
+propios builds** —ver el apartado siguiente—, pero el finding es más amplio que
+eso y sigue abierto.
 
 ## Hecho demostrado
 
-`mobile/app.config.ts:61` declara `scheme: 'guardiancloud'` mientras `:72`
-declara `package: 'com.guariacloud.app'`. El scheme **no** se renombró al
-cambiar el identificador de aplicación, de modo que cualquier aplicación
-instalada que registre `guardiancloud://` compite por el deep link con el que
-el backend entrega el `code` de Google
-(`backend/src/routes/destinations.routes.ts:1113-1117`).
+El scheme de producto **no** se renombró al cambiar el identificador de
+aplicación, de modo que cualquier aplicación instalada que registre
+`guardiancloud://` compite por el deep link con el que el backend entrega el
+`code` de Google (`backend/src/routes/destinations.routes.ts:1113-1117`).
 
-Es un hecho de código, verificable hoy en ambos ficheros.
+Es un hecho de código.
+
+## Qué elimina el aislamiento por flavor, y qué NO
+
+**OBSERVADO (2026-10-03).** El scheme de producto pasó a ser **por variante**:
+el `<intent-filter>` de `src/main/AndroidManifest.xml` usa el placeholder
+`${gcDeepLinkScheme}` y cada `productFlavor` declara su valor. Comprobado en los
+manifests **combinados** generados por `processProductionReleaseManifest` y
+`processBenchReleaseManifest`:
+
+```
+productionRelease   package com.guariacloud.app
+                    <data android:scheme="guardiancloud" />
+                    <data android:scheme="exp+guardian-cloud" />
+
+benchRelease        package com.guariacloud.app.bench
+                    <data android:scheme="guardiancloudbench" />
+                    <data android:scheme="exp+guardian-cloud" />
+```
+
+**Banco ya no registra `guardiancloud`.** Eso elimina la colisión **entre
+nuestros dos builds**: el callback que inicia banco sólo puede llegar a banco, y
+el de producción no puede ser capturado por banco. Es el escenario exacto que
+se observó en `G3''`.
+
+**Lo que NO cambia, y por eso el finding sigue `OPEN`:**
+
+* una aplicación de **terceros** puede seguir registrando `guardiancloud://` y
+  competir con producción. Ese es el finding, y no se ha tocado;
+* `exp+guardian-cloud` **sigue compartido** por los dos flavors, por decisión
+  explícita: es el scheme del Dev Client de Expo, no del producto;
+* no se ha ensayado la captura por una app de terceros, y **no se asigna
+  severidad**, igual que antes;
+* nada de esto se ha ejercitado en un dispositivo: es configuración observada en
+  el manifest combinado, **no una validación en hardware**;
+* **no afirma que Drive funcione en banco.** Habilitar Drive en banco sigue
+  bloqueado por la configuración de OAuth en Google, que es otro gate.
+
+`GC-OAUTH-NOSTATE-001` (§9) sigue **`OPEN`** y sin tocar: `state` no se genera,
+no se valida y no se usa.
 
 ## Grado de certeza
 

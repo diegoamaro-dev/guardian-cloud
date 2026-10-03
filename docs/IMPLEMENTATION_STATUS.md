@@ -8,7 +8,7 @@
 | Producto usado para la revalidación de `GC-DEST-PAUSE-001` | **`22a9b26`** (APK release `2b3be062…`) |
 | Producto usado para la validación de `GC-START-LATENCY-001` | **`e643b01`** (APK release `1cb80fea…`) |
 | Producto usado para la validación de **D3 local segment salvage** | **`cb59c7e`** (APK release `8151c338…`) |
-| Última suite automática registrada | **2026-10-03**, sobre el árbol del gate **E1-BENCH-EAS-ENV** medido antes de commitearlo — **1011/1011 en 47 ficheros** · typecheck **12 errores heredados, cero nuevos**. El corte anterior, 1007/1007 en 47 ficheros, se midió tras **`ccbf4fa`**. Esta cifra se anclará a su hash cuando el gate quede commiteado |
+| Última suite automática registrada | **2026-10-03**, sobre el árbol del gate **E1-BENCH-OAUTH-SCHEME** medido antes de commitearlo — **1021/1021 en 47 ficheros** · typecheck **12 errores heredados, cero nuevos**. Cortes anteriores ya anclados: 1014/1014 tras **`b1f73aa`** y 1007/1007 tras **`ccbf4fa`**. Esta cifra se anclará a su hash cuando el gate quede commiteado |
 | Aislamiento de build y de proyecto Supabase | **`ccbf4fa`** — ver [la sección propia](#aislamiento-de-build-e1--android-y-proyecto-supabase) |
 
 > Las fechas y los commits son distintos a propósito, y no deben fundirse. La
@@ -210,7 +210,34 @@ SUPABASE PROJECT ISOLATION  = IMPLEMENTED / TESTED      · NO VALIDATED
 |---|---|---|
 | `applicationId` | `com.guariacloud.app` | `com.guariacloud.app.bench` |
 | Nombre visible | `Guardian Cloud` | `Guardian Cloud BANCO` |
+| Scheme de producto | `guardiancloud` | `guardiancloudbench` |
 | Proyecto Supabase | `nahksdkcvhveoctpjrea` | `rgbsofvycynhabycetel` (`guaria-auth-test`) |
+
+> **Scheme del deep link, por variante — OBSERVADO el 2026-10-03.** El
+> `<intent-filter>` de `src/main/AndroidManifest.xml` usa el placeholder
+> `${gcDeepLinkScheme}` y cada `productFlavor` declara su valor; `buildVariant`
+> es la única fuente y `app.config.ts` deriva de ella el `scheme` que lee
+> `expo-linking`. Comprobado en los manifests **combinados** que generan
+> `processProductionReleaseManifest` y `processBenchReleaseManifest`: producción
+> queda con `guardiancloud` y banco con `guardiancloudbench`, los dos con
+> `exp+guardian-cloud` —el scheme del Dev Client, compartido por decisión
+> explícita—. **Banco ya no registra `guardiancloud`.**
+>
+> No se eligió un `AndroidManifest.xml` en `src/bench/` porque un
+> `<intent-filter>` de flavor **se suma** al de `main` en vez de reemplazarlo:
+> banco habría registrado los dos schemes, que es el defecto a evitar.
+>
+> El `linkingURI` del foreground service dejó de ser un literal y sale de la
+> misma fuente: con un valor fijo, pulsar la notificación de banco habría
+> abierto la aplicación de producción, la única que registra ese scheme.
+>
+> **Qué acredita y qué no.** Elimina la colisión de deep link **entre nuestros
+> dos builds** — [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §8—. **No cierra
+> `GC-OAUTH-SCHEME-COLLISION-001`**, que sigue `OPEN` porque un tercero puede
+> registrar `guardiancloud://`; **no toca `GC-OAUTH-NOSTATE-001`**, también
+> `OPEN`; **no es validación en hardware**; y **no afirma que Google Drive
+> funcione en banco**, que sigue bloqueado por la configuración de OAuth en
+> Google.
 
 **Dónde vive el aislamiento Android, y dónde NO.** En los `productFlavors` de
 `mobile/android/app/build.gradle` —cada flavor declara su `applicationId`

@@ -55,6 +55,8 @@ import BackgroundActions, {
 } from 'react-native-background-actions';
 
 import { log, error } from '@/utils/log';
+import { env } from '@/config/env';
+import { resolveBuildVariant } from '@/config/buildVariant';
 
 const TASK_NAME = 'guardian-cloud-evidence';
 const NOTIFICATION_TITLE = 'Guardian Cloud';
@@ -169,7 +171,14 @@ const baseOptions: BackgroundTaskOptions = {
   },
   // Calm green to match the protected-evidence palette in the home UI.
   color: '#3ddc84',
-  linkingURI: 'guardiancloud://',
+  // Where tapping the notification lands. Derived from the SAME source
+  // as the rest of the variant isolation — `buildVariant` — instead of a
+  // literal: a bench build registers `guardiancloudbench://` and does
+  // NOT register production's scheme, so a hardcoded value would send
+  // the operator from the bench notification into the production app.
+  // `env.gcEnv` is already validated to be one of the two declared
+  // literals, so this cannot throw.
+  linkingURI: `${resolveBuildVariant(env.gcEnv).deepLinkScheme}://`,
   // Android 14+ requires a typed foreground service. Microphone matches
   // the use case; the manifest declares the same type on the <service>
   // element so both layers agree.

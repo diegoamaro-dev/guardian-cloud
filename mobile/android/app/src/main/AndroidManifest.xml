@@ -33,7 +33,7 @@
         <action android:name="android.intent.action.VIEW"/>
         <category android:name="android.intent.category.DEFAULT"/>
         <category android:name="android.intent.category.BROWSABLE"/>
-        <data android:scheme="guardiancloud"/>
+        <data android:scheme="${gcDeepLinkScheme}"/>
         <data android:scheme="exp+guardian-cloud"/>
       </intent-filter>
     </activity>
