@@ -97,7 +97,8 @@ android {
 
     namespace 'com.guardiancloud.app'
     defaultConfig {
-        applicationId 'com.guariacloud.app'
+        // `applicationId` NO vive aquí: lo declara cada flavor, completo.
+        // Ver el bloque `productFlavors` más abajo.
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 1
@@ -134,18 +135,31 @@ android {
      * sobrescribe `app_name` del source set `main` por precedencia de
      * flavor. Deliberadamente NO se usa `resValue`: `app_name` ya existe
      * en `main` y produciría un recurso duplicado.
+     *
+     * ## Por qué el `applicationId` completo, y por qué NO en defaultConfig
+     *
+     * EAS CLI 24.10.0 **rechaza** `applicationIdSuffix`: «"applicationIdSuffix"
+     * in app/build.gradle is not supported, configure the full application
+     * ID under productFlavors». Lo documenta Expo en `build-reference/variants`
+     * —«EAS CLI supports only the `applicationId` field»— y falla cerrado en
+     * vez de resolver un identificador equivocado, que es el comportamiento
+     * correcto: un identificador mal leído es exactamente la barrera que
+     * impide que banco se instale encima de producción.
+     *
+     * Y no queda en `defaultConfig` para que exista **una sola fuente por
+     * flavor**. Con el valor en los dos sitios, Gradle resolvería bien —el
+     * flavor gana— pero cualquier herramienta que leyera `defaultConfig`
+     * primero vería `com.guariacloud.app` también para banco, en silencio.
      */
     flavorDimensions = ['env']
     productFlavors {
         production {
             dimension 'env'
-            // Sin suffix y sin recursos propios, a propósito: producción
-            // conserva exactamente el `applicationId` y el nombre que
-            // tenía antes de este cambio.
+            applicationId 'com.guariacloud.app'
         }
         bench {
             dimension 'env'
-            applicationIdSuffix '.bench'
+            applicationId 'com.guariacloud.app.bench'
         }
     }
 

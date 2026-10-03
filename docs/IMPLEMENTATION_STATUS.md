@@ -213,14 +213,39 @@ SUPABASE PROJECT ISOLATION  = IMPLEMENTED / TESTED      · NO VALIDATED
 | Proyecto Supabase | `nahksdkcvhveoctpjrea` | `rgbsofvycynhabycetel` (`guaria-auth-test`) |
 
 **Dónde vive el aislamiento Android, y dónde NO.** En los `productFlavors` de
-`mobile/android/app/build.gradle` —`bench` con `applicationIdSuffix '.bench'`— y
-en el source set `mobile/android/app/src/bench/`, que aporta su propio
-`app_name`. **No** en `app.config.ts`: `android.package` y `name` del config de
+`mobile/android/app/build.gradle` —cada flavor declara su `applicationId`
+**completo**, y `defaultConfig` ya no declara ninguno— y en el source set
+`mobile/android/app/src/bench/`, que aporta su propio `app_name`. **No** en `app.config.ts`: `android.package` y `name` del config de
 Expo sólo llegarían al nativo a través de `expo prebuild`, que no es un paso de
 build de este repositorio —ver [`RELEASE_CHECKLIST_v0.3.md`](./RELEASE_CHECKLIST_v0.3.md) §3.1—.
 Un mecanismo apoyado en el config de Expo no habría tenido efecto en la ruta
 real, y antes de `ccbf4fa` no lo tenía: un build de banco se instalaba con el
 `applicationId` y el nombre de producción, encima de ella.
+
+> **Por qué `applicationId` completo y no un sufijo.** La primera versión de
+> este mecanismo usaba `applicationIdSuffix '.bench'`. **EAS CLI 24.10.0 lo
+> rechazó antes de llegar a construir nada**, al resolver la versión remota del
+> perfil `bench`: *«"applicationIdSuffix" in app/build.gradle is not supported,
+> configure the full application ID under productFlavors»*. Expo lo documenta en
+> `build-reference/variants` —«EAS CLI supports only the `applicationId`
+> field»—, y falla cerrado en vez de resolver un identificador equivocado, que
+> es el comportamiento correcto: un identificador mal leído es exactamente la
+> barrera que impide que banco se instale encima de producción. Se sustituyó por
+> el `applicationId` completo en cada flavor, que es la forma que documenta Expo
+> para este caso. **En la misma corrida, EAS confirmó por escrito que
+> `android.package` de `app.config.ts` se ignora por existir el directorio
+> `android/`**: manda Gradle, como decía §3.1 del checklist.
+>
+> **Verificado tras la corrección**, con una segunda corrida del mismo comando
+> read-only: el error de `applicationIdSuffix` desaparece y
+> `build:version:get` ya no falla. Eso acredita que EAS **lee** la
+> configuración de flavors; **no** acredita qué `applicationId` acaba dentro de
+> un APK, porque no se ha construido ninguno.
+>
+> `defaultConfig` dejó de declarar `applicationId` para que exista **una sola
+> fuente por flavor**. Con el valor en los dos sitios Gradle resolvería bien
+> —el flavor gana—, pero cualquier herramienta que leyera `defaultConfig`
+> primero vería el id de producción también para banco, y en silencio.
 
 **`namespace 'com.guardiancloud.app'` permanece deliberadamente intacto**, junto
 con los paquetes Kotlin `com.guardiancloud.*`. Un flavor sólo modifica
@@ -317,10 +342,23 @@ EAS ENVIRONMENT ISOLATION = IMPLEMENTED / TESTED   · NO VALIDADO
 
 Lo acreditan pruebas estáticas sobre `eas.json` —los cuatro mapeos y las dos
 invariantes cruzadas— y, para las variantes nativas, que Gradle resuelve
-`assembleBenchDebug` y `assembleBenchRelease` en `--dry-run`. **Eso es
-configuración, no una build.** Que EAS cargue de verdad el entorno correcto sólo
-lo acredita la línea `Environment variables … loaded from the "<env>"
-environment` del log de una build real, que no se ha ejecutado.
+`assembleBenchDebug` y `assembleBenchRelease` en `--dry-run`.
+
+**OBSERVADO (2026-10-03), con EAS CLI 24.10.0.** Una corrida de
+`build:version:get --platform android --profile bench --json --non-interactive`
+—read-only, sin construir nada— mostró que EAS carga las **tres** variables del
+proyecto de banco desde el entorno `development` y `EXPO_PUBLIC_GC_ENV` junto a
+`NPM_CONFIG_LEGACY_PEER_DEPS` desde el `env` del perfil `bench`. El reparto de
+entornos de A2 **se interpreta como se diseñó**, y eso ya no está pendiente de
+una build. La misma corrida devolvió `{}`, que se registra como **ausencia de
+versión remota inicializada para este target** —el estado esperado— y **no**
+como error.
+
+**Lo que esa corrida NO acredita.** Nada sobre el artefacto: no se ha construido
+ningún APK, así que **no se afirma que ningún APK contenga
+`com.guariacloud.app.bench`**. El primer APK real sigue siendo el gate que
+permitirá validar el artefacto, su identificador, su nombre visible y la
+coexistencia en el dispositivo.
 
 **Deuda que este reparto crea:** el entorno se llama `development` y contiene
 banco. Quien añada una variable ahí pensando «esto es mi portátil» alimentará el

@@ -98,12 +98,19 @@ firma              sin cambios · applicationId y certificado son independientes
 
 #### Actualización 2026-10-03 — el banco deriva del `applicationId`, no lo discute
 
-`ccbf4fa` añade el flavor `bench` con `applicationIdSuffix '.bench'`, de modo que
-el banco se instala como **`com.guariacloud.app.bench`** y coexiste con
-producción en vez de pisarla. **No altera esta decisión**: el `applicationId` de
-producción sigue siendo `com.guariacloud.app`, y un flavor sólo modifica
-`applicationId`, así que `namespace` y los paquetes Kotlin quedan fuera de su
-alcance por construcción.
+`ccbf4fa` añade el flavor `bench`, de modo que el banco se instala como
+**`com.guariacloud.app.bench`** y coexiste con producción en vez de pisarla.
+**No altera esta decisión**: el `applicationId` de producción sigue siendo
+`com.guariacloud.app`, y un flavor sólo modifica `applicationId`, así que
+`namespace` y los paquetes Kotlin quedan fuera de su alcance por construcción.
+
+Cada flavor declara su `applicationId` **completo**, y `defaultConfig` ya no
+declara ninguno: una sola fuente por flavor. La primera versión derivaba el de
+banco con `applicationIdSuffix '.bench'`, y **EAS CLI 24.10.0 lo rechazó antes
+del primer build** —*«"applicationIdSuffix" in app/build.gradle is not
+supported, configure the full application ID under productFlavors»*—, lo que
+Expo documenta en `build-reference/variants`. El valor de producción no cambió
+en ningún momento; cambió dónde se declara.
 
 La divergencia pasa además a estar **protegida por una prueba**:
 `mobile/tests/benchInstallIsolation.test.ts` falla si alguien iguala `namespace`

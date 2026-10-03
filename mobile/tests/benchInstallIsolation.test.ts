@@ -49,7 +49,50 @@ function profile(name: string): EasProfile {
 }
 
 const PRODUCTION_APPLICATION_ID = 'com.guariacloud.app';
+const BENCH_APPLICATION_ID = 'com.guariacloud.app.bench';
 const PRODUCTION_NAMESPACE = 'com.guardiancloud.app';
+
+/**
+ * Cuerpo de un bloque `nombre { … }` de Gradle, delimitado **contando
+ * llaves** en vez de confiando en la indentación: así una reindentación
+ * del fichero no rompe estas pruebas, y el bloque que se inspecciona es
+ * el real y no una ventana de líneas.
+ */
+function gradleBlock(source: string, name: string): string {
+  const declaration = source.indexOf(`${name} {`);
+  if (declaration < 0) {
+    throw new Error(`build.gradle no declara el bloque '${name}'`);
+  }
+  const open = source.indexOf('{', declaration);
+  let depth = 0;
+  for (let i = open; i < source.length; i++) {
+    if (source[i] === '{') depth++;
+    else if (source[i] === '}' && --depth === 0) {
+      return source.slice(open + 1, i);
+    }
+  }
+  throw new Error(`el bloque '${name}' no se cierra`);
+}
+
+const FLAVORS = gradleBlock(APP_GRADLE, 'productFlavors');
+
+/**
+ * El gradle sin comentarios de bloque ni de línea completa. La
+ * prohibición de `applicationIdSuffix` es sobre el CÓDIGO: el fichero
+ * explica a propósito por qué no se usa, y esa explicación no debe hacer
+ * fallar la prueba que la justifica.
+ */
+const APP_GRADLE_CODE = APP_GRADLE.replace(/\/\*[\s\S]*?\*\//g, '').replace(
+  /^\s*\/\/.*$/gm,
+  '',
+);
+
+/** El `applicationId` que declara un flavor, o `null` si no declara ninguno. */
+function flavorApplicationId(flavor: string): string | null {
+  return (
+    gradleBlock(FLAVORS, flavor).match(/applicationId '([^']+)'/)?.[1] ?? null
+  );
+}
 
 /** `app_name` del source set indicado, que es el nombre que instala Android. */
 function appName(stringsXml: string): string | null {
@@ -59,14 +102,30 @@ function appName(stringsXml: string): string | null {
 }
 
 describe('E1 · identidad nativa de producción — no se mueve', () => {
-  it('conserva EXACTAMENTE su applicationId', () => {
-    const matches = [...APP_GRADLE.matchAll(/applicationId '([^']+)'/g)].map(
+  it('conserva EXACTAMENTE su applicationId, declarado en su flavor', () => {
+    expect(flavorApplicationId('production')).toBe(PRODUCTION_APPLICATION_ID);
+  });
+
+  it('no existe ningún applicationId fuera de los dos flavors', () => {
+    const declared = [...APP_GRADLE.matchAll(/applicationId '([^']+)'/g)].map(
       (m) => m[1],
     );
-    // Uno y sólo uno: un segundo `applicationId` en otro bloque sería una
-    // identidad de producción alternativa, que es justo lo que no puede
+    // Exactamente dos, uno por flavor. Un tercero en cualquier otro bloque
+    // sería una identidad alternativa, que es justo lo que no puede
     // existir.
-    expect(matches).toEqual([PRODUCTION_APPLICATION_ID]);
+    expect(declared.sort()).toEqual(
+      [PRODUCTION_APPLICATION_ID, BENCH_APPLICATION_ID].sort(),
+    );
+  });
+
+  it('`defaultConfig` NO declara applicationId', () => {
+    // Una sola fuente por flavor. Con el valor también aquí, Gradle
+    // resolvería bien —el flavor gana— pero una herramienta que leyera
+    // `defaultConfig` primero vería el id de producción también para
+    // banco, y en silencio.
+    expect(gradleBlock(APP_GRADLE, 'defaultConfig')).not.toMatch(
+      /applicationId\s/,
+    );
   });
 
   it('conserva el namespace, que NO es el applicationId', () => {
@@ -80,28 +139,25 @@ describe('E1 · identidad nativa de producción — no se mueve', () => {
     expect(appName(STRINGS_MAIN)).toBe('Guardian Cloud');
   });
 
-  it('no le añade sufijo ni recursos propios al flavor de producción', () => {
-    const productionBlock = APP_GRADLE.match(
-      /production \{([\s\S]*?)\n {8}\}/,
-    )?.[1];
-    expect(productionBlock).toBeTruthy();
-    expect(productionBlock).toContain("dimension 'env'");
-    expect(productionBlock).not.toContain('applicationIdSuffix');
+  it('el flavor de producción no lleva recursos propios ni sufijo', () => {
+    const production = gradleBlock(FLAVORS, 'production');
+    expect(production).toContain("dimension 'env'");
+    expect(production).not.toContain('applicationIdSuffix');
   });
 });
 
 describe('E1 · identidad nativa de banco — distinta, por configuración', () => {
-  it('deriva su applicationId del sufijo del flavor', () => {
-    const benchBlock = APP_GRADLE.match(/bench \{([\s\S]*?)\n {8}\}/)?.[1];
-    expect(benchBlock).toBeTruthy();
-    expect(benchBlock).toContain("applicationIdSuffix '.bench'");
+  it('declara su applicationId completo', () => {
+    expect(flavorApplicationId('bench')).toBe(BENCH_APPLICATION_ID);
+  });
 
-    const suffix = benchBlock?.match(/applicationIdSuffix '([^']+)'/)?.[1];
-    // Esto es lo que Android compondrá. Se escribe aquí para que el valor
-    // esperado sea legible sin saber cómo funciona AGP.
-    expect(`${PRODUCTION_APPLICATION_ID}${suffix}`).toBe(
-      'com.guariacloud.app.bench',
-    );
+  it('ningún flavor usa applicationIdSuffix, que EAS CLI no soporta', () => {
+    // EAS CLI 24.10.0 rechazó el build con «"applicationIdSuffix" in
+    // app/build.gradle is not supported, configure the full application ID
+    // under productFlavors», y Expo lo documenta: sólo lee `applicationId`.
+    // La comprobación es sobre el fichero entero porque la limitación
+    // alcanza también a `buildTypes`.
+    expect(APP_GRADLE_CODE).not.toContain('applicationIdSuffix');
   });
 
   it('declara su propio nombre visible y sólo esa cadena', () => {
@@ -112,14 +168,18 @@ describe('E1 · identidad nativa de banco — distinta, por configuración', () 
   });
 
   it('los dos application id son distintos, así que las instalaciones coexisten', () => {
-    const suffix = APP_GRADLE.match(/applicationIdSuffix '([^']+)'/)?.[1];
-    expect(`${PRODUCTION_APPLICATION_ID}${suffix}`).not.toBe(
-      PRODUCTION_APPLICATION_ID,
+    // Leídos los dos del fichero, no compuestos aquí: si alguien iguala
+    // los flavors, esto falla en vez de seguir afirmando la separación.
+    expect(flavorApplicationId('bench')).not.toBe(
+      flavorApplicationId('production'),
     );
   });
 
   it('declara la dimensión de flavor que AGP exige', () => {
-    expect(APP_GRADLE).toMatch(/flavorDimensions = \['env'\]/);
+    expect(APP_GRADLE).toMatch(/flavorDimensions\s*=\s*\[\s*'env'\s*\]/);
+    for (const flavor of ['production', 'bench']) {
+      expect(gradleBlock(FLAVORS, flavor)).toContain("dimension 'env'");
+    }
   });
 });
 
@@ -128,8 +188,8 @@ describe('E1 · el plugin de React Native sigue sabiendo qué es debuggable', ()
     // Con flavors ya no existe una variante llamada `debug`, que es el
     // único valor por defecto del plugin. Sin esta lista los debug
     // empaquetarían el bundle y el Dev Client no conectaría.
-    expect(APP_GRADLE).toContain(
-      'debuggableVariants = ["productionDebug", "benchDebug"]',
+    expect(APP_GRADLE).toMatch(
+      /debuggableVariants\s*=\s*\[\s*"productionDebug"\s*,\s*"benchDebug"\s*\]/,
     );
   });
 });
