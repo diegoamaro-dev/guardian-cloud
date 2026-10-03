@@ -194,17 +194,62 @@ una capacidad de producto: es la separación entre un build de **banco** y uno d
 implementado y con qué evidencia.
 
 ```
-ANDROID INSTALL ISOLATION   = IMPLEMENTED / TESTED      · NO VALIDATED
-SUPABASE PROJECT ISOLATION  = IMPLEMENTED / TESTED      · NO VALIDATED
+ANDROID INSTALL ISOLATION        = HARDWARE VALIDATED   OnePlus A6000, 2026-10-03
+BENCH DEEP-LINK SCHEME ISOLATION = HARDWARE VALIDATED   OnePlus A6000, 2026-10-03
+SUPABASE PROJECT ISOLATION       = IMPLEMENTED / TESTED      · NO VALIDATED
+EAS ENVIRONMENT ISOLATION        = IMPLEMENTED / TESTED      · NO VALIDATED
 ```
 
-> **Qué significa `TESTED` aquí, y es un nivel propio.** Acredita pruebas
-> automáticas sobre configuración estática, más —en el caso de Android— que
-> Gradle reconoce y resuelve el grafo de tareas de ambas variantes. **No** es
-> `UNIT_TESTED` de lógica de producto y **no** se acerca a
-> `HARDWARE_VALIDATED`: no se ha construido ningún APK, no se ha instalado
-> nada, no se ha contactado con ningún proyecto Supabase y no ha habido
+> **Las dos primeras se validaron en hardware el 2026-10-03.** Registro completo
+> y reconstruible en
+> [`VALIDATIONS/E1_BENCH_ISOLATION_2026-10-03.md`](./VALIDATIONS/E1_BENCH_ISOLATION_2026-10-03.md).
+> Procedencia del artefacto probado:
+>
+> ```
+> commit        77bef24a1f9d544dba3cc1da2c882fff8497c914
+> EAS build     5c86cd00-8a75-40ba-99ff-0e93b7bec748
+> APK sha256    402e9b85f5ab12b9e99ba22d3a01afbafda46210c1cb037888c1a9fcc0a927cf
+> package       com.guariacloud.app.bench      label  Guardian Cloud BANCO
+> keystore      Build Credentials d5yCcmQnkP (default) — reutilizado, no generado
+> dispositivo   OnePlus A6000 · Android 11 · API 30
+> ```
+>
+> **Qué se observó**, en este orden: el manifest **empaquetado** del APK registra
+> `guardiancloudbench`, **no** registra `guardiancloud` y conserva
+> `exp+guardian-cloud`; `adb install -r` dio `Success` y la actualización
+> **conservó `firstInstallTime`** —2026-10-03 10:40:39— moviendo sólo
+> `lastUpdateTime`, y el `sha256` del `base.apk` instalado es el del artefacto
+> validado; **los tres packages coexisten** —`com.guardiancloud.app`,
+> `com.guariacloud.app` y `com.guariacloud.app.bench`— sin que las marcas de
+> tiempo de los dos primeros cambiaran; el Package Manager resuelve
+> `guardiancloudbench://oauth/drive` a **un único** candidato, banco, y
+> `guardiancloud://oauth/drive` a los **dos** packages no-banco, sin banco entre
+> ellos; y el lanzamiento real del deep link, con banco **vivo en segundo
+> plano**, dio `Status: ok` · `LaunchState: HOT` ·
+> `Activity: com.guariacloud.app.bench/com.guardiancloud.app.MainActivity`, con
+> transición launcher → banco y **ninguna otra aplicación de la familia en
+> foreground**.
+>
+> Como todo `HARDWARE VALIDATED` de este documento, significa **validado en ese
+> dispositivo**. No implica cobertura multi-dispositivo ni Android 13+.
+
+> **Qué significa `TESTED` en las dos que siguen sin validar, y es un nivel
+> propio.** Acredita pruebas automáticas sobre configuración estática, más —en
+> el caso de los entornos de EAS— lo que una corrida read-only del CLI observó.
+> **No** es `UNIT_TESTED` de lógica de producto y **no** equivale a
+> `HARDWARE VALIDATED`: `SUPABASE PROJECT ISOLATION` no ha contactado con ningún
+> proyecto Supabase, y el reparto de entornos no se ha ejercitado en un
 > dispositivo.
+
+> **Lo que la validación del 2026-10-03 NO acredita.** **OAuth real y Drive en
+> banco siguen SIN VALIDAR**: no se ejecutó ningún flujo, no se conectó Drive y
+> no se tocó Google ni el backend; la URI de prueba no llevaba `code` ni
+> `state`, y el `MOBILE_OAUTH_REDIRECT` del backend de banco sigue en
+> `unused://bench`. **`GC-OAUTH-SCHEME-COLLISION-001` sigue `OPEN`** —lo
+> validado es la exclusividad entre **nuestros** builds, no el finding, y un
+> tercero puede seguir registrando `guardiancloud://`— y
+> **`GC-OAUTH-NOSTATE-001` sigue `OPEN`** y sin tocar. Tampoco se ejercitó
+> captura, `GC_QUEUE`, worker, subida, recovery, cleanup ni export.
 
 | | production | bench |
 |---|---|---|
@@ -298,12 +343,17 @@ Evidencia de este corte:
   `:app:assembleProductionRelease --dry-run` = **PASS**, los dos
   `BUILD SUCCESSFUL`, sin generar artefactos.
 
-Lo que **falta**, y por qué no hay nada que ascender:
+Lo que **falta**:
 
-* **ningún APK BENCH construido todavía**;
-* **la coexistencia de las dos aplicaciones en un dispositivo no se ha
-  observado**;
-* **ningún contacto real con Supabase** queda acreditado por este gate.
+* **ningún contacto real con Supabase** queda acreditado: `SUPABASE PROJECT
+  ISOLATION` sigue sin validar;
+* **el reparto de entornos de EAS** no se ha ejercitado en un dispositivo;
+* **OAuth real y Drive en banco**: sin validar.
+
+Lo que **ya no falta**, desde el 2026-10-03: existe un APK BENCH construido,
+instalado y actualizado en sitio, y la coexistencia de las tres aplicaciones en
+el dispositivo **está observada**. Ver
+[`VALIDATIONS/E1_BENCH_ISOLATION_2026-10-03.md`](./VALIDATIONS/E1_BENCH_ISOLATION_2026-10-03.md).
 
 La configuración remota de banco **ya no es un bloqueo**: se creó el 2026-10-03
 y EAS CLI confirmó que la carga. Detalle y alcance exacto en la subsección

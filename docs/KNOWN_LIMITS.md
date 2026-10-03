@@ -1838,9 +1838,12 @@ producción.
 - **Aislamiento del build de banco.** Desde `ccbf4fa` un build de banco se
   instala como `com.guariacloud.app.bench` / «Guardian Cloud BANCO» y sólo puede
   alcanzar el proyecto Supabase de banco, con fallo cerrado en los dos sentidos.
-  Es `TESTED`, **no** `VALIDATED`: sin APK, sin instalación y sin dispositivo, y
-  la coexistencia de las dos aplicaciones **no se ha observado**. Estado exacto
-  en [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md#aislamiento-de-build-e1--android-y-proyecto-supabase).
+  La identidad de instalación y el enrutado de su deep link están **validados en
+  hardware** desde el 2026-10-03 —OnePlus A6000, tres packages conviviendo—; ver
+  [`VALIDATIONS/E1_BENCH_ISOLATION_2026-10-03.md`](./VALIDATIONS/E1_BENCH_ISOLATION_2026-10-03.md).
+  El **aislamiento del proyecto Supabase sigue `TESTED` y sin validar**: ninguna
+  corrida ha contactado con un proyecto real. Estado exacto en
+  [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md#aislamiento-de-build-e1--android-y-proyecto-supabase).
   **No cierra este finding ni ninguna parte de él**: separar builds no recupera
   ninguna identidad.
 
@@ -2205,10 +2208,27 @@ se observó en `G3''`.
   explícita: es el scheme del Dev Client de Expo, no del producto;
 * no se ha ensayado la captura por una app de terceros, y **no se asigna
   severidad**, igual que antes;
-* nada de esto se ha ejercitado en un dispositivo: es configuración observada en
-  el manifest combinado, **no una validación en hardware**;
 * **no afirma que Drive funcione en banco.** Habilitar Drive en banco sigue
-  bloqueado por la configuración de OAuth en Google, que es otro gate.
+  bloqueado por la configuración de OAuth en Google y por el
+  `MOBILE_OAUTH_REDIRECT` del backend de banco, que es otro gate.
+
+**VALIDADO EN HARDWARE (2026-10-03), OnePlus A6000.** Lo anterior dejó de ser
+sólo configuración. Con los **tres** packages instalados a la vez, el Package
+Manager resuelve `guardiancloudbench://oauth/drive` a **un único** candidato
+—banco— y `guardiancloud://oauth/drive` a los **dos** packages no-banco, sin
+banco entre ellos. El lanzamiento real del deep link de banco, con la aplicación
+viva en segundo plano, dio `Status: ok` y entregó la URI a
+`com.guariacloud.app.bench/com.guardiancloud.app.MainActivity`, con transición
+launcher → banco y ninguna otra aplicación de la familia en foreground. Registro
+completo en
+[`VALIDATIONS/E1_BENCH_ISOLATION_2026-10-03.md`](./VALIDATIONS/E1_BENCH_ISOLATION_2026-10-03.md).
+
+**Eso valida la exclusividad entre nuestros builds. No valida este finding, que
+sigue `OPEN`**, y la misma corrida lo demuestra: `guardiancloud://` tiene **dos**
+candidatos en ese dispositivo —el identificador histórico y el de producción
+vigente— y el preferido que Android elige es el **histórico**. Es el modo de
+fallo de esta sección, vivo entre dos instalaciones de producción. Queda
+documentado y **sin corregir**.
 
 `GC-OAUTH-NOSTATE-001` (§9) sigue **`OPEN`** y sin tocar: `state` no se genera,
 no se valida y no se usa.

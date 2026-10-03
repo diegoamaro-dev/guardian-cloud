@@ -31,12 +31,21 @@ BANCO»— mediante `productFlavors` del proyecto nativo versionado, y ancla cad
 entorno a **un** proyecto Supabase con fallo cerrado en los dos sentidos.
 `namespace` sigue intacto a propósito.
 
-Es `TESTED`, **no** `VALIDATED`: sin APK, sin instalación, sin dispositivo y sin
-contacto con Supabase. **No hay todavía ningún APK BENCH**, y construir uno
-sigue bloqueado por las variables de entorno de banco en EAS. Alcance exacto en
+Y el 2026-10-03, más tarde, `77bef24` dio además a banco su propio scheme de
+deep link —`guardiancloudbench`— y todo ello quedó **validado en hardware** en el
+OnePlus A6000: APK de banco instalado y actualizado en sitio conservando sus
+datos, los **tres** packages conviviendo, y el deep link de banco entregado
+únicamente a banco. Registro reconstruible en
+[`VALIDATIONS/E1_BENCH_ISOLATION_2026-10-03.md`](./VALIDATIONS/E1_BENCH_ISOLATION_2026-10-03.md);
+estado por capacidad en
 [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md#aislamiento-de-build-e1--android-y-proyecto-supabase).
-No cambia ningún veredicto de producto: `GC-AUTH-SESSION-RECOVERY-001` sigue
-`OPEN` y el sistema sigue **NO APTO PARA RELEASE**.
+
+**Lo que sigue sin validar**: el aislamiento del proyecto Supabase, el reparto de
+entornos de EAS, y **OAuth real y Drive en banco** — no se ejecutó ningún flujo
+ni se tocó Google. `GC-OAUTH-SCHEME-COLLISION-001` y `GC-OAUTH-NOSTATE-001`
+siguen **`OPEN`**. No cambia ningún veredicto de producto:
+`GC-AUTH-SESSION-RECOVERY-001` sigue `OPEN` y el sistema sigue **NO APTO PARA
+RELEASE**.
 
 ### Lo que cambió el 2026-08-20
 
