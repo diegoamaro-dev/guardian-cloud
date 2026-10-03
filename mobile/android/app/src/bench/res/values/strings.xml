@@ -1,0 +1,15 @@
+<resources>
+  <!--
+    E1 — nombre visible del build de BANCO.
+
+    Sobrescribe `app_name` del source set `main` por precedencia de
+    flavor. Contiene SÓLO esa cadena: todo lo demás (splash screen,
+    status bar) se hereda de `main` sin duplicarse.
+
+    El operador que tenga el dispositivo en la mano debe poder saber qué
+    build está mirando SIN abrirlo. Ese es el propósito entero de esta
+    cadena, y es por lo que el texto es distinto de forma evidente y no
+    un sufijo discreto.
+  -->
+  <string name="app_name">Guardian Cloud BANCO</string>
+</resources>

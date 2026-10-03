@@ -14,6 +14,8 @@
 
 import { z } from 'zod';
 
+import { EXPECTED_PROJECT_REFS, verifyProjectRef } from './projectRefs';
+
 /**
  * E1 — BENCH vs PRODUCTION, declared and never inferred.
  *
@@ -110,6 +112,38 @@ if (!parsed.success) {
 }
 
 const supabaseUrl = parsed.data.EXPO_PUBLIC_SUPABASE_URL.replace(/\/$/, '');
+const projectRef = deriveProjectRef(supabaseUrl);
+
+/**
+ * E1-S — el entorno declarado y el proyecto alcanzado tienen que
+ * corresponder, 1:1 y de fallo cerrado.
+ *
+ * Esto se comprueba aquí, en el límite de configuración, y no en Auth ni
+ * en la UI: a partir de esta línea el resto del sistema ya puede dar por
+ * hecho que el proyecto es el que toca. La regla y el porqué viven en
+ * `projectRefs.ts`.
+ *
+ * El mensaje dice el entorno y la razón, y nada más: ni URL, ni ref, ni
+ * clave. Quien diagnostica ya sabe qué build ha instalado.
+ */
+const projectVerdict = verifyProjectRef(
+  parsed.data.EXPO_PUBLIC_GC_ENV,
+  projectRef,
+  EXPECTED_PROJECT_REFS,
+);
+
+if (!projectVerdict.ok) {
+  console.log('GC_ENV_PROJECT_REFUSED', {
+    gcEnv: parsed.data.EXPO_PUBLIC_GC_ENV,
+    refusal: projectVerdict.refusal,
+  });
+  throw new Error(
+    `[env] El proyecto Supabase alcanzado no corresponde al entorno ` +
+      `declarado '${parsed.data.EXPO_PUBLIC_GC_ENV}': ` +
+      `${projectVerdict.refusal}. Revisa EXPO_PUBLIC_SUPABASE_URL y ` +
+      `EXPO_PUBLIC_GC_ENV del build, y la tabla de src/config/projectRefs.ts.`,
+  );
+}
 
 export const env = Object.freeze({
   apiUrl: parsed.data.EXPO_PUBLIC_API_URL.replace(/\/$/, ''),
@@ -119,7 +153,7 @@ export const env = Object.freeze({
   gcEnv: parsed.data.EXPO_PUBLIC_GC_ENV,
   isBench: parsed.data.EXPO_PUBLIC_GC_ENV === 'bench',
   /** Which Supabase project this build actually reaches. */
-  projectRef: deriveProjectRef(supabaseUrl),
+  projectRef,
 });
 
 // Declared environment and reached project, side by side and on purpose:

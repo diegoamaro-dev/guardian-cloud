@@ -8,13 +8,13 @@
       "developmentClient": true,
       "distribution": "internal",
       "android": {
-        "buildType": "apk"
+        "gradleCommand": ":app:assembleProductionDebug"
       }
     },
     "preview": {
       "distribution": "internal",
       "android": {
-        "buildType": "apk"
+        "gradleCommand": ":app:assembleProductionRelease"
       },
       "env": {
         "NPM_CONFIG_LEGACY_PEER_DEPS": "true"
@@ -23,7 +23,20 @@
     },
     "production": {
       "autoIncrement": true,
+      "android": {
+        "gradleCommand": ":app:bundleProductionRelease"
+      },
       "environment": "production"
+    },
+    "bench": {
+      "distribution": "internal",
+      "android": {
+        "gradleCommand": ":app:assembleBenchRelease"
+      },
+      "env": {
+        "NPM_CONFIG_LEGACY_PEER_DEPS": "true",
+        "EXPO_PUBLIC_GC_ENV": "bench"
+      }
     }
   },
   "submit": {

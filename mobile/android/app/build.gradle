@@ -33,6 +33,14 @@ react {
     //   skip the bundling of the JS bundle and the assets. By default is just 'debug'.
     //   If you add flavors like lite, prod, etc. you'll have to list your debuggableVariants.
     // debuggableVariants = ["liteDebug", "prodDebug"]
+    //
+    // E1 — OBLIGATORIO desde que existen los flavors `production` y `bench`.
+    // Sin esta lista el plugin sólo considera debuggable la variante
+    // literal `debug`, que ya no existe: los debug pasarían a empaquetar
+    // el bundle JS y el Dev Client dejaría de conectarse al servidor de
+    // Metro. Esto NO añade comportamiento nuevo — restituye exactamente
+    // la semántica anterior al cambio, ahora por sus nombres reales.
+    debuggableVariants = ["productionDebug", "benchDebug"]
 
     /* Bundling */
     //   A list containing the node command and its flags. Default is just 'node'.
@@ -97,6 +105,50 @@ android {
 
         buildConfigField "String", "REACT_NATIVE_RELEASE_LEVEL", "\"${findProperty('reactNativeReleaseLevel') ?: 'stable'}\""
     }
+
+    /**
+     * E1 — aislamiento de instalación entre BANCO y PRODUCCIÓN.
+     *
+     * Por qué vive aquí y no en `app.config.ts`: el `applicationId` y el
+     * nombre visible de un APK salen SIEMPRE de este proyecto nativo
+     * versionado. `android.package` y `name` del config de Expo sólo
+     * llegarían hasta aquí a través de `expo prebuild`, que este
+     * repositorio NO ejecuta como paso de build — ver
+     * `docs/RELEASE_CHECKLIST_v0.3.md` §3.1. Un mecanismo que dependiera
+     * del config de Expo no tendría efecto en la ruta real.
+     *
+     * `namespace` NO se toca, y no puede tocarse desde aquí: un flavor
+     * modifica únicamente `applicationId`. La divergencia intencional
+     * `namespace != applicationId` que decide
+     * `docs/decisions/ADR-ANDROID-APPLICATION-ID.md` se conserva por
+     * construcción, igual que los paquetes Kotlin `com.guardiancloud.*`.
+     *
+     *   production   com.guariacloud.app         Guardian Cloud
+     *   bench        com.guariacloud.app.bench   Guardian Cloud BANCO
+     *
+     * Dos `applicationId` distintos significa que Android los trata como
+     * dos aplicaciones: COEXISTEN en el mismo dispositivo y ninguna puede
+     * sobrescribir a la otra. Eso es lo que E1 no conseguía antes.
+     *
+     * El nombre de banco vive en `src/bench/res/values/strings.xml`, que
+     * sobrescribe `app_name` del source set `main` por precedencia de
+     * flavor. Deliberadamente NO se usa `resValue`: `app_name` ya existe
+     * en `main` y produciría un recurso duplicado.
+     */
+    flavorDimensions = ['env']
+    productFlavors {
+        production {
+            dimension 'env'
+            // Sin suffix y sin recursos propios, a propósito: producción
+            // conserva exactamente el `applicationId` y el nombre que
+            // tenía antes de este cambio.
+        }
+        bench {
+            dimension 'env'
+            applicationIdSuffix '.bench'
+        }
+    }
+
     signingConfigs {
         debug {
             storeFile file('debug.keystore')

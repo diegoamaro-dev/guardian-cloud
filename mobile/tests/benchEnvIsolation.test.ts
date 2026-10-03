@@ -1,14 +1,24 @@
 /**
  * E1 — banco y producción no pueden confundirse en silencio.
  *
- * Dos garantías, y las dos son verificables sin construir nada:
+ * Este fichero cubre **una** de las garantías: la DECLARACIÓN del
+ * entorno, de fallo cerrado. Un build que no declara `production` o
+ * `bench` no se produce —`resolveBuildVariant` rehúsa durante
+ * `app.config.ts`— y no arranca —`env.ts` lanza—. `app.config.ts` no
+ * duplica esa regla, la llama.
  *
- *   1. un build que no DECLARA su entorno no arranca: `env.ts` lanza;
- *   2. declarar `bench` cambia el nombre visible y el application id,
- *      así que las dos instalaciones coexisten en vez de pisarse.
+ * **`resolveBuildVariant` NO es lo que hace coexistir las dos
+ * instalaciones.** Calcula un nombre y un `applicationId`, pero esos
+ * valores sólo llegarían al APK a través de `expo prebuild`, que no es un
+ * paso de build en este repositorio. El aislamiento Android EFECTIVO
+ * —`applicationId` distinto y nombre visible distinto— vive en el
+ * proyecto nativo versionado: los `productFlavors` de
+ * `android/app/build.gradle` y el source set `android/app/src/bench/`.
  *
- * La segunda se prueba contra `resolveBuildVariant`, que es donde vive la
- * regla; `app.config.ts` no la duplica, la llama.
+ * Ese contrato se prueba en `benchInstallIsolation.test.ts`, y la
+ * correspondencia entre entorno declarado y proyecto Supabase alcanzado
+ * en `supabaseProjectIsolation.test.ts`. Tres ficheros, tres garantías
+ * distintas, y ninguna acredita a las otras.
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
@@ -18,6 +28,20 @@ import {
   PRODUCTION_APP_NAME,
   PRODUCTION_ANDROID_PACKAGE,
 } from '@/config/buildVariant';
+import { EXPECTED_PROJECT_REFS } from '@/config/projectRefs';
+
+/**
+ * E1-S — este fichero prueba la DECLARACIÓN del entorno; a qué proyecto
+ * Supabase corresponde cada uno se prueba en
+ * `supabaseProjectIsolation.test.ts`, que es su sitio. Pero desde que
+ * `env.ts` exige esa correspondencia 1:1, los fixtures de aquí tienen que
+ * apuntar al proyecto REAL de cada entorno: no hay tabla ficticia en
+ * ninguna parte, y por tanto nada que pueda divergir de la vigente.
+ */
+const REAL_REF = {
+  production: EXPECTED_PROJECT_REFS.production as string,
+  bench: EXPECTED_PROJECT_REFS.bench as string,
+} as const;
 
 describe('E1 · variante de build', () => {
   it('produce identidades de app distintas para banco y producción', () => {
@@ -90,7 +114,7 @@ describe('E1 · variante de build', () => {
 describe('E1 · env.ts exige declarar el entorno', () => {
   const VALID = {
     EXPO_PUBLIC_API_URL: 'https://api.example.com',
-    EXPO_PUBLIC_SUPABASE_URL: 'https://benchref.supabase.co',
+    EXPO_PUBLIC_SUPABASE_URL: `https://${REAL_REF.bench}.supabase.co`,
     EXPO_PUBLIC_SUPABASE_ANON_KEY: 'x'.repeat(40),
   };
 
@@ -124,11 +148,16 @@ describe('E1 · env.ts exige declarar el entorno', () => {
 
     expect(env.gcEnv).toBe('bench');
     expect(env.isBench).toBe(true);
-    expect(env.projectRef).toBe('benchref');
+    expect(env.projectRef).toBe(REAL_REF.bench);
   });
 
   it('producción declarada no queda marcada como banco', async () => {
     vi.stubEnv('EXPO_PUBLIC_GC_ENV', 'production');
+    // Cada entorno tiene que alcanzar SU proyecto, también aquí.
+    vi.stubEnv(
+      'EXPO_PUBLIC_SUPABASE_URL',
+      `https://${REAL_REF.production}.supabase.co`,
+    );
     const { env } = await import('@/config/env');
 
     expect(env.gcEnv).toBe('production');
@@ -142,6 +171,10 @@ describe('E1 · env.ts exige declarar el entorno', () => {
    */
   it('runtime y config aceptan exactamente los mismos literales', async () => {
     vi.stubEnv('EXPO_PUBLIC_GC_ENV', 'production');
+    vi.stubEnv(
+      'EXPO_PUBLIC_SUPABASE_URL',
+      `https://${REAL_REF.production}.supabase.co`,
+    );
     const { GC_ENVIRONMENTS } = await import('@/config/env');
     const { BUILD_ENVIRONMENTS } = await import('@/config/buildVariant');
 
