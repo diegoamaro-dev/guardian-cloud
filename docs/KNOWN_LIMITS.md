@@ -1402,7 +1402,11 @@ cifras de arriba.
 
 ```
 GC-AUTH-RECOVERABLE-IDENTITY-PRIMITIVE-001 = PASS / OBSERVADO EN PoC DESECHABLE   (2026-09-16)
-integración en Guardian Cloud              = NO IMPLEMENTADA
+integración en Guardian Cloud              = PARCIAL — vinculación diferida de
+                                             email publicada en 2cef552
+                                             (implementada, con pruebas
+                                             unitarias, NUNCA validada);
+                                             entrada por OTP NO IMPLEMENTADA
 GC-AUTH-SESSION-RECOVERY-001               = OPEN
 ```
 
@@ -1823,10 +1827,22 @@ producción.
 - **La causa histórica del 22/08 sigue sin demostrar**, y ninguna prueba futura
   puede demostrarla.
 - **Identidad recuperable en el producto.** La primitiva pasó en un proyecto
-  desechable, pero la app no la integra: no ofrece vincular un email ni entrar
-  por OTP, y nada reconecta una identidad recuperada con la evidencia pendiente.
-  Contra producción no se ha probado, y allí Manual Linking sigue desactivado.
-  Sigue pendiente la prueba negativa de `shouldCreateUser: false`.
+  desechable, y de la integración existe **sólo la primera mitad**: desde
+  `2cef552` la app ofrece vincular un email —pantalla de presentación y
+  `linkEmail`, que conserva el `user.id` o devuelve fallo sin tocar la cola ni
+  la pausa—, implementada y con pruebas unitarias, **nunca validada ni en banco
+  ni en hardware**. Sigue **sin existir** entrada por OTP, y nada reconecta una
+  identidad recuperada con la evidencia pendiente. Contra producción no se ha
+  probado, y allí Manual Linking sigue desactivado. Sigue pendiente la prueba
+  negativa de `shouldCreateUser: false`.
+- **Aislamiento del build de banco.** Desde `ccbf4fa` un build de banco se
+  instala como `com.guariacloud.app.bench` / «Guardian Cloud BANCO» y sólo puede
+  alcanzar el proyecto Supabase de banco, con fallo cerrado en los dos sentidos.
+  Es `TESTED`, **no** `VALIDATED`: sin APK, sin instalación y sin dispositivo, y
+  la coexistencia de las dos aplicaciones **no se ha observado**. Estado exacto
+  en [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md#aislamiento-de-build-e1--android-y-proyecto-supabase).
+  **No cierra este finding ni ninguna parte de él**: separar builds no recupera
+  ninguna identidad.
 
 ---
 

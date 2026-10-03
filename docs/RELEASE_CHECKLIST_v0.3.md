@@ -132,6 +132,14 @@ seguridad de red.
 Además, EAS ignora `android.package` de `app.config.ts` precisamente porque
 detecta ese directorio: **el paquete real sale del nativo versionado**.
 
+> Eso dejó de ser sólo una advertencia el 2026-10-03: es la razón por la que el
+> aislamiento del build de banco vive en los `productFlavors` del nativo y no en
+> el config de Expo. Ver
+> [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md#aislamiento-de-build-e1--android-y-proyecto-supabase).
+> Un prebuild, además de destruir las personalizaciones, alinearía `namespace`
+> con `applicationId` y renombraría los paquetes Kotlin, deshaciendo la decisión
+> de [`decisions/ADR-ANDROID-APPLICATION-ID.md`](./decisions/ADR-ANDROID-APPLICATION-ID.md).
+
 > **No ejecutar `prebuild --clean` como parte de un flujo normal de build.**
 > Sólo de forma consciente, cuando sea imprescindible (p. ej. al subir de SDK
 > mayor), y en ese caso:
@@ -146,13 +154,21 @@ detecta ese directorio: **el paquete real sale del nativo versionado**.
 
 ```bash
 cd mobile
-npx expo run:android --variant release
+npx expo run:android --variant productionRelease
 # o:
-cd android && ./gradlew assembleRelease
+cd android && ./gradlew :app:assembleProductionRelease
 ```
 
+> **La variante se cualifica siempre.** Desde `ccbf4fa` existen los flavors
+> `production` y `bench`, así que `assembleRelease` a secas construiría **los
+> dos** y habría que elegir entre dos artefactos. Una release se construye
+> desde el flavor `production`, nunca desde el agregado.
+
 - [ ] AAB / APK firmado con keystore de release (NO con el debug.keystore).
-- [ ] `applicationId` = `com.guardiancloud.app`.
+- [ ] `applicationId` = `com.guariacloud.app` — el de producción, decidido en
+      [`decisions/ADR-ANDROID-APPLICATION-ID.md`](./decisions/ADR-ANDROID-APPLICATION-ID.md).
+      Si aparece `com.guariacloud.app.bench`, se ha construido el flavor de
+      banco: **el artefacto no vale para release**.
 
 > **Versionado:** el requisito completo —incluido el incremento de `versionCode`
 > respecto a la release anterior— vive en **§1 · Pre-flight (código)**. No se
@@ -174,6 +190,9 @@ Si falta una, el artefacto no vale:
       **reutilizado, no regenerado**. Un keystore nuevo rompe `install -r`
       sobre instalaciones previas.
 - [ ] Paquete Android procedente del nativo, no de `app.config.ts`.
+- [ ] **Variante cualificada en el comando de Gradle del log** —
+      `assembleProductionRelease` o `bundleProductionRelease`—, y el perfil de
+      `eas.json` usado es uno de producción, no `bench`.
 - [ ] **Arranque del APK real con Metro APAGADO**, sin `FATAL EXCEPTION` ni
       `JavascriptException`, con `ENV READY` mostrando valores reales y la
       secuencia `GC_BOOT_RECOVERY_START` → `GC_BOOT_QUEUE_PENDING` →
@@ -189,9 +208,20 @@ usuario, con Metro APAGADO. Metro Dev Client esconde bugs reales
 
 Desinstalar el dev client antes:
 ```bash
-adb uninstall com.guardiancloud.app
-adb install mobile/android/app/build/outputs/apk/release/app-release.apk
+adb uninstall com.guariacloud.app
+adb install mobile/android/app/build/outputs/apk/production/release/app-production-release.apk
 ```
+
+> El paquete es `com.guariacloud.app` desde `f82b111`. La ruta de salida cambió
+> con los flavors de `ccbf4fa`: AGP emite en
+> `outputs/apk/<flavor>/<buildType>/`, de modo que ya no hay un
+> `apk/release/app-release.apk`. **Esa ruta concreta todavía no se ha
+> observado** —no se ha construido ningún APK desde el cambio—; confírmala en el
+> primer build y corrige esta línea si AGP la nombra de otro modo.
+>
+> **`com.guariacloud.app.bench` es otra aplicación**: no se desinstala al
+> preparar una release, no estorba, y desinstalarla por costumbre destruiría el
+> estado del banco.
 
 ### 4.1 Camino feliz audio
 - [ ] Conectar Drive desde Settings → consent flow completo → "Conectado".

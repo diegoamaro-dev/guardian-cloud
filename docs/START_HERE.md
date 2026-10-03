@@ -22,6 +22,22 @@ el alcance de su evidencia. El estado vigente se reconstruye desde:
 > ese bloque**. La tabla completa está en
 > [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md#findings-abiertos-de-identidad-destino-y-herramientas).
 
+### Lo que cambió el 2026-10-03
+
+Un build de **banco** y uno de **producción** ya no pueden confundirse ni
+pisarse. `ccbf4fa` separa la identidad Android de los dos —`com.guariacloud.app`
+/ «Guardian Cloud» frente a `com.guariacloud.app.bench` / «Guardian Cloud
+BANCO»— mediante `productFlavors` del proyecto nativo versionado, y ancla cada
+entorno a **un** proyecto Supabase con fallo cerrado en los dos sentidos.
+`namespace` sigue intacto a propósito.
+
+Es `TESTED`, **no** `VALIDATED`: sin APK, sin instalación, sin dispositivo y sin
+contacto con Supabase. **No hay todavía ningún APK BENCH**, y construir uno
+sigue bloqueado por las variables de entorno de banco en EAS. Alcance exacto en
+[`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md#aislamiento-de-build-e1--android-y-proyecto-supabase).
+No cambia ningún veredicto de producto: `GC-AUTH-SESSION-RECOVERY-001` sigue
+`OPEN` y el sistema sigue **NO APTO PARA RELEASE**.
+
 ### Lo que cambió el 2026-08-20
 
 El requisito crítico del producto quedó **demostrado físicamente**: la evidencia
@@ -60,9 +76,12 @@ baseline `v0.3.0-rc.1`, no la rama actual.
 | Typecheck **backend** | **no medido en este corte** |
 | `git diff --check` | Limpio |
 
-La cifra vigente es la de la tabla: **936 tests móviles en 42 ficheros**,
-medidos el 2026-08-27 sobre el mismo objeto `tree` de `mobile/` que publica
-`main@63099d8`. La medición anterior, del 2026-08-26 tras `fc9a20e`, dio la
+La cifra de esa tabla —**936 tests móviles en 42 ficheros**— es la del corte del
+2026-08-27, medida sobre el mismo objeto `tree` de `mobile/` que publica
+`main@63099d8`. **Ya no es la vigente**: la cifra actual la fija
+[`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md), y en el corte del
+2026-10-03, tras `ccbf4fa`, es **1007/1007 en 47 ficheros**. El typecheck sigue
+en 12 errores heredados. La medición anterior, del 2026-08-26 tras `fc9a20e`, dio la
 misma cifra. Los **cortes históricos anteriores** fueron 900/900 en 42 ficheros
 tras `cb59c7e` y 792/792 en 41 ficheros tras `3c10994`, y ninguno describe ya
 la suite actual. El fichero 41 era `startLatencyDecoupling.test.ts`, que aportó

@@ -4,11 +4,12 @@
 
 | Qué | Cuándo / sobre qué |
 |---|---|
-| Estado documental vigente | **2026-08-31** |
+| Estado documental vigente | **2026-10-03** |
 | Producto usado para la revalidación de `GC-DEST-PAUSE-001` | **`22a9b26`** (APK release `2b3be062…`) |
 | Producto usado para la validación de `GC-START-LATENCY-001` | **`e643b01`** (APK release `1cb80fea…`) |
 | Producto usado para la validación de **D3 local segment salvage** | **`cb59c7e`** (APK release `8151c338…`) |
-| Última suite automática registrada | **2026-08-31**, tras **`eb86340`** — 958/958 en 43 ficheros · typecheck 12, sin drift |
+| Última suite automática registrada | **2026-10-03**, tras **`ccbf4fa`** — 1007/1007 en 47 ficheros · typecheck 12, sin drift |
+| Aislamiento de build y de proyecto Supabase | **`ccbf4fa`** — ver [la sección propia](#aislamiento-de-build-e1--android-y-proyecto-supabase) |
 
 > Las fechas y los commits son distintos a propósito, y no deben fundirse. La
 > suite vigente —958/958 en 43 ficheros— se midió sobre el árbol posterior a
@@ -185,6 +186,92 @@ cifrado local de chunks (sólo `TODO` en el código), recovery autónomo tras
 reinicio sin abrir la app (`I5c`), `capture_end_reason`, Closed Testing,
 usuarios externos y publicación en Play Store.
 
+### Aislamiento de build (E1) — Android y proyecto Supabase
+
+Publicado en **`ccbf4fa999545da075d21921937d70f0e9b12d99`** (2026-10-03). No es
+una capacidad de producto: es la separación entre un build de **banco** y uno de
+**producción**. Se registra aquí porque es la fuente canónica de qué está
+implementado y con qué evidencia.
+
+```
+ANDROID INSTALL ISOLATION   = IMPLEMENTED / TESTED      · NO VALIDATED
+SUPABASE PROJECT ISOLATION  = IMPLEMENTED / TESTED      · NO VALIDATED
+```
+
+> **Qué significa `TESTED` aquí, y es un nivel propio.** Acredita pruebas
+> automáticas sobre configuración estática, más —en el caso de Android— que
+> Gradle reconoce y resuelve el grafo de tareas de ambas variantes. **No** es
+> `UNIT_TESTED` de lógica de producto y **no** se acerca a
+> `HARDWARE_VALIDATED`: no se ha construido ningún APK, no se ha instalado
+> nada, no se ha contactado con ningún proyecto Supabase y no ha habido
+> dispositivo.
+
+| | production | bench |
+|---|---|---|
+| `applicationId` | `com.guariacloud.app` | `com.guariacloud.app.bench` |
+| Nombre visible | `Guardian Cloud` | `Guardian Cloud BANCO` |
+| Proyecto Supabase | `nahksdkcvhveoctpjrea` | `rgbsofvycynhabycetel` (`guaria-auth-test`) |
+
+**Dónde vive el aislamiento Android, y dónde NO.** En los `productFlavors` de
+`mobile/android/app/build.gradle` —`bench` con `applicationIdSuffix '.bench'`— y
+en el source set `mobile/android/app/src/bench/`, que aporta su propio
+`app_name`. **No** en `app.config.ts`: `android.package` y `name` del config de
+Expo sólo llegarían al nativo a través de `expo prebuild`, que no es un paso de
+build de este repositorio —ver [`RELEASE_CHECKLIST_v0.3.md`](./RELEASE_CHECKLIST_v0.3.md) §3.1—.
+Un mecanismo apoyado en el config de Expo no habría tenido efecto en la ruta
+real, y antes de `ccbf4fa` no lo tenía: un build de banco se instalaba con el
+`applicationId` y el nombre de producción, encima de ella.
+
+**`namespace 'com.guardiancloud.app'` permanece deliberadamente intacto**, junto
+con los paquetes Kotlin `com.guardiancloud.*`. Un flavor sólo modifica
+`applicationId`, así que la divergencia que decide
+[`decisions/ADR-ANDROID-APPLICATION-ID.md`](./decisions/ADR-ANDROID-APPLICATION-ID.md)
+se conserva por construcción, no por cuidado.
+
+**El proyecto Supabase está anclado 1:1 y de fallo cerrado.** `src/config/projectRefs.ts`
+declara un único proyecto autorizado por entorno y `src/config/env.ts` rehúsa
+arrancar si el proyecto alcanzado no es ése. Un entorno sin proyecto declarado
+también se rechaza: ausencia significa «no declarado», nunca un valor por
+defecto. No existe variable ni flag que relaje la comprobación en un build; el
+único sustituto de la tabla es el import, es decir las pruebas. El project ref
+no es un secreto —viaja en cada APK— y las claves no están ahí.
+
+Evidencia de este corte:
+
+* suite **1007/1007 en 47 ficheros**; typecheck en los **12 errores heredados**,
+  sin añadir ninguno;
+* 25 pruebas nuevas: 13 del contrato nativo, 12 de la guarda, incluidos los
+  cruces `production ↔ bench` en ambos sentidos y el tercer proyecto;
+* `./gradlew :app:assembleBenchRelease --dry-run` y
+  `:app:assembleProductionRelease --dry-run` = **PASS**, los dos
+  `BUILD SUCCESSFUL`, sin generar artefactos.
+
+Lo que **falta**, y por qué no hay nada que ascender:
+
+* **ningún APK BENCH construido todavía**;
+* **la coexistencia de las dos aplicaciones en un dispositivo no se ha
+  observado**;
+* **ningún contacto real con Supabase** queda acreditado por este gate;
+* **bloqueo operativo abierto:** el perfil `bench` de `eas.json` no declara
+  `environment`, deliberadamente, para que no herede las variables de
+  producción. Mientras no se decida dónde viven `EXPO_PUBLIC_SUPABASE_URL` y la
+  clave anónima de banco, una build de banco en EAS no recibiría esos valores y
+  abortaría al arrancar. **No está resuelto.**
+
+**Deuda inmediata, de una línea de alcance.** El docstring de
+`mobile/src/config/buildVariant.js` conserva un bloque «KNOWN LIMIT» que
+describe como abierta la rendija que `ccbf4fa` cerró: dice que un build lanzado
+directamente por Gradle conserva el `applicationId` de producción «regardless of
+this module», que era cierto antes de los flavors. Es un comentario, no
+comportamiento, y se corrige en un gate propio para que este corte quede
+estrictamente documental. Su sitio canónico sería
+[`KNOWN_DEBT.md`](./KNOWN_DEBT.md); se registra aquí porque ese fichero quedó
+fuera del alcance autorizado de esta reconciliación.
+
+Esto no toca Auth funcional, ni `GC_QUEUE`, worker, retry, uploader, recovery o
+cleanup, ni el backend. **`GC-AUTH-SESSION-RECOVERY-001` sigue `OPEN`** y el
+producto sigue **`NO APTO PARA RELEASE`**.
+
 ### Problema 8 — Durable cleanup scheduler
 
 Estado: `IMPLEMENTED / UNIT_TESTED / HARDWARE_VALIDATED` **en la ruta normal**;
@@ -254,7 +341,7 @@ proviniendo de una ficha de evidencia congelada fuera del repositorio.
 | **GC-DEV-RESET-001** | RELEASE BLOCKER · `FIXED IN CODE` / revalidación hardware **no requerida** | `e289dcb` | El defecto es de política de borrado, demostrable en pruebas. 62 tests en `devResetGuard.test.ts` |
 | **GC-DEST-PAUSE-001** | `FIXED IN CODE` / **`HARDWARE REVALIDATED`** | `3fae4f6` | Revalidado el 24/08 como **cross-build durable-state recovery validation**: la pausa la escribió el build `34412a0`-era y la retiró producto `22a9b26`. Reconexión real por OAuth → pausa retirada → 10/10 chunks con referencias remotas distintas → `/complete` → cleanup, en ese orden. Identidad estable (`08c0875e`). La corrida del 21/08 había quedado **anulada** por GC-DEV-RESET-001. Detalle en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §3 |
 | **GC-AUTH-001** | `FIXED IN CODE` · ruta de identidad **PASS en hardware** · flujo extremo a extremo **no alcanzado** | `ad8756b`…`8615ba6`, integrados en `e215e5c` | La Vía 2 del 21/08 dio `Identity PASS` y `Registration PASS`, pero `Upload BLOCKED`, `Completion NOT REACHED` y `Cleanup NOT EXECUTED`. **No es un cierre** |
-| **GC-AUTH-SESSION-RECOVERY-001** | **`OPEN`** · prevención **validada en banco** · **evidencia incidental en hardware** · **validación dirigida en dispositivo PENDIENTE**; supervivencia (D3) **`HARDWARE FUNCTIONAL PASS`**; primitiva de identidad recuperable **`PASS / OBSERVADO EN PoC DESECHABLE`** (2026-09-16), **integración NO implementada** | D0 `02551a1`+`34412a0` · D2-B `08e3cd2` · D2-C `22a9b26` · D3 `cb59c7e` | Tras una ventana offline prolongada la sesión de Supabase desaparecía y 87 chunks quedaron sin poder subirse (22/08). **D2-B** (upgrade a 2.112.3) corrige la destrucción ante `500` / `502` / `525-529` y añade proactive-preserve y un cooldown de 60 s. **D2-C** clasifica `429` en el refresh como reintentable; todo lo demás hace pass-through fail-closed. **D3** es de otra naturaleza: no previene nada, da **salida local** a la evidencia de vídeo nativo segmentado que ya quedó varada. Validado en hardware el 24/08 (OnePlus A6000, modo avión, 12/12 segmentos, `status: complete`). **Ninguna de las tres cierra el finding**: la identidad sigue sin recuperarse, la subida sigue sin reanudarse y el ownership sigue sin restaurarse. El 2026-09-16 pasó, en un proyecto Supabase desechable, la **primitiva** de la prevención elegida: un usuario anónimo con email vinculado y sin ninguna sesión vuelve a entrar por OTP y recupera **el mismo `user.id`**. **Tampoco cierra el finding**: no está integrada en la app, no se ha probado contra producción y no recupera identidades ya perdidas. Detalle en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §5 |
+| **GC-AUTH-SESSION-RECOVERY-001** | **`OPEN`** · prevención **validada en banco** · **evidencia incidental en hardware** · **validación dirigida en dispositivo PENDIENTE**; supervivencia (D3) **`HARDWARE FUNCTIONAL PASS`**; primitiva de identidad recuperable **`PASS / OBSERVADO EN PoC DESECHABLE`** (2026-09-16), **integración PARCIAL**: `2cef552` publicó la vinculación diferida de email (E1); la **entrada por OTP y la reconexión con la evidencia pendiente siguen NO IMPLEMENTADAS** | D0 `02551a1`+`34412a0` · D2-B `08e3cd2` · D2-C `22a9b26` · D3 `cb59c7e` | Tras una ventana offline prolongada la sesión de Supabase desaparecía y 87 chunks quedaron sin poder subirse (22/08). **D2-B** (upgrade a 2.112.3) corrige la destrucción ante `500` / `502` / `525-529` y añade proactive-preserve y un cooldown de 60 s. **D2-C** clasifica `429` en el refresh como reintentable; todo lo demás hace pass-through fail-closed. **D3** es de otra naturaleza: no previene nada, da **salida local** a la evidencia de vídeo nativo segmentado que ya quedó varada. Validado en hardware el 24/08 (OnePlus A6000, modo avión, 12/12 segmentos, `status: complete`). **Ninguna de las tres cierra el finding**: la identidad sigue sin recuperarse, la subida sigue sin reanudarse y el ownership sigue sin restaurarse. El 2026-09-16 pasó, en un proyecto Supabase desechable, la **primitiva** de la prevención elegida: un usuario anónimo con email vinculado y sin ninguna sesión vuelve a entrar por OTP y recupera **el mismo `user.id`**. **Tampoco cierra el finding**: lo único integrado en la app es pedir y enviar la vinculación del email —`2cef552`, implementado y con pruebas unitarias, **nunca validado**—; no hay entrada por OTP, no se ha probado contra producción y no recupera identidades ya perdidas. Detalle en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §5 |
 | **GC-START-LATENCY-001** | `FIXED IN CODE` / **`HARDWARE VALIDATED`** | producto `e643b01` · guardas de test `3c10994` | `startRecording` esperaba a `getOwnershipAccessToken()` antes de abrir la grabadora, y esa ruta de auth **no lleva timeout en ninguna capa**. La lectura se movió dentro de `sessionCreatePromise`, que no se espera antes del productor. Validado en hardware el 24/08 en dos escenarios: **remoto vivo** — 531 ms tap→productor, 163 ms de lógica propia, 28/29 fragmentos confirmados **antes** de PARAR — y **token caducado + modo avión** — 243 ms tap→productor, 102 ms de lógica propia, con auth resolviendo **10,72 s después** de que el productor ya grababa. **auth no se volvió rápida: dejó de bloquear START.** Recuperación tras restaurar red: mismo `localSessionId`, 1 `POST /sessions`, 77/77 confirmados, cleanup posterior a `http_200`. Detalle en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §6 |
 | **GC-DEST-STATUS-001** | **`OPEN`** · defecto de **backend** | — | Ningún camino de código escribe `revoked` ni `error`. Un destino Drive con refresh token revocado sigue reportándose `connected`. Ver [`API_SPEC.md`](./API_SPEC.md#estado-de-los-destinos--defecto-abierto) |
 | **GC-AUTH-RETRY-CLASSIFICATION-001** | **causa suficiente demostrada** · relación causal con el 22/08 **no probada** | banco `9d682bc` · D2-B `08e3cd2` · D2-C `22a9b26` | Dejó de ser estático: el banco reproduce de forma determinista que un `429` / `500` en el refresh destruye una credencial **intacta** (`refresh_present: true`). Corregido para `500` por D2-B y para `429` por D2-C. **Sigue sin demostrarse** que el incidente del 22/08 fuera uno de esos dos: la respuesta nunca se capturó |

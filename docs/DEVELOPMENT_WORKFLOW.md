@@ -87,11 +87,13 @@ Nada se considera funcionando por pasar en Metro o en emulador. La comprobación
 ```bash
 adb install -r <apk>
 adb logcat -c
-adb shell monkey -p com.guardiancloud.app -c android.intent.category.LAUNCHER 1
+adb shell monkey -p com.guariacloud.app -c android.intent.category.LAUNCHER 1
 adb logcat -d
 ```
 
-Verificar como mínimo: proceso vivo, sin `FATAL EXCEPTION`, `ENV READY` con valores reales, y la secuencia `GC_BOOT_RECOVERY_START` → `GC_BOOT_QUEUE_PENDING` → `GC_PERF_DRAIN_PICK`.
+El package es `com.guariacloud.app` desde `f82b111`. Un build de **banco** es otra aplicación, `com.guariacloud.app.bench`, y se comprueba con ese package: ver [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md#aislamiento-de-build-e1--android-y-proyecto-supabase).
+
+Verificar como mínimo: proceso vivo, sin `FATAL EXCEPTION`, `ENV READY` con valores reales, y la secuencia `GC_BOOT_RECOVERY_START` → `GC_BOOT_QUEUE_PENDING` → `GC_PERF_DRAIN_PICK`. En un build de banco, además, `GC_ENV` debe decir `bench` y el project ref del proyecto de banco.
 
 ### 5.4 Repetir las pruebas críticas afectadas
 

@@ -7,7 +7,7 @@ Cada escenario es **físico** y debe ejecutarse contra el APK firmado, NO contra
 
 ## Cómo se usa
 
-1. Construir APK release (`eas build --profile preview --platform android` o `assembleRelease`).
+1. Construir APK release (`eas build --profile preview --platform android` o `:app:assembleProductionRelease` — la variante se cualifica desde `ccbf4fa`, porque `assembleRelease` a secas construiría también el flavor de banco).
 2. Desinstalar dev client si lo hubiera.
 3. Instalar APK en al menos **dos** dispositivos: uno Pixel/Android-stock y uno OEM agresivo (Xiaomi/Huawei/OPPO si está a mano).
 4. Por cada escenario abajo: ejecutar pasos al pie de la letra, anotar PASS/FAIL en una copia con fecha + dispositivo + Android version.

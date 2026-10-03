@@ -96,6 +96,20 @@ dex                com/guardiancloud/app/MainActivity   presente
 firma              sin cambios · applicationId y certificado son independientes
 ```
 
+#### Actualización 2026-10-03 — el banco deriva del `applicationId`, no lo discute
+
+`ccbf4fa` añade el flavor `bench` con `applicationIdSuffix '.bench'`, de modo que
+el banco se instala como **`com.guariacloud.app.bench`** y coexiste con
+producción en vez de pisarla. **No altera esta decisión**: el `applicationId` de
+producción sigue siendo `com.guariacloud.app`, y un flavor sólo modifica
+`applicationId`, así que `namespace` y los paquetes Kotlin quedan fuera de su
+alcance por construcción.
+
+La divergencia pasa además a estar **protegida por una prueba**:
+`mobile/tests/benchInstallIsolation.test.ts` falla si alguien iguala `namespace`
+y `applicationId` —lo que haría cualquier `prebuild`, como advierte §3 C—. El
+aviso de abajo deja de depender de que un futuro lector lo lea a tiempo.
+
 > **Esta divergencia no debe registrarse como deuda pendiente de rename.**
 > Alinear `namespace` con `applicationId` obligaría a mover paquetes Kotlin y
 > rutas físicas sin ningún beneficio observable, y a cambio introduce riesgo de
