@@ -40,9 +40,15 @@ datos, los **tres** packages conviviendo, y el deep link de banco entregado
 estado por capacidad en
 [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md#aislamiento-de-build-e1--android-y-proyecto-supabase).
 
-**Lo que sigue sin validar**: el aislamiento del proyecto Supabase, el reparto de
-entornos de EAS, y **OAuth real y Drive en banco** — no se ejecutó ningún flujo
-ni se tocó Google. `GC-OAUTH-SCHEME-COLLISION-001` y `GC-OAUTH-NOSTATE-001`
+Y en la misma sesión, **E2** observó la configuración efectiva de ese APK —única
+URL Supabase configurada, la del proyecto de banco— y cruzó la frontera de
+autenticación con un JWT real: aceptado por el backend de banco, **rechazado con
+`401` por el de producción**. Registro en
+[`VALIDATIONS/E2_SUPABASE_PROJECT_ISOLATION_2026-10-03.md`](./VALIDATIONS/E2_SUPABASE_PROJECT_ISOLATION_2026-10-03.md).
+
+**Lo que sigue sin validar**: el sentido inverso del cruce —producción → banco,
+**no ejecutado**—, el reparto de entornos de EAS en un dispositivo, y **OAuth
+real y Drive en banco** — no se ejecutó ningún flujo ni se tocó Google. `GC-OAUTH-SCHEME-COLLISION-001` y `GC-OAUTH-NOSTATE-001`
 siguen **`OPEN`**. No cambia ningún veredicto de producto:
 `GC-AUTH-SESSION-RECOVERY-001` sigue `OPEN` y el sistema sigue **NO APTO PARA
 RELEASE**.

@@ -196,9 +196,36 @@ implementado y con qué evidencia.
 ```
 ANDROID INSTALL ISOLATION        = HARDWARE VALIDATED   OnePlus A6000, 2026-10-03
 BENCH DEEP-LINK SCHEME ISOLATION = HARDWARE VALIDATED   OnePlus A6000, 2026-10-03
-SUPABASE PROJECT ISOLATION       = IMPLEMENTED / TESTED      · NO VALIDATED
-EAS ENVIRONMENT ISOLATION        = IMPLEMENTED / TESTED      · NO VALIDATED
+EAS ENVIRONMENT ISOLATION        = IMPLEMENTED / TESTED / OBSERVED
+SUPABASE PROJECT CONFIGURATION (BENCH artifact) = OBSERVED
+JWT CROSS-PROJECT ISOLATION  BENCH → PROD       = DYNAMICALLY VALIDATED
+JWT CROSS-PROJECT ISOLATION  PROD  → BENCH      = NOT EXECUTED / INFERRED
 ```
+
+> **`SUPABASE PROJECT ISOLATION` deja de existir como etiqueta única.** Agrupaba
+> tres cosas de evidencia muy distinta —qué proyecto configura el artefacto, qué
+> entorno entrega EAS, y si la frontera de autenticación rechaza una credencial
+> ajena—, y mantenerlas bajo un solo nombre invitaba a atribuir a una lo
+> demostrado por otra. Las tres últimas líneas la sustituyen. Registro
+> reconstruible de E2 en
+> [`VALIDATIONS/E2_SUPABASE_PROJECT_ISOLATION_2026-10-03.md`](./VALIDATIONS/E2_SUPABASE_PROJECT_ISOLATION_2026-10-03.md).
+>
+> **Qué observó E2.** En el APK instalado —verificado por `sha256`— la única URL
+> Supabase configurada es la de `rgbsofvycynhabycetel` y la API es
+> `http://192.168.178.21:3101`; el ref de producción aparece **sólo como
+> constante de la tabla de guarda**, nunca como URL configurada. Y con un JWT
+> **real** emitido por `guaria-auth-test`: `GET /recovery/manifests` contra el
+> backend de banco dio **200** con `drive_not_connected: true` —el
+> `authMiddleware` se superó—, y **el mismo token** contra
+> `api.guardiancloud.app` dio **401 `UNAUTHORIZED`**, antes del handler.
+>
+> **Lo que esa observación no dice.** El `401` es opaco por diseño, así que
+> **no determina** si el rechazo lo produjo el issuer fijado o la verificación de
+> firma; el código señala ambos como mecanismos, y no se atribuye causalidad.
+> **No hay aislamiento bidireccional dinámicamente validado**: el sentido
+> producción → banco **no se ejecutó**, porque exigiría un JWT de producción, y
+> permanece inferido por identidad de código. Nada de E2 es `HARDWARE VALIDATED`:
+> no ejercita dispositivo, ni captura, ni cola, ni subida, ni recovery, ni export.
 
 > **Las dos primeras se validaron en hardware el 2026-10-03.** Registro completo
 > y reconstruible en
@@ -233,13 +260,12 @@ EAS ENVIRONMENT ISOLATION        = IMPLEMENTED / TESTED      · NO VALIDATED
 > Como todo `HARDWARE VALIDATED` de este documento, significa **validado en ese
 > dispositivo**. No implica cobertura multi-dispositivo ni Android 13+.
 
-> **Qué significa `TESTED` en las dos que siguen sin validar, y es un nivel
-> propio.** Acredita pruebas automáticas sobre configuración estática, más —en
-> el caso de los entornos de EAS— lo que una corrida read-only del CLI observó.
-> **No** es `UNIT_TESTED` de lógica de producto y **no** equivale a
-> `HARDWARE VALIDATED`: `SUPABASE PROJECT ISOLATION` no ha contactado con ningún
-> proyecto Supabase, y el reparto de entornos no se ha ejercitado en un
-> dispositivo.
+> **Qué significa `TESTED` y qué añade `OBSERVED`.** `TESTED` acredita pruebas
+> automáticas sobre configuración estática; **no** es `UNIT_TESTED` de lógica de
+> producto y **no** equivale a `HARDWARE VALIDATED`. `OBSERVED` añade que la
+> configuración se leyó en el artefacto o en una corrida real del CLI, no sólo en
+> el repositorio. El reparto de entornos de EAS **sigue sin ejercitarse en un
+> dispositivo**, y por eso no pasa de ahí.
 
 > **Lo que la validación del 2026-10-03 NO acredita.** **OAuth real y Drive en
 > banco siguen SIN VALIDAR**: no se ejecutó ningún flujo, no se conectó Drive y
@@ -345,10 +371,14 @@ Evidencia de este corte:
 
 Lo que **falta**:
 
-* **ningún contacto real con Supabase** queda acreditado: `SUPABASE PROJECT
-  ISOLATION` sigue sin validar;
+* **el cruce `PROD → BENCH`**: no ejecutado, inferido por identidad de código;
 * **el reparto de entornos de EAS** no se ha ejercitado en un dispositivo;
 * **OAuth real y Drive en banco**: sin validar.
+
+El contacto real con Supabase **ya está acreditado** desde E2: un JWT emitido por
+`guaria-auth-test` superó el backend de banco y fue rechazado por el de
+producción. Ver
+[`VALIDATIONS/E2_SUPABASE_PROJECT_ISOLATION_2026-10-03.md`](./VALIDATIONS/E2_SUPABASE_PROJECT_ISOLATION_2026-10-03.md).
 
 Lo que **ya no falta**, desde el 2026-10-03: existe un APK BENCH construido,
 instalado y actualizado en sitio, y la coexistencia de las tres aplicaciones en
@@ -416,7 +446,7 @@ define.
 Nivel de evidencia, que es estrecho:
 
 ```
-EAS ENVIRONMENT ISOLATION = IMPLEMENTED / TESTED   · NO VALIDADO
+EAS ENVIRONMENT ISOLATION = IMPLEMENTED / TESTED / OBSERVED
 ```
 
 Lo acreditan pruebas estáticas sobre `eas.json` —los cuatro mapeos y las dos
@@ -465,13 +495,14 @@ La visibilidad de las tres debe ser `plaintext` o `sensitive`: una variable
 de la config y el bundle.
 
 **Configurada y observada no es construida ni validada.** Nada de lo anterior
-implica que exista un APK: **el siguiente gate pendiente es el primer APK BENCH
-real**, y es el único que podrá acreditar el `applicationId` del artefacto, su
-nombre visible instalado y la coexistencia con producción en un dispositivo.
-Hasta entonces las tres clasificaciones se quedan donde están —`ANDROID INSTALL
-ISOLATION`, `SUPABASE PROJECT ISOLATION` y `EAS ENVIRONMENT ISOLATION`, todas
-`IMPLEMENTED / TESTED · NO VALIDADO`— y **ninguna asciende a `VALIDATED`** por
-el hecho de que la configuración remota esté puesta.
+implicaba que existiera un APK, y por sí sola no eleva ninguna clasificación:
+poner variables en EAS no construye, no instala y no ejercita nada.
+
+> **Esta frase decía que «el siguiente gate pendiente es el primer APK BENCH
+> real».** Dejó de ser cierta el 2026-10-03, cuando ese APK se construyó, se
+> instaló y se validó en hardware (E1), y E2 añadió después la configuración
+> efectiva del artefacto y el cruce de JWT. Las clasificaciones vigentes son las
+> del bloque de arriba.
 
 ### Problema 8 — Durable cleanup scheduler
 

@@ -1841,8 +1841,13 @@ producción.
   La identidad de instalación y el enrutado de su deep link están **validados en
   hardware** desde el 2026-10-03 —OnePlus A6000, tres packages conviviendo—; ver
   [`VALIDATIONS/E1_BENCH_ISOLATION_2026-10-03.md`](./VALIDATIONS/E1_BENCH_ISOLATION_2026-10-03.md).
-  El **aislamiento del proyecto Supabase sigue `TESTED` y sin validar**: ninguna
-  corrida ha contactado con un proyecto real. Estado exacto en
+  Y el 2026-10-03, **E2** observó la configuración efectiva de ese artefacto y
+  cruzó la frontera de autenticación con un JWT real de `guaria-auth-test`:
+  aceptado por el backend de banco, **rechazado con `401` por producción**. El
+  sentido inverso —producción → banco— **no se ejecutó** y sigue inferido por
+  identidad de código. Ver
+  [`VALIDATIONS/E2_SUPABASE_PROJECT_ISOLATION_2026-10-03.md`](./VALIDATIONS/E2_SUPABASE_PROJECT_ISOLATION_2026-10-03.md)
+  y el estado exacto en
   [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md#aislamiento-de-build-e1--android-y-proyecto-supabase).
   **No cierra este finding ni ninguna parte de él**: separar builds no recupera
   ninguna identidad.
