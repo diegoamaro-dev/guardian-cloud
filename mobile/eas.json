@@ -7,8 +7,12 @@
     "development": {
       "developmentClient": true,
       "distribution": "internal",
+      "environment": "development",
       "android": {
-        "gradleCommand": ":app:assembleProductionDebug"
+        "gradleCommand": ":app:assembleBenchDebug"
+      },
+      "env": {
+        "EXPO_PUBLIC_GC_ENV": "bench"
       }
     },
     "preview": {
@@ -17,7 +21,8 @@
         "gradleCommand": ":app:assembleProductionRelease"
       },
       "env": {
-        "NPM_CONFIG_LEGACY_PEER_DEPS": "true"
+        "NPM_CONFIG_LEGACY_PEER_DEPS": "true",
+        "EXPO_PUBLIC_GC_ENV": "production"
       },
       "environment": "preview"
     },
@@ -26,10 +31,14 @@
       "android": {
         "gradleCommand": ":app:bundleProductionRelease"
       },
+      "env": {
+        "EXPO_PUBLIC_GC_ENV": "production"
+      },
       "environment": "production"
     },
     "bench": {
       "distribution": "internal",
+      "environment": "development",
       "android": {
         "gradleCommand": ":app:assembleBenchRelease"
       },

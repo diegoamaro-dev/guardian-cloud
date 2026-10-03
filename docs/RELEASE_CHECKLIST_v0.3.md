@@ -179,6 +179,24 @@ cd android && ./gradlew :app:assembleProductionRelease
 Antes de aceptar cualquier artefacto de EAS, verificar **las cinco** en su log.
 Si falta una, el artefacto no vale:
 
+> **Qué entorno corresponde a cada perfil.** `environment` está escrito en los
+> cuatro perfiles de `eas.json` desde el gate E1-BENCH-EAS-ENV, porque omitirlo
+> **no** deja un perfil sin entorno: EAS elige uno —`preview` para un perfil
+> `internal` que no sea dev client—. El plan de esta cuenta no ofrece entornos
+> personalizados, así que los tres estándar están repartidos en dos mundos:
+>
+> | Perfil | Entorno EAS | `EXPO_PUBLIC_GC_ENV` | Variante | Mundo |
+> |---|---|---|---|---|
+> | `development` | `development` | `bench` | `assembleBenchDebug` | BANCO |
+> | `bench` | `development` | `bench` | `assembleBenchRelease` | BANCO |
+> | `preview` | `preview` | `production` | `assembleProductionRelease` | real |
+> | `production` | `production` | `production` | `bundleProductionRelease` | real |
+>
+> El entorno `development` contiene **banco**, no desarrollo. Detalle en
+> [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md#aislamiento-de-build-e1--android-y-proyecto-supabase).
+> Un artefacto de release sale de `preview` o `production`; si el log carga el
+> entorno `development`, **no vale**.
+
 - [ ] Las tres variables cargadas del entorno correspondiente:
       `Environment variables … loaded from the "<env>" environment on EAS:
       EXPO_PUBLIC_API_URL, EXPO_PUBLIC_SUPABASE_ANON_KEY, EXPO_PUBLIC_SUPABASE_URL`.

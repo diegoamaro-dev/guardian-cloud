@@ -134,28 +134,80 @@ describe('E1 · el plugin de React Native sigue sabiendo qué es debuggable', ()
   });
 });
 
+/**
+ * E1-S · el mapeo perfil → entorno → variante, fijado como contrato.
+ *
+ * Por qué importa que `environment` esté SIEMPRE escrito: si se omite, EAS
+ * **no** se queda sin entorno — elige uno solo: `production` cuando
+ * `distribution` es `store`, `development` cuando `developmentClient` es
+ * `true`, y `preview` para todo lo demás. El perfil `bench`, que es
+ * `internal` y no dev client, caía en el último caso: habría recibido las
+ * variables de `preview`, que son las de producción.
+ *
+ * El plan de esta cuenta no ofrece entornos personalizados, así que la
+ * separación se consigue repartiendo los tres estándar en dos mundos:
+ *
+ *   development + bench  →  entorno `development`  →  BANCO
+ *   preview + production →  entornos homónimos     →  real
+ *
+ * `EXPO_PUBLIC_GC_ENV` se declara aquí y en ningún entorno remoto: una
+ * sola fuente, versionada y visible en el diff. La precedencia entre el
+ * `env` de un perfil y las variables del entorno no está documentada, y
+ * este reparto hace que nunca haga falta conocerla.
+ */
 describe('E1 · eas.json construye una variante inequívoca por perfil', () => {
-  it('el perfil de banco construye BENCH y declara el entorno', () => {
-    const bench = profile('bench');
-    expect(bench.android?.gradleCommand).toBe(':app:assembleBenchRelease');
-    expect(bench.env?.EXPO_PUBLIC_GC_ENV).toBe('bench');
-  });
+  /** El entorno estándar reasignado al mundo BANCO. */
+  const BENCH_ENVIRONMENT = 'development';
 
-  it('los perfiles de producción construyen el flavor de producción', () => {
-    expect(profile('development').android?.gradleCommand).toBe(
-      ':app:assembleProductionDebug',
-    );
-    expect(profile('preview').android?.gradleCommand).toBe(
-      ':app:assembleProductionRelease',
-    );
-    expect(profile('production').android?.gradleCommand).toBe(
-      ':app:bundleProductionRelease',
-    );
+  const CONTRACT = {
+    development: {
+      environment: 'development',
+      gcEnv: 'bench',
+      gradleCommand: ':app:assembleBenchDebug',
+    },
+    bench: {
+      environment: 'development',
+      gcEnv: 'bench',
+      gradleCommand: ':app:assembleBenchRelease',
+    },
+    preview: {
+      environment: 'preview',
+      gcEnv: 'production',
+      gradleCommand: ':app:assembleProductionRelease',
+    },
+    production: {
+      environment: 'production',
+      gcEnv: 'production',
+      gradleCommand: ':app:bundleProductionRelease',
+    },
+  } as const;
+
+  /** Deriva el flavor del propio comando, que es lo que Gradle ejecuta. */
+  const buildsProductionFlavor = (command: string | undefined): boolean =>
+    /:(assemble|bundle)Production(Debug|Release)$/.test(command ?? '');
+
+  for (const [name, expected] of Object.entries(CONTRACT)) {
+    it(`${name} → entorno ${expected.environment} · ${expected.gcEnv} · ${expected.gradleCommand}`, () => {
+      const target = profile(name);
+      expect(target.environment).toBe(expected.environment);
+      expect(target.env?.EXPO_PUBLIC_GC_ENV).toBe(expected.gcEnv);
+      expect(target.android?.gradleCommand).toBe(expected.gradleCommand);
+    });
+  }
+
+  it('ningún perfil depende de la selección automática de EAS', () => {
+    for (const [name, target] of Object.entries(EAS_JSON.build)) {
+      expect(target.environment, `perfil ${name} sin environment`).toBeTruthy();
+      expect(
+        target.env?.EXPO_PUBLIC_GC_ENV,
+        `perfil ${name} sin EXPO_PUBLIC_GC_ENV`,
+      ).toBeTruthy();
+    }
   });
 
   it('ningún perfil deja la variante sin cualificar', () => {
-    for (const [name, profile] of Object.entries(EAS_JSON.build)) {
-      const command = profile.android?.gradleCommand;
+    for (const [name, target] of Object.entries(EAS_JSON.build)) {
+      const command = target.android?.gradleCommand;
       expect(command, `perfil ${name} sin gradleCommand`).toBeTruthy();
       // `assembleRelease` o `bundleRelease` a secas construirían AMBOS
       // flavors, y EAS tendría que elegir entre dos artefactos. Un build
@@ -164,12 +216,26 @@ describe('E1 · eas.json construye una variante inequívoca por perfil', () => {
     }
   });
 
-  it('el perfil de banco no hereda el entorno de producción', () => {
-    // Sin `environment`, EAS no inyecta las variables de ningún entorno
-    // remoto. Es deliberado: la relación entorno declarado ↔ proyecto
-    // Supabase alcanzado todavía NO tiene guarda, y hasta que la tenga un
-    // build de banco no debe poder recibir las credenciales de producción
-    // por omisión.
-    expect(profile('bench')).not.toHaveProperty('environment');
+  it('ningún perfil que construya el flavor de producción consume el entorno de banco', () => {
+    for (const [name, target] of Object.entries(EAS_JSON.build)) {
+      if (!buildsProductionFlavor(target.android?.gradleCommand)) continue;
+      expect(
+        target.environment,
+        `perfil ${name} llevaría datos de banco a una identidad de producción`,
+      ).not.toBe(BENCH_ENVIRONMENT);
+    }
+  });
+
+  it('ningún perfil que consuma el entorno de banco construye el flavor de producción', () => {
+    // La recíproca, y no es redundante: cierra el cruce desde el otro
+    // lado, de modo que añadir un perfil nuevo por cualquiera de los dos
+    // caminos rompa una prueba en vez de pasar inadvertido.
+    for (const [name, target] of Object.entries(EAS_JSON.build)) {
+      if (target.environment !== BENCH_ENVIRONMENT) continue;
+      expect(
+        buildsProductionFlavor(target.android?.gradleCommand),
+        `perfil ${name} expone el banco a la identidad de producción`,
+      ).toBe(false);
+    }
   });
 });

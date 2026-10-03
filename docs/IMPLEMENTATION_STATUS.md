@@ -8,7 +8,7 @@
 | Producto usado para la revalidación de `GC-DEST-PAUSE-001` | **`22a9b26`** (APK release `2b3be062…`) |
 | Producto usado para la validación de `GC-START-LATENCY-001` | **`e643b01`** (APK release `1cb80fea…`) |
 | Producto usado para la validación de **D3 local segment salvage** | **`cb59c7e`** (APK release `8151c338…`) |
-| Última suite automática registrada | **2026-10-03**, tras **`ccbf4fa`** — 1007/1007 en 47 ficheros · typecheck 12, sin drift |
+| Última suite automática registrada | **2026-10-03**, sobre el árbol del gate **E1-BENCH-EAS-ENV** medido antes de commitearlo — **1011/1011 en 47 ficheros** · typecheck **12 errores heredados, cero nuevos**. El corte anterior, 1007/1007 en 47 ficheros, se midió tras **`ccbf4fa`**. Esta cifra se anclará a su hash cuando el gate quede commiteado |
 | Aislamiento de build y de proyecto Supabase | **`ccbf4fa`** — ver [la sección propia](#aislamiento-de-build-e1--android-y-proyecto-supabase) |
 
 > Las fechas y los commits son distintos a propósito, y no deben fundirse. La
@@ -252,11 +252,8 @@ Lo que **falta**, y por qué no hay nada que ascender:
 * **la coexistencia de las dos aplicaciones en un dispositivo no se ha
   observado**;
 * **ningún contacto real con Supabase** queda acreditado por este gate;
-* **bloqueo operativo abierto:** el perfil `bench` de `eas.json` no declara
-  `environment`, deliberadamente, para que no herede las variables de
-  producción. Mientras no se decida dónde viven `EXPO_PUBLIC_SUPABASE_URL` y la
-  clave anónima de banco, una build de banco en EAS no recibiría esos valores y
-  abortaría al arrancar. **No está resuelto.**
+* **bloqueo operativo abierto:** las variables del proyecto de banco no existen
+  todavía en EAS. Ver la subsección siguiente.
 
 **Deuda inmediata, de una línea de alcance.** El docstring de
 `mobile/src/config/buildVariant.js` conserva un bloque «KNOWN LIMIT» que
@@ -271,6 +268,79 @@ fuera del alcance autorizado de esta reconciliación.
 Esto no toca Auth funcional, ni `GC_QUEUE`, worker, retry, uploader, recovery o
 cleanup, ni el backend. **`GC-AUTH-SESSION-RECOVERY-001` sigue `OPEN`** y el
 producto sigue **`NO APTO PARA RELEASE`**.
+
+#### Entornos de EAS — reparto explícito, sin selección automática
+
+**Corrección de una afirmación anterior de este documento.** Se dijo que el
+perfil `bench` no declaraba `environment` «deliberadamente, para que no herede
+las variables de producción». **Era falso.** Omitir `environment` no deja un
+perfil sin entorno: EAS **elige uno** —`production` cuando `distribution` es
+`store`, `development` cuando `developmentClient` es `true`, y **`preview` para
+todo lo demás**—. El perfil `bench` es `internal` y no es dev client, así que
+habría seleccionado **`preview`**, que es donde viven hoy las variables de
+producción. La omisión no protegía: exponía.
+
+Lo que sí sostenía el fallo cerrado en ese escenario era, y sigue siendo, la
+guarda 1:1 de `projectRefs`: con `GC_ENV=bench` y una URL de producción, la app
+rehúsa arrancar.
+
+El plan de EAS de esta cuenta ofrece **sólo los tres entornos estándar**
+—comprobado en el dashboard el 2026-10-03—, y los entornos personalizados
+requieren plan Enterprise o Production. La separación se consigue por tanto
+repartiendo los tres en dos mundos, con `environment` **escrito en los cuatro
+perfiles**:
+
+| Perfil | Entorno EAS | `EXPO_PUBLIC_GC_ENV` | Variante Gradle | Mundo |
+|---|---|---|---|---|
+| `development` | `development` | `bench` | `assembleBenchDebug` | BANCO |
+| `bench` | `development` | `bench` | `assembleBenchRelease` | BANCO |
+| `preview` | `preview` | `production` | `assembleProductionRelease` | real |
+| `production` | `production` | `production` | `bundleProductionRelease` | real |
+
+Dos consecuencias que no dependen de disciplina. **Ningún perfil queda a merced
+de la selección automática**, de modo que la trampa de arriba no puede repetirse
+con un perfil nuevo. Y **el único consumidor del entorno `development` construye
+el flavor de banco**, así que ningún `applicationId` de producción puede leer el
+proyecto de banco; el perfil del dev client pasó a `assembleBenchDebug` por esa
+razón, y con ello un dev client ya no puede apuntar a producción.
+
+`EXPO_PUBLIC_GC_ENV` vive **sólo en `eas.json`**: una fuente, versionada y
+visible en el diff. No se declara en ningún entorno remoto, lo que además evita
+depender de la precedencia entre ambos sitios, que la documentación de Expo no
+define.
+
+Nivel de evidencia, que es estrecho:
+
+```
+EAS ENVIRONMENT ISOLATION = IMPLEMENTED / TESTED   · NO VALIDADO
+```
+
+Lo acreditan pruebas estáticas sobre `eas.json` —los cuatro mapeos y las dos
+invariantes cruzadas— y, para las variantes nativas, que Gradle resuelve
+`assembleBenchDebug` y `assembleBenchRelease` en `--dry-run`. **Eso es
+configuración, no una build.** Que EAS cargue de verdad el entorno correcto sólo
+lo acredita la línea `Environment variables … loaded from the "<env>"
+environment` del log de una build real, que no se ha ejecutado.
+
+**Deuda que este reparto crea:** el entorno se llama `development` y contiene
+banco. Quien añada una variable ahí pensando «esto es mi portátil» alimentará el
+build de banco. Se mitiga con la descripción de cada variable, con esta tabla y
+con las pruebas que la fijan; desaparecería sólo con un entorno personalizado,
+es decir con un cambio de plan.
+
+**Bloqueo vigente para el primer APK BENCH.** Las tres variables del proyecto de
+banco —`EXPO_PUBLIC_SUPABASE_URL`, `EXPO_PUBLIC_SUPABASE_ANON_KEY` y
+`EXPO_PUBLIC_API_URL`— **no existen todavía** en el entorno `development`; el
+estado remoto observado el 2026-10-03 es que las tres variables del proyecto
+viven **únicamente en `preview`** y que `EXPO_PUBLIC_GC_ENV` no estaba en ningún
+entorno. Con ese estado remoto y el contrato vigente —`app.config.ts` rehúsa
+evaluarse sin `EXPO_PUBLIC_GC_ENV`— **se espera** que una build de EAS falle
+antes de compilar, en cualquier perfil. **No se ha ejecutado ninguna build que
+lo demuestre**, y la corrección de `eas.json` de este gate elimina esa causa
+concreta al declarar la variable por perfil. La visibilidad de las tres
+variables debe ser `plaintext` o `sensitive`: una variable `secret` no es
+legible fuera de los servidores de EAS y rompería la resolución de la config y
+el bundle.
 
 ### Problema 8 — Durable cleanup scheduler
 
