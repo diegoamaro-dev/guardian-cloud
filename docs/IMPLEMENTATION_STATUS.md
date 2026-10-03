@@ -276,9 +276,11 @@ Lo que **falta**, y por qué no hay nada que ascender:
 * **ningún APK BENCH construido todavía**;
 * **la coexistencia de las dos aplicaciones en un dispositivo no se ha
   observado**;
-* **ningún contacto real con Supabase** queda acreditado por este gate;
-* **bloqueo operativo abierto:** las variables del proyecto de banco no existen
-  todavía en EAS. Ver la subsección siguiente.
+* **ningún contacto real con Supabase** queda acreditado por este gate.
+
+La configuración remota de banco **ya no es un bloqueo**: se creó el 2026-10-03
+y EAS CLI confirmó que la carga. Detalle y alcance exacto en la subsección
+siguiente. **El gate pendiente es el primer APK BENCH real.**
 
 **Deuda inmediata, de una línea de alcance.** El docstring de
 `mobile/src/config/buildVariant.js` conserva un bloque «KNOWN LIMIT» que
@@ -366,19 +368,33 @@ build de banco. Se mitiga con la descripción de cada variable, con esta tabla y
 con las pruebas que la fijan; desaparecería sólo con un entorno personalizado,
 es decir con un cambio de plan.
 
-**Bloqueo vigente para el primer APK BENCH.** Las tres variables del proyecto de
-banco —`EXPO_PUBLIC_SUPABASE_URL`, `EXPO_PUBLIC_SUPABASE_ANON_KEY` y
-`EXPO_PUBLIC_API_URL`— **no existen todavía** en el entorno `development`; el
-estado remoto observado el 2026-10-03 es que las tres variables del proyecto
-viven **únicamente en `preview`** y que `EXPO_PUBLIC_GC_ENV` no estaba en ningún
-entorno. Con ese estado remoto y el contrato vigente —`app.config.ts` rehúsa
-evaluarse sin `EXPO_PUBLIC_GC_ENV`— **se espera** que una build de EAS falle
-antes de compilar, en cualquier perfil. **No se ha ejecutado ninguna build que
-lo demuestre**, y la corrección de `eas.json` de este gate elimina esa causa
-concreta al declarar la variable por perfil. La visibilidad de las tres
-variables debe ser `plaintext` o `sensitive`: una variable `secret` no es
-legible fuera de los servidores de EAS y rompería la resolución de la config y
-el bundle.
+**Configuración remota de banco: CONFIGURADA · OBSERVADA POR EAS CLI.** Las tres
+variables del proyecto de banco —`EXPO_PUBLIC_SUPABASE_URL`,
+`EXPO_PUBLIC_SUPABASE_ANON_KEY` y `EXPO_PUBLIC_API_URL`— **ya existen en el
+entorno `development`**, y **EAS CLI 24.10.0 confirmó que las carga** al
+resolver con `--profile bench` el 2026-10-03. Las tres de producción siguen
+exclusivamente en `preview`. `EXPO_PUBLIC_GC_ENV` **no se creó en ningún entorno
+remoto**: sigue viviendo exclusivamente en `eas.json`, una sola fuente,
+versionada, lo que además evita depender de una precedencia que Expo no
+documenta.
+
+> Esta entrada decía que las tres variables de banco **no existían todavía** y
+> que la configuración remota bloqueaba el primer APK. **Dejó de ser cierto el
+> 2026-10-03**, cuando se crearon y se observó su carga. El bloqueo que
+> describía ya no existe; lo que queda pendiente es otra cosa, el artefacto.
+
+La visibilidad de las tres debe ser `plaintext` o `sensitive`: una variable
+`secret` no es legible fuera de los servidores de EAS y rompería la resolución
+de la config y el bundle.
+
+**Configurada y observada no es construida ni validada.** Nada de lo anterior
+implica que exista un APK: **el siguiente gate pendiente es el primer APK BENCH
+real**, y es el único que podrá acreditar el `applicationId` del artefacto, su
+nombre visible instalado y la coexistencia con producción en un dispositivo.
+Hasta entonces las tres clasificaciones se quedan donde están —`ANDROID INSTALL
+ISOLATION`, `SUPABASE PROJECT ISOLATION` y `EAS ENVIRONMENT ISOLATION`, todas
+`IMPLEMENTED / TESTED · NO VALIDADO`— y **ninguna asciende a `VALIDATED`** por
+el hecho de que la configuración remota esté puesta.
 
 ### Problema 8 — Durable cleanup scheduler
 
