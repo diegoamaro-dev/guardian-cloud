@@ -36,6 +36,9 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 // finalize paths use. Reusing it means the identity layer and the
 // protection layer cannot drift apart about what counts as proof.
 import { isChunkConfirmedOffDevice } from '@/recording/deriveGuardianStatus';
+// The recovery capability declaration lives in its own module so the barrier
+// it guards can be exercised in a test. See `recoveryEntry.ts` for why.
+import { RECOVERY_ENTRY_IMPLEMENTED } from './recoveryEntry';
 
 export const IDENTITY_KEY = 'gc.identity.v1';
 
@@ -99,24 +102,6 @@ export interface IdentityMarker {
   user_id?: string;
 }
 
-/**
- * G-R1 — whether THIS BUILD can bring a session into existence by any route
- * other than the one anonymous mint: email + OTP recovery.
- *
- * It gates the anchor back-fill, and the reasoning is the whole point of the
- * flag. The back-fill trusts a live session to BE the historical identity.
- * That inference holds only while no other route can produce a session:
- * `IDENTITY_DEGRADED` never mints, and nothing else signs in. The moment a
- * recovery entry exists, a live session may be the candidate itself, and
- * anchoring it would make the continuity check compare the candidate against
- * itself — a check that always passes and proves nothing.
- *
- * G-R3 flips this to `true` and, by doing so, turns the back-fill off. A
- * device that reaches that build without an anchor is `RECOVERY_NOT_VERIFIABLE`
- * and stays that way: a durable `recovery_attempted` record, decided before
- * G-R3, is what will allow anything finer.
- */
-export const RECOVERY_ENTRY_IMPLEMENTED = false;
 
 /**
  * The sealed result of the one-shot legacy migration probe.

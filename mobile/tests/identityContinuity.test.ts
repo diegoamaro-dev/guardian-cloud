@@ -86,13 +86,13 @@ vi.mock('@/auth/store', async () => await vi.importActual('@/auth/store'));
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
   IDENTITY_KEY,
-  RECOVERY_ENTRY_IMPLEMENTED,
   backfillIdentityAnchor,
   checkIdentityContinuity,
   markIdentityInitialized,
   readIdentityMarker,
   readIdentityMarkerState,
 } from '@/auth/identityMarker';
+import { RECOVERY_ENTRY_IMPLEMENTED } from '@/auth/recoveryEntry';
 import {
   __resetOwnershipLatchForTests,
   getOwnershipAccessToken,
