@@ -9,12 +9,12 @@
 | Producto usado para la validación de `GC-START-LATENCY-001` | **`e643b01`** (APK release `1cb80fea…`) |
 | Producto usado para la validación de **D3 local segment salvage** | **`cb59c7e`** (APK release `8151c338…`) |
 | Producto usado para la **revalidación S1 BENCH** (G-R1 + H1 + R1 presentes) | **`3a68699`** (APK de banco, build EAS `5999431a-d487-4330-8692-84ad00c23c62`) |
-| Última suite automática registrada | **2026-10-04**, anclada a **`ee539629b61e8a186e1eb5b52812cf79115b31ba`** — **1072/1072 en 48 ficheros** · typecheck **12 errores heredados, cero nuevos**, por tanto **NO** verde. Cortes anteriores ya anclados: **1040/1040 en 48 ficheros** sobre **`39d6d05`**, **1021/1021 en 47 ficheros** el 2026-10-03 sobre el árbol del gate **E1-BENCH-OAUTH-SCHEME** medido antes de commitearlo, 1014/1014 tras **`b1f73aa`** y 1007/1007 tras **`ccbf4fa`** |
+| Última suite automática registrada | **2026-10-04**, anclada a **`8ea3fea1a876a44f0b0f57e37dc1f928fb3592ea`** — **1094/1094 en 49 ficheros** · typecheck **12 errores heredados, cero nuevos**, por tanto **NO** verde. Cortes anteriores ya anclados: **1072/1072 en 48 ficheros** sobre **`ee53962`**, **1040/1040 en 48 ficheros** sobre **`39d6d05`**, **1021/1021 en 47 ficheros** el 2026-10-03 sobre el árbol del gate **E1-BENCH-OAUTH-SCHEME** medido antes de commitearlo, 1014/1014 tras **`b1f73aa`** y 1007/1007 tras **`ccbf4fa`** |
 | Aislamiento de build y de proyecto Supabase | **`ccbf4fa`** — ver [la sección propia](#aislamiento-de-build-e1--android-y-proyecto-supabase) |
 
 > Las fechas y los commits son distintos a propósito, y no deben fundirse. La
-> suite vigente —1072/1072 en 48 ficheros— se midió sobre el árbol de
-> `ee53962`; las tres validaciones de hardware se hicieron en dispositivo, no
+> suite vigente —1094/1094 en 49 ficheros— se midió sobre el árbol de
+> `8ea3fea`; las tres validaciones de hardware se hicieron en dispositivo, no
 > corriendo la suite, y cada una sobre **su propio APK**:
 > `GC-DEST-PAUSE-001` sobre `22a9b26`, `GC-START-LATENCY-001` sobre `e643b01` y
 > **D3** sobre `cb59c7e`. **Ninguna cifra de tests describe un APK.**
@@ -186,6 +186,81 @@ Fuera de estos tres niveles, y explícitamente **no** capacidades actuales:
 cifrado local de chunks (sólo `TODO` en el código), recovery autónomo tras
 reinicio sin abrir la app (`I5c`), `capture_end_reason`, Closed Testing,
 usuarios externos y publicación en Play Store.
+
+### Endurecimiento previo a recovery — R1 y precondición A (2026-10-04)
+
+Dos cambios de código que **preparan** la recuperación de identidad sin
+habilitarla. Ninguno es una capacidad de producto y ninguno está validado en
+hardware.
+
+| Pieza | Estado | Publicado en |
+|---|---|---|
+| **R1 · veto de anclaje no verificable** | `IMPLEMENTED / TESTED` · `NOT HARDWARE VALIDATED` | `3a68699` |
+| **Precondición A · barrera de recovery** | `IMPLEMENTED / TESTED` · `NOT HARDWARE VALIDATED` | `8ea3fea` |
+
+**R1.** Una ranura de marker vacía no siempre es una primera identidad: puede
+ser una identidad que existió y cuyo marker nunca aterrizó. Donde el
+dispositivo conserva prueba durable de que **alguna** identidad ya puso
+evidencia en la nube desde esta instalación, `markIdentityInitialized()`
+**rechaza crear un ancla** —`prior_identity_unverifiable`— en lugar de adoptar
+la sesión viva. Es un **veto y sólo un veto**: la prueba acredita que existió
+una identidad, **nunca cuál**, y no autoriza a nadie. Una instalación limpia no
+puede activarlo, porque la dependencia es circular —subir exige token, el token
+exige marker durable—, así que `FIRST_IDENTITY` queda intacto.
+
+**Alcance y límite de R1.** No cierra el caso de los dispositivos cuya prueba
+local **ya fue cosechada**: el reap del camino feliz borra la entrada de cola y
+con ella el veto, y esos vuelven a la conducta anterior. **R1 estrecha el
+agujero, no lo cierra.** Es una limitación registrada, no un finding con
+seguimiento propio.
+
+**Precondición A.** `RECOVERY_ENTRY_IMPLEMENTED` pasó a su propio módulo,
+`mobile/src/auth/recoveryEntry.ts`, cuya única responsabilidad es declarar la
+capacidad. El motivo no es de estilo: un `const` leído dentro de su propio
+módulo es un binding directo, así que la rama `true` de la barrera era
+**inejecutable en test**. Separada, se ejecuta de verdad.
+
+**Estado productivo: `RECOVERY_ENTRY_IMPLEMENTED = false`.** Es la única
+declaración del repositorio, sin configuración en runtime, sin variable de
+entorno y sin inyección. La rama `true` **está ejercitada automáticamente y NO
+está activa en producción**: el único sitio que la pone en `true` es el mock de
+`mobile/tests/recoveryBarrier.test.ts`.
+
+Lo que esa cobertura demuestra, con la barrera activa: el back-fill rechaza con
+`recovery_entry_exists` **sin escribir**, la continuidad posterior es
+`continuity_unverifiable`, no se emite `OwnershipToken`, el ancla **no se mueve**
+ante un mismatch, y ninguna ruta de bloqueo borra, reasigna ni re-keyea
+`GC_QUEUE` ni la evidencia local. Y un test de acoplamiento fija la obligación
+futura: **si aparece una ruta de sesión por recovery, el flag debe ser `true`**
+— el commit que introduzca OTP y el que apague el back-fill tienen que ser el
+mismo.
+
+#### La regla de ownership, ya decidida
+
+Una instalación **sin ancla histórica demostrable queda no recuperable
+automáticamente**. No se permiten heurísticas para atribuir ownership: ni
+`sub_prefix`, ni identificadores de sesión, ni el contenido de `GC_QUEUE`, ni
+ninguna otra correlación. Ante identidad no demostrable o discrepancia se falla
+cerrado, **preservando `GC_QUEUE` y la evidencia local**.
+
+#### Lo que NO cambia
+
+- **`GC-AUTH-SESSION-RECOVERY-001` sigue `OPEN`.**
+- **El recovery por OTP sigue `NOT IMPLEMENTED`**: no existen `signInWithOtp`,
+  `verifyOtp` ni `setSession` en el código.
+- **La precondición B sigue pendiente, y exclusivamente por la secuencia
+  operacional de releases:**
+
+  ```
+  release con G-R1/anclaje → ventana de anclaje → release posterior con OTP
+                                                  + RECOVERY_ENTRY_IMPLEMENTED=true
+  ```
+
+  La ventana de anclaje **todavía no ha empezado**: ningún artefacto
+  distribuido contiene G-R1.
+- **Ninguno de los dos añade validación en hardware**, ni adversarial ni de
+  ningún otro tipo. S1 sólo acreditó el camino legítimo de primera identidad.
+- **El veredicto de producto sigue siendo `NO APTO PARA RELEASE`.**
 
 ### Revalidación hardware S1 — BENCH, 2026-10-04
 
@@ -648,7 +723,7 @@ proviniendo de una ficha de evidencia congelada fuera del repositorio.
 | **GC-START-LATENCY-001** | `FIXED IN CODE` / **`HARDWARE VALIDATED`** | producto `e643b01` · guardas de test `3c10994` | `startRecording` esperaba a `getOwnershipAccessToken()` antes de abrir la grabadora, y esa ruta de auth **no lleva timeout en ninguna capa**. La lectura se movió dentro de `sessionCreatePromise`, que no se espera antes del productor. Validado en hardware el 24/08 en dos escenarios: **remoto vivo** — 531 ms tap→productor, 163 ms de lógica propia, 28/29 fragmentos confirmados **antes** de PARAR — y **token caducado + modo avión** — 243 ms tap→productor, 102 ms de lógica propia, con auth resolviendo **10,72 s después** de que el productor ya grababa. **auth no se volvió rápida: dejó de bloquear START.** Recuperación tras restaurar red: mismo `localSessionId`, 1 `POST /sessions`, 77/77 confirmados, cleanup posterior a `http_200`. Detalle en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §6 |
 | **GC-DEST-STATUS-001** | **`OPEN`** · defecto de **backend** | — | Ningún camino de código escribe `revoked` ni `error`. Un destino Drive con refresh token revocado sigue reportándose `connected`. Ver [`API_SPEC.md`](./API_SPEC.md#estado-de-los-destinos--defecto-abierto) |
 | **GC-AUTH-RETRY-CLASSIFICATION-001** | **causa suficiente demostrada** · relación causal con el 22/08 **no probada** | banco `9d682bc` · D2-B `08e3cd2` · D2-C `22a9b26` | Dejó de ser estático: el banco reproduce de forma determinista que un `429` / `500` en el refresh destruye una credencial **intacta** (`refresh_present: true`). Corregido para `500` por D2-B y para `429` por D2-C. **Sigue sin demostrarse** que el incidente del 22/08 fuera uno de esos dos: la respuesta nunca se capturó |
-| **GC-AUTH-ANCHOR-MALFORMED-001** | **`FIXED IN CODE`** / **`TESTED`** / **`NOT HARDWARE VALIDATED`** · `PREEXISTING` | `ee539629b61e8a186e1eb5b52812cf79115b31ba` | **Noveno finding, registrado el 2026-10-04** en la revisión adversarial de G-R1, no en la ventana 20/08–24/08, y **corregido ese mismo día** en `ee53962`. El defecto —histórico— era que `readIdentityMarker()` colapsaba un marker ilegible en el mismo `null` que una ranura vacía y `markIdentityInitialized()` lo **sustituía**, fabricando desde G-R1 un `user_id` anclado a la sesión del momento; y que la guarda write-once del back-fill no distinguía un `user_id` **presente pero inválido** de uno ausente. Ahora la validez se decide sólo en `readIdentityMarkerState()`, que responde cuatro hechos: **`absent` únicamente para `null`** —la única ausencia real—, `unreadable` para un `getItem` que lanza, `corrupt` para bytes que no son un marker válido —`version` desconocida o futura incluida, y `user_id` presente e inválido también—, y `present` con el esquema completo. **`setItem` ocurre si y sólo si el estado es `absent`**; `corrupt` y `unreadable` rechazan sin tocar un byte, y **negarse a escribir es la preservación**: ninguna clave durable nueva, ningún salvage. Un marker pre-G-R1 válido **sin la propiedad** `user_id` conserva el back-fill mientras la entrada de recuperación no esté habilitada. La **corrupción posterior a abrir el latch tampoco emite token**: el latch de durabilidad sigue abierto y la continuidad, releída del disco en cada emisión, niega con `continuity_unverifiable`. **No tocó `GC_QUEUE`, worker, recovery ni evidencia**, y `RECOVERY_ENTRY_IMPLEMENTED` sigue en `false`. Evidencia: 1072/1072 en 48 ficheros, 51 tests en `identityContinuity.test.ts` de los que **29** fijan este finding; **sin validación en hardware**. La precondición H1 queda satisfecha y **eso no autoriza** abrir la entrada de recuperación: siguen pendientes la ordenación/atomicidad de la barrera y las instalaciones pre-G-R1 sin ancla. Detalle en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §5 |
+| **GC-AUTH-ANCHOR-MALFORMED-001** | **`FIXED IN CODE`** / **`TESTED`** / **`NOT HARDWARE VALIDATED`** · `PREEXISTING` | `ee539629b61e8a186e1eb5b52812cf79115b31ba` | **Noveno finding, registrado el 2026-10-04** en la revisión adversarial de G-R1, no en la ventana 20/08–24/08, y **corregido ese mismo día** en `ee53962`. El defecto —histórico— era que `readIdentityMarker()` colapsaba un marker ilegible en el mismo `null` que una ranura vacía y `markIdentityInitialized()` lo **sustituía**, fabricando desde G-R1 un `user_id` anclado a la sesión del momento; y que la guarda write-once del back-fill no distinguía un `user_id` **presente pero inválido** de uno ausente. Ahora la validez se decide sólo en `readIdentityMarkerState()`, que responde cuatro hechos: **`absent` únicamente para `null`** —la única ausencia real—, `unreadable` para un `getItem` que lanza, `corrupt` para bytes que no son un marker válido —`version` desconocida o futura incluida, y `user_id` presente e inválido también—, y `present` con el esquema completo. **`setItem` ocurre si y sólo si el estado es `absent`**; `corrupt` y `unreadable` rechazan sin tocar un byte, y **negarse a escribir es la preservación**: ninguna clave durable nueva, ningún salvage. Un marker pre-G-R1 válido **sin la propiedad** `user_id` conserva el back-fill mientras la entrada de recuperación no esté habilitada. La **corrupción posterior a abrir el latch tampoco emite token**: el latch de durabilidad sigue abierto y la continuidad, releída del disco en cada emisión, niega con `continuity_unverifiable`. **No tocó `GC_QUEUE`, worker, recovery ni evidencia**, y `RECOVERY_ENTRY_IMPLEMENTED` sigue en `false`. Evidencia: 1072/1072 en 48 ficheros sobre `ee53962`, 51 tests en `identityContinuity.test.ts` de los que **29** fijan este finding; **sin validación en hardware**. La precondición H1 queda satisfecha y **eso no autoriza** abrir la entrada de recuperación: siguen pendientes la ordenación/atomicidad de la barrera y las instalaciones pre-G-R1 sin ancla. Detalle en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §5 |
 
 ### Consecuencia sobre el veredicto
 
@@ -686,11 +761,11 @@ asimetría es deuda documental conocida, no un descuido de este documento.
 ### Validación automática actual
 
 Ejecutada el **2026-10-04** sobre el árbol de
-`ee539629b61e8a186e1eb5b52812cf79115b31ba`.
+`8ea3fea1a876a44f0b0f57e37dc1f928fb3592ea`.
 
 | Comprobación | Resultado |
 |---|---|
-| Suite completa | **1072/1072**, en **48 ficheros** |
+| Suite completa | **1094/1094**, en **49 ficheros** |
 | Typecheck | **12 errores TypeScript heredados, cero nuevos** — typecheck **NO** verde |
 | `git diff --check` | Limpio |
 
@@ -711,12 +786,17 @@ Ejecutada el **2026-10-04** sobre el árbol de
 >             fichero identityContinuity.test.ts (19 → 51). Cero ficheros
 >             nuevos: los otros tres del commit cambiaron aserciones
 > 1072 / 48   medido el 2026-10-04 sobre ee53962
+>  +13 / +0   3a68699 — R1, en identityContinuity.test.ts (51 → 64)
+>   +9 / +1   8ea3fea — precondición A, fichero nuevo
+>             recoveryBarrier.test.ts
+> 1094 / 49   medido el 2026-10-04 sobre 8ea3fea
 > ```
 >
 > Del tramo 958 → 1021 este documento conserva los cortes intermedios que ya
 > había anclado, pero **no atribuye esos incrementos a commits concretos**:
-> «medido tras X» significa medido después de X, no aportado por X. El único
-> incremento atribuido es el de G-R1.
+> «medido tras X» significa medido después de X, no aportado por X. Los
+> incrementos atribuidos a un commit concreto son los cuatro marcados con
+> `+`: G-R1, H1, R1 y la precondición A.
 
 > **El corte de 958/43 reconciliaba a su vez dos incrementos, no uno**, y esa
 > cuenta se conserva tal como se registró el 2026-08-31:
