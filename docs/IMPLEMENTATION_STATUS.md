@@ -8,6 +8,7 @@
 | Producto usado para la revalidación de `GC-DEST-PAUSE-001` | **`22a9b26`** (APK release `2b3be062…`) |
 | Producto usado para la validación de `GC-START-LATENCY-001` | **`e643b01`** (APK release `1cb80fea…`) |
 | Producto usado para la validación de **D3 local segment salvage** | **`cb59c7e`** (APK release `8151c338…`) |
+| Producto usado para la **revalidación S1 BENCH** (G-R1 + H1 + R1 presentes) | **`3a68699`** (APK de banco, build EAS `5999431a-d487-4330-8692-84ad00c23c62`) |
 | Última suite automática registrada | **2026-10-04**, anclada a **`ee539629b61e8a186e1eb5b52812cf79115b31ba`** — **1072/1072 en 48 ficheros** · typecheck **12 errores heredados, cero nuevos**, por tanto **NO** verde. Cortes anteriores ya anclados: **1040/1040 en 48 ficheros** sobre **`39d6d05`**, **1021/1021 en 47 ficheros** el 2026-10-03 sobre el árbol del gate **E1-BENCH-OAUTH-SCHEME** medido antes de commitearlo, 1014/1014 tras **`b1f73aa`** y 1007/1007 tras **`ccbf4fa`** |
 | Aislamiento de build y de proyecto Supabase | **`ccbf4fa`** — ver [la sección propia](#aislamiento-de-build-e1--android-y-proyecto-supabase) |
 
@@ -185,6 +186,63 @@ Fuera de estos tres niveles, y explícitamente **no** capacidades actuales:
 cifrado local de chunks (sólo `TODO` en el código), recovery autónomo tras
 reinicio sin abrir la app (`I5c`), `capture_end_reason`, Closed Testing,
 usuarios externos y publicación en Play Store.
+
+### Revalidación hardware S1 — BENCH, 2026-10-04
+
+Artefacto: APK de banco construido desde
+**`3a68699c6e8c19bae00ec2a5404e9a0db972b966`**, build EAS
+`5999431a-d487-4330-8692-84ad00c23c62`, package `com.guariacloud.app.bench`.
+Dispositivo: **OnePlus A6000 · Android 11 · API 30**. Backend de banco local en
+`:3101`, Supabase de banco, destino Google Drive conectado en banco.
+
+**Es el primer artefacto que contiene G-R1, H1 y R1.** Todos los anteriores son
+previos a `39d6d05`, así que ninguna validación de hardware anterior cubre esta
+ruta de identidad: por §13 del `CLAUDE.md`, una validación no se hereda a un
+artefacto nuevo.
+
+En el primer arranque posterior al borrado controlado de datos de banco se
+observó **`FIRST_IDENTITY`** seguido de autenticación anónima correcta y
+**marker durable**; esta corrida valida únicamente el **camino legítimo de
+primera identidad**, no las ramas adversariales de G-R1/H1/R1.
+
+#### Dos resultados, con alcances distintos
+
+| Propiedad | Estado | Evidencia observada |
+|---|---|---|
+| **Subida durante la grabación** | `HARDWARE_VALIDATED` 2026-10-04 | sesión nueva: el backend registró `DRIVE_CHUNK_UPLOAD_SUCCESS` **antes** de `/sessions/{id}/complete`; la sesión cerró y produjo manifiesto final de **19 chunks** |
+| **Recovery post-fallo de red/destino** | `HARDWARE_VALIDATED` 2026-10-04 | sesión anterior: **16 chunks** quedaron pendientes por red y destino no resuelto, **sobrevivieron en `GC_QUEUE`**, se evacuaron automáticamente al restaurar la red y conectar Drive, y la sesión se completó con manifiesto de **16 chunks** |
+
+Son **dos corridas distintas y no se funden**: la primera demuestra que la
+evidencia sale del dispositivo mientras la captura sigue viva; la segunda, que
+lo que quedó varado no se pierde y drena solo. **Ninguna de las dos demuestra la
+otra.**
+
+#### Lo que esta corrida NO demuestra
+
+No está validado en hardware, y no se declara como tal:
+
+- **el back-fill de un marker pre-G-R1** sin propiedad `user_id`;
+- **la discrepancia de `user_id`** — la rama `continuity_mismatch` de G-R1;
+- **el marker corrupto o ilegible** — las ramas de H1;
+- **`prior_identity_unverifiable`** — el veto de R1;
+- **la recuperación de una identidad perdida.**
+
+Ninguno de esos estados se indujo. Su cobertura sigue siendo **exclusivamente
+automática**.
+
+Y no se mueve nada de lo siguiente:
+
+- **`GC-AUTH-SESSION-RECOVERY-001` sigue `OPEN`**: aquí no se recuperó ninguna
+  identidad, y el recovery por OTP sigue **`NOT IMPLEMENTED`**.
+- **Las precondiciones A y B siguen `OPEN`.**
+- **`I5c` sigue sin validar**: recovery autónomo tras reinicio sin abrir la app.
+- **El veredicto de producto sigue siendo `NO APTO PARA RELEASE`.**
+
+Lo que sí añade, y es lo que se buscaba para la beta: los tres cambios de la
+ruta de identidad **no rompen el camino normal en hardware**, y los dos
+invariantes operativos que esa ruta podía haber comprometido —evidencia fuera
+del dispositivo durante la captura, y supervivencia de la cola— se observaron
+funcionando sobre el artefacto que los contiene.
 
 ### Aislamiento de build (E1) — Android y proyecto Supabase
 
@@ -387,7 +445,7 @@ el dispositivo **está observada**. Ver
 
 La configuración remota de banco **ya no es un bloqueo**: se creó el 2026-10-03
 y EAS CLI confirmó que la carga. Detalle y alcance exacto en la subsección
-siguiente. **El gate pendiente es el primer APK BENCH real.**
+siguiente.
 
 **Deuda inmediata, de una línea de alcance.** El docstring de
 `mobile/src/config/buildVariant.js` conserva un bloque «KNOWN LIMIT» que
