@@ -1894,6 +1894,70 @@ modelo de `one_time_tokens` que la lectura de 0 filas dejó sin respaldo.
 
 ---
 
+### Negativo · `shouldCreateUser: false` no creó identidad (2026-10-04)
+
+```
+NEGATIVO shouldCreateUser:false = PASS   (2026-10-04, banco)
+```
+
+Era la prueba **pendiente desde el 2026-09-16** y nunca ejecutada. Demuestra la
+propiedad de la que depende el diseño de G-R3: **una entrada de recuperación no
+puede fabricar identidad**. Si pudiera, recovery sería una fábrica de usuarios.
+
+**Sólo BANCO**, en `guaria-auth-test`. Producción no se tocó.
+
+Criterio **fijado antes de la llamada**: el estado no debe moverse. Dirección de
+prueba con local-part aleatorio sobre un dominio propio —elegido así a
+propósito: un dominio nuestro y enrutable es el caso realmente peligroso, una
+dirección plausible, y evita el trato especial que un dominio reservado podría
+recibir en alguna capa.
+
+| | Antes | Llamada | Después |
+|---|---|---|---|
+| `total_usuarios` | **6** | — | **6** |
+| `coincidencias` con el email | **0** | — | **0** |
+
+La comparación del email se hizo con `lower()` en los dos lados, para que una
+normalización a minúsculas no produjera un «ausente» falso.
+
+**Una sola llamada**, sin reintentos, sin `verifyOtp`, con `persistSession`,
+`autoRefreshToken` y `detectSessionInUrl` desactivados:
+
+```
+signInWithOtp : sin error
+error.name / status / code : —
+data.user     : null
+data.session  : null
+rate limited  : no
+```
+
+#### Lo observado NO fue lo que se esperaba, y es mejor
+
+Se había anticipado un `422 / otp_disabled` —«signups no permitidos para otp»—.
+Lo observado fue **ningún error en absoluto**, con `user` y `session` en `null`.
+Es la forma **anti-enumeración**: la llamada **no revela si el email existe**.
+
+Y eso tiene una consecuencia de diseño para G-R3, que conviene fijar ahora:
+**la pantalla de recuperación no puede decirle al usuario «ese correo no está
+registrado», porque el cliente no lo sabe.** Tampoco debe intentar deducirlo.
+El único mensaje honesto es «si ese correo está vinculado, recibirás un código».
+
+#### Alcance exacto, sin exagerarlo
+
+**Es evidencia de banco del comportamiento observado, no una garantía universal
+de Supabase.** Una corrida, un proyecto, una dirección, una configuración
+—`Email provider` ON, `Secure email change` ON, OTP de 8 dígitos / 3600 s,
+Manual Linking ON—. No acredita el comportamiento en producción, ni con otra
+configuración, ni frente a cambios futuros del servicio.
+
+Lo que **no** demuestra, y sigue igual: **H-3 PENDIENTE**, producción **NO
+TOCADA**, **G-R3 / OTP `NOT IMPLEMENTED`**, recovery real de la app **NO
+VALIDADO**, `RECOVERY_ENTRY_IMPLEMENTED = false`,
+**`GC-AUTH-SESSION-RECOVERY-001` `OPEN`**, producto **`NO APTO PARA RELEASE`**.
+H-2 no se reabre: su cierre del 2026-10-04 conserva su alcance.
+
+---
+
 ## `GC-AUTH-ANCHOR-MALFORMED-001` — un marker ilegible **se sustituía** y la sesión del momento pasaba a ser el ancla
 
 ### Estado
