@@ -75,7 +75,48 @@ export interface IdentityMarker {
   sub_prefix: string | null;
   /** True when the marker was inferred by `probeLegacyIdentity`, not observed. */
   migrated_from_legacy: boolean;
+  /**
+   * G-R1 — THE ANCHOR. Full Supabase `user.id` of the historical identity.
+   *
+   * This is the ONLY field in this module that any security decision reads:
+   * `checkIdentityContinuity` compares a candidate session against it, and
+   * `getOwnershipToken` refuses to mint an `OwnershipToken` when they
+   * disagree. `sub_prefix` stays what it has always been — diagnostic — and
+   * is NEVER consulted for that decision: 8 truncated characters are a
+   * correlation aid, not an identity, and they are structurally `null` on
+   * every marker the legacy probe wrote.
+   *
+   * OPTIONAL ON PURPOSE, and `version` stays 1. Markers written before this
+   * field existed remain valid and parse unchanged — the meaning of nothing
+   * already stored has changed, which is the only thing a version bump is
+   * for. Absence means **not verifiable**, never "matches".
+   *
+   * WRITE-ONCE. Once present it is never rewritten, not even by a later
+   * observation and not even when a candidate disagrees. A disagreement is
+   * resolved by refusing the session, never by moving the anchor to it —
+   * that would make the check circular and silently adopt the wrong user.
+   */
+  user_id?: string;
 }
+
+/**
+ * G-R1 — whether THIS BUILD can bring a session into existence by any route
+ * other than the one anonymous mint: email + OTP recovery.
+ *
+ * It gates the anchor back-fill, and the reasoning is the whole point of the
+ * flag. The back-fill trusts a live session to BE the historical identity.
+ * That inference holds only while no other route can produce a session:
+ * `IDENTITY_DEGRADED` never mints, and nothing else signs in. The moment a
+ * recovery entry exists, a live session may be the candidate itself, and
+ * anchoring it would make the continuity check compare the candidate against
+ * itself — a check that always passes and proves nothing.
+ *
+ * G-R3 flips this to `true` and, by doing so, turns the back-fill off. A
+ * device that reaches that build without an anchor is `RECOVERY_NOT_VERIFIABLE`
+ * and stays that way: a durable `recovery_attempted` record, decided before
+ * G-R3, is what will allow anything finer.
+ */
+export const RECOVERY_ENTRY_IMPLEMENTED = false;
 
 /**
  * The sealed result of the one-shot legacy migration probe.
@@ -270,7 +311,13 @@ export interface IdentityMarkWrite {
 }
 
 export async function markIdentityInitialized(
-  subPrefix: string | null,
+  /**
+   * G-R1 — the FULL `user.id`, not a prefix. Callers already passed the
+   * whole value and this function truncated it; the parameter was merely
+   * named after what it kept. It now keeps both: the full id as the
+   * continuity anchor, and the 8-character prefix for diagnostics.
+   */
+  userId: string | null,
   opts: { migratedFromLegacy?: boolean } = {},
 ): Promise<IdentityMarkWrite> {
   const existing = await readIdentityMarker();
@@ -279,8 +326,12 @@ export async function markIdentityInitialized(
   const marker: IdentityMarker = {
     version: IDENTITY_MARKER_VERSION,
     initialized_at: Date.now(),
-    sub_prefix: subPrefix ? subPrefix.slice(0, 8) : null,
+    sub_prefix: userId ? userId.slice(0, 8) : null,
     migrated_from_legacy: opts.migratedFromLegacy === true,
+    // Absent rather than `undefined`: `exactOptionalPropertyTypes` forbids
+    // assigning undefined to an optional field, and an absent key is also
+    // what every pre-G-R1 marker looks like.
+    ...(userId ? { user_id: userId } : {}),
   };
   try {
     await AsyncStorage.setItem(IDENTITY_KEY, JSON.stringify(marker));
@@ -291,6 +342,120 @@ export async function markIdentityInitialized(
     return { marker, persisted: false };
   }
   return { marker, persisted: true };
+}
+
+export type AnchorBackfillResult =
+  | { anchored: true; source: 'already_present' | 'written' }
+  | {
+      anchored: false;
+      reason:
+        | 'no_marker'
+        | 'marker_malformed'
+        | 'migrated_from_legacy'
+        | 'no_session_id'
+        | 'recovery_entry_exists'
+        | 'write_failed';
+    };
+
+/**
+ * G-R1 — gives an existing marker its anchor, once, and only where that is
+ * demonstrably safe.
+ *
+ * The justification, because "a live session must be the historical one" is
+ * NOT true in general and must not be assumed: it is true exactly while no
+ * route other than the first anonymous mint can produce a session. Today
+ * none can — `IDENTITY_DEGRADED` refuses to mint and nothing else signs in —
+ * so a device presenting a valid marker AND a live session is presenting the
+ * identity that has been operating all along.
+ *
+ * Every state where that argument fails is refused instead:
+ *
+ *   no marker            nothing to augment; creation handles that case
+ *   malformed            "an identity existed, we cannot say which" — writing
+ *                        an anchor here would invent the answer
+ *   migrated_from_legacy the probe INFERRED the identity from traces and
+ *                        recorded `sub_prefix: null` precisely because it did
+ *                        not know which one. A later session does not prove
+ *                        it is the same one
+ *   no session id        nothing to anchor to
+ *   recovery exists      the live session may BE the unverified candidate
+ *
+ * STRICTLY ADDITIVE: it writes `user_id` and copies every other field
+ * verbatim. `initialized_at`, `sub_prefix` and `migrated_from_legacy` keep
+ * their meaning and their values, so the marker's immutability survives
+ * except for the field that did not exist before.
+ *
+ * FAIL CLOSED: a failed write leaves the device without an anchor, which the
+ * gate reads as not verifiable. It never throws — the capture path must not
+ * acquire a new way to break.
+ */
+export async function backfillIdentityAnchor(
+  sessionUserId: string | null,
+): Promise<AnchorBackfillResult> {
+  if (RECOVERY_ENTRY_IMPLEMENTED) {
+    return { anchored: false, reason: 'recovery_entry_exists' };
+  }
+  if (!sessionUserId) return { anchored: false, reason: 'no_session_id' };
+
+  const read = await readIdentityMarkerState();
+  if (read.kind === 'absent') return { anchored: false, reason: 'no_marker' };
+  if (read.kind === 'malformed') {
+    return { anchored: false, reason: 'marker_malformed' };
+  }
+
+  const marker = read.marker;
+  // WRITE-ONCE. An anchor that disagrees with this session is NOT corrected
+  // here; the gate refuses the session instead.
+  if (typeof marker.user_id === 'string' && marker.user_id.length > 0) {
+    return { anchored: true, source: 'already_present' };
+  }
+  if (marker.migrated_from_legacy === true) {
+    return { anchored: false, reason: 'migrated_from_legacy' };
+  }
+
+  const next: IdentityMarker = { ...marker, user_id: sessionUserId };
+  try {
+    await AsyncStorage.setItem(IDENTITY_KEY, JSON.stringify(next));
+  } catch (err) {
+    console.log('GC_IDENTITY_ANCHOR_BACKFILL_FAILED', {
+      err: err instanceof Error ? err.message : String(err),
+    });
+    return { anchored: false, reason: 'write_failed' };
+  }
+  console.log('GC_IDENTITY_ANCHOR_BACKFILLED', {
+    sub_prefix: sessionUserId.slice(0, 8),
+  });
+  return { anchored: true, source: 'written' };
+}
+
+export type ContinuityCheck =
+  | { ok: true }
+  | { ok: false; reason: 'unverifiable' | 'mismatch' };
+
+/**
+ * G-R1 — the continuity POLICY, in one place.
+ *
+ * Answers one question: may this session act for the identity this device
+ * historically held? `getOwnershipToken` is the authority that acts on the
+ * answer; this function is the only thing that decides it.
+ *
+ * `sub_prefix` is deliberately not consulted. A matching prefix cannot
+ * rescue a mismatching `user_id`, and a mismatching prefix cannot condemn a
+ * matching one: the anchor is the authority and the prefix is a comment.
+ */
+export async function checkIdentityContinuity(
+  sessionUserId: string | null,
+): Promise<ContinuityCheck> {
+  if (!sessionUserId) return { ok: false, reason: 'unverifiable' };
+
+  const read = await readIdentityMarkerState();
+  if (read.kind !== 'present') return { ok: false, reason: 'unverifiable' };
+
+  const anchor = read.marker.user_id;
+  if (typeof anchor !== 'string' || anchor.length === 0) {
+    return { ok: false, reason: 'unverifiable' };
+  }
+  return anchor === sessionUserId ? { ok: true } : { ok: false, reason: 'mismatch' };
 }
 
 /**

@@ -178,13 +178,27 @@ describe('R5_OWNERSHIP_TOKEN_IS_THE_SINGLE_AUTHORITY', () => {
     expect(await getOwnershipAccessToken()).toBe('tok-A');
     expect((await readIdentityMarkerState()).kind).toBe('present');
 
-    // The in-memory latch makes later calls free — no extra storage churn.
-    const before = (AsyncStorage.getItem as unknown as { mock: { calls: unknown[] } })
+    // G-R1 — "it opens once" is a property of the DURABLE state, not a count
+    // of storage reads. Continuity is re-read from the marker on every single
+    // issuance — no latch, no memo, by design — so later calls DO touch
+    // storage. What they must never do is rewrite it, move the anchor or add
+    // a second durable key.
+    const first = store.get(IDENTITY_KEY)!;
+    const keysBefore = [...store.keys()];
+    const writesBefore = (AsyncStorage.setItem as unknown as { mock: { calls: unknown[] } })
       .mock.calls.length;
-    await getOwnershipAccessToken();
-    const after = (AsyncStorage.getItem as unknown as { mock: { calls: unknown[] } })
+
+    expect(await getOwnershipAccessToken()).toBe('tok-A');
+
+    const writesAfter = (AsyncStorage.setItem as unknown as { mock: { calls: unknown[] } })
       .mock.calls.length;
-    expect(after).toBe(before);
+    expect(writesAfter).toBe(writesBefore);
+    expect(store.get(IDENTITY_KEY)).toBe(first);
+    expect(JSON.parse(store.get(IDENTITY_KEY)!).initialized_at).toBe(
+      JSON.parse(first).initialized_at,
+    );
+    expect(JSON.parse(store.get(IDENTITY_KEY)!).user_id).toBe(A_ID);
+    expect([...store.keys()]).toEqual(keysBefore);
   });
 
   it('no session means no ownership token either, for the ordinary reason', async () => {
@@ -326,8 +340,11 @@ describe('R5_NO_NEW_DURABLE_KEY', () => {
     const raw = store.get(IDENTITY_KEY)!;
 
     expect(raw).not.toContain('tok-A');
-    expect(raw).not.toContain(A_ID);
     expect(raw).not.toMatch(/eyJ|access_token|refresh_token/);
+    // G-R1 — the anchor. The full user id is stored on purpose: it is the
+    // only field a continuity decision reads. An identifier is not a
+    // credential, and the two prohibitions above are unchanged.
+    expect(JSON.parse(raw).user_id).toBe(A_ID);
     expect(JSON.parse(raw).sub_prefix).toBe('a1a1a1a1');
   });
 });

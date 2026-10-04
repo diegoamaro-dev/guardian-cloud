@@ -1797,6 +1797,140 @@ producción.
 
 ---
 
+## `GC-AUTH-ANCHOR-MALFORMED-001` — un marker ilegible se sustituye y la sesión del momento pasa a ser el ancla
+
+### Estado
+
+**OPEN.** Sin corregir, y **deliberadamente** no corregido en G-R1. Detectado el
+2026-10-04 en la revisión adversarial de la composición de G-R1, donde se
+registró como **H1** y se clasificó:
+
+```
+PREEXISTING / OBSERVED IN CODE / BLOCKER BEFORE RECOVERY ENTRY
+```
+
+**El origen es preexistente a G-R1.** La ruta existía antes del gate y el gate
+no la introdujo. Lo que G-R1 cambia es su **gravedad**, no su mecánica.
+
+### Hecho demostrado
+
+Es un hecho de código, y desde el 2026-10-04 está **fijado por test** en
+`mobile/tests/identityContinuity.test.ts` → `H1 · KNOWN LIMIT — marker ilegible
+y ancla fabricada`. Esos tests existen para que el comportamiento no cambie sin
+que nadie lo vea; **no lo legitiman**.
+
+Dos piezas, ambas en `mobile/src/auth/identityMarker.ts`:
+
+1. **`readIdentityMarker()` colapsa `malformed` en `null`.** Es la lectura que
+   usan los callers del camino feliz. `readIdentityMarkerState()` sí distingue
+   `absent` de `malformed` —y ese reparto es justo lo que exigió
+   GC-AUTH-MIGRATION-001—, pero la versión colapsada sigue existiendo y sigue
+   usándose.
+2. **`markIdentityInitialized()` sólo preserva lo existente cuando esa lectura
+   es truthy.** Para esa función un marker ilegible es por tanto indistinguible
+   de un slot vacío: **lo SUSTITUYE**.
+
+La secuencia completa, con el latch de durabilidad cerrado:
+
+```
+marker ilegible  (bytes corruptos · JSON inválido · version ≠ 1 · getItem LANZA)
+  → getOwnershipToken()            markerKnownDurable === false
+  → ensureIdentityMarkerDurable(sessionUserId)
+  → markIdentityInitialized(sessionUserId)
+        readIdentityMarker() → null        ← malformed colapsado
+        ESCRIBE un marker nuevo:  user_id = sessionUserId
+                                  initialized_at → Date.now()
+                                  migrated_from_legacy → false
+  → latch abierto
+  → backfillIdentityAnchor → already_present
+  → checkIdentityContinuity → ancla === sesión → OK
+  → OwnershipToken EMITIDO
+```
+
+### La asimetría es el defecto
+
+`backfillIdentityAnchor()` **rechaza** `marker_malformed` y lo justifica en su
+propio docstring: escribir un ancla ahí sería *inventar la respuesta*. Pero
+`markIdentityInitialized()` alcanza el mismo slot de almacenamiento un paso
+antes y hace exactamente eso. Consecuencia observada: con el latch cerrado, la
+rama `marker_malformed` del back-fill es **inalcanzable** desde
+`getOwnershipToken()` —el marker ya fue sustituido—. Sólo se alcanza cuando la
+corrupción ocurre **después** de abrirse el latch, y entonces sí se rechaza
+correctamente con `continuity_unverifiable`.
+
+### Qué cambió con G-R1, y qué no
+
+| | antes de G-R1 | desde G-R1 |
+|---|---|---|
+| mecánica | idéntica | idéntica |
+| qué se pierde | `initialized_at`, `migrated_from_legacy` | lo mismo |
+| qué se fabrica | nada | **`user_id`: el campo del que depende la autorización** |
+| clasificación | defecto de integridad | **defecto de autorización latente** |
+
+### Por qué NO se ha demostrado emisión para una identidad incorrecta
+
+Porque **este build no dispone de una segunda ruta de sesión**. Enumeración
+exhaustiva del 2026-10-04 sobre `mobile/src` + `mobile/app`:
+
+- `signInAnonymously()` — `app/index.tsx`, única ruta activa, y sólo bajo
+  `FIRST_IDENTITY`, que exige un marker **`absent`**. Un marker `malformed`
+  resuelve `initialized: true` → `IDENTITY_DEGRADED` → **no acuña**.
+- `signInWithPassword()` — existe en `src/auth/store.ts` y **no tiene ningún
+  caller** en `src/` ni en `app/`: ruta muerta en el artefacto enviado.
+- `updateUser({ email })` (`linkEmail`) — no instala sesión, conserva el
+  `user.id` y rechaza explícitamente con `identity_changed` si cambiara.
+- `signInWithOtp` / `verifyOtp` / `setSession()` — **no existen en el código**.
+
+De ahí se sigue que, hoy, la sesión viva sólo puede ser la identidad histórica,
+y el token que se emite es el correcto. **Esa propiedad es de este build y de
+ninguno posterior.** No es una garantía del diseño: es una consecuencia de que
+todavía no exista recuperación.
+
+### Residuales de la misma causa
+
+- **Pérdida de `migrated_from_legacy: true`.** Un marker legacy que se vuelva
+  ilegible reaparece con la guarda en `false`, lo que **habilita** un back-fill
+  que debía rechazarse.
+- **`initialized_at` reescrito.** Se pierde la marca de la primera identidad
+  observada en el dispositivo.
+- **TOCTOU del back-fill.** `backfillIdentityAnchor()` hace read-modify-write
+  sin lock. No puede desplazar un ancla **establecida** —ambas lecturas verían
+  `already_present`—, así que no emite token incorrecto; queda registrado por
+  completitud.
+
+### Qué NO implica
+
+- **No implica pérdida de `GC_QUEUE` ni de evidencia.** La cola no se toca en
+  ninguna rama de esta ruta. Una refusal de continuidad **pausa** la creación de
+  ownership remoto: no borra, no descarta y no vacía el transporte. La captura
+  local es independiente.
+- **No es una regresión de G-R1** ni un fallo de sus tests. G-R1 pasó la
+  revisión adversarial; esta entrada es lo que esa revisión encontró **al lado**.
+
+### Condición de cierre — vinculante para G-R2 / G-R3
+
+> **Mientras `GC-AUTH-ANCHOR-MALFORMED-001` siga abierto, G-R2 y G-R3 NO pueden
+> abrir una entrada de recuperación.**
+
+La propiedad que hoy hace inofensiva esta ruta —que no haya segunda ruta de
+sesión— es exactamente la que una entrada de recuperación elimina. En el momento
+en que exista OTP, recuperación o cualquier segundo sign-in, esta ruta ancla a
+**quien esté firmado en ese instante** y emite token para esa identidad. El
+orden correcto es cerrar esto **antes** de que `RECOVERY_ENTRY_IMPLEMENTED` pase
+a `true`, nunca después: ese flag guarda `backfillIdentityAnchor()` y **no cubre
+esta vía**.
+
+**No se declara el recovery seguro mientras esta entrada esté abierta**, por
+bien que salgan las corridas de las capacidades vecinas.
+
+### Lo que esta entrada NO hace
+
+No diseña la solución. La elección —rechazar y dejar el dispositivo sin
+ownership, o sanear el slot bajo condiciones— es una decisión de diseño que
+pertenece a su propio gate y **no se toma aquí**.
+
+---
+
 ## Lo que sigue abierto
 
 - **Validación DIRIGIDA en hardware de la prevención.** El banco prueba la
@@ -1851,6 +1985,11 @@ producción.
   [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md#aislamiento-de-build-e1--android-y-proyecto-supabase).
   **No cierra este finding ni ninguna parte de él**: separar builds no recupera
   ninguna identidad.
+- **`GC-AUTH-ANCHOR-MALFORMED-001`** — ver el apartado inmediatamente
+  anterior. Un marker ilegible se sustituye y la sesión del momento pasa a ser
+  el ancla de continuidad. Hoy no emite token para una identidad incorrecta
+  porque este build no tiene una segunda ruta de sesión, y **esa es la única
+  razón**. Bloquea abrir una entrada de recuperación en G-R2 / G-R3.
 
 ---
 

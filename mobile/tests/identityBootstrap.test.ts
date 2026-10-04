@@ -131,17 +131,23 @@ describe('TEST_IDENTITY_MARKER_IS_IDEMPOTENT', () => {
     expect(second.persisted).toBe(true);
   });
 
-  it('stores no token material — only a version, a timestamp and 8 hex chars', async () => {
+  it('stores no credential material — a version, a timestamp, 8 hex chars and the anchor', async () => {
     await markIdentityInitialized('9095c9e7-9d19-48d4-a465-8b7e69171078');
     const raw = (await AsyncStorage.getItem(IDENTITY_KEY)) ?? '';
     expect(raw).not.toMatch(/eyJ/);
     expect(raw).not.toMatch(/access_token|refresh_token/);
-    // The full user id must not survive either — prefix only.
-    expect(raw).not.toContain('9095c9e7-9d19-48d4-a465-8b7e69171078');
+    // G-R1 — the full user id DOES survive now, and deliberately: `user_id`
+    // is the durable continuity anchor `getOwnershipToken` compares the live
+    // session against. An opaque identifier is not credential material: it
+    // authenticates nothing on its own, and the prohibitions above still
+    // hold. `sub_prefix` stays DIAGNOSTIC ONLY and decides nothing.
+    expect(JSON.parse(raw).user_id).toBe('9095c9e7-9d19-48d4-a465-8b7e69171078');
+    expect(JSON.parse(raw).sub_prefix).toBe('9095c9e7');
     expect(Object.keys(JSON.parse(raw)).sort()).toEqual([
       'initialized_at',
       'migrated_from_legacy',
       'sub_prefix',
+      'user_id',
       'version',
     ]);
   });

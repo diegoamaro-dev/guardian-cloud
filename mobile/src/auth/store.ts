@@ -25,7 +25,11 @@ import { supabase } from './supabase';
 import { logAuthStateChange } from './authDiagnostics';
 // R5 — the marker is the durable proof the ownership gate consults. Leaf
 // module; importing it here cannot form a cycle.
-import { markIdentityInitialized } from './identityMarker';
+import {
+  backfillIdentityAnchor,
+  checkIdentityContinuity,
+  markIdentityInitialized,
+} from './identityMarker';
 // PHASE 1A: the upload queue pauses globally on `401 NO_TOKEN`. Only a
 // usable Supabase session may lift that pause, so auth transitions have
 // to be observable by the worker. We notify a leaf module rather than
@@ -212,7 +216,25 @@ export type TokenFailureReason =
    * every observed session retries the write. Only `getOwnershipToken`
    * ever returns this; read paths are unaffected.
    */
-  | 'marker_not_durable';
+  | 'marker_not_durable'
+  /**
+   * G-R1 — the session is fine and the marker is durable, but the device
+   * holds no anchor to compare against, so continuity with the historical
+   * identity cannot be demonstrated. `RECOVERY_NOT_VERIFIABLE`.
+   *
+   * NOT transient in the way `marker_not_durable` is: no retry produces an
+   * anchor on a device that lost its session before anchors existed, or
+   * whose marker came from the legacy probe. Evidence and ownership stay
+   * intact — the queue pauses and keeps the bytes — but this device cannot
+   * create remote ownership until an anchor exists.
+   */
+  | 'continuity_unverifiable'
+  /**
+   * G-R1 — a usable session whose `user.id` is NOT the anchored identity.
+   * The anchor is never moved to match: the session is refused instead.
+   * This is the state that must never upload, register, complete or claim.
+   */
+  | 'continuity_mismatch';
 
 export type TokenResult =
   | { ok: true; token: string }
@@ -425,6 +447,35 @@ export async function getOwnershipToken(): Promise<OwnershipTokenResult> {
     if (!durable) {
       return { ok: false, reason: 'marker_not_durable', name: null };
     }
+  }
+
+  // G-R1 — CONTINUITY. The last condition before a token exists.
+  //
+  // Deliberately NOT behind a latch. `markerKnownDurable` caches a fact that
+  // cannot revert — a durable marker stays durable — whereas continuity CAN
+  // change inside one process: a recovery that signs a different identity in
+  // would otherwise inherit a verdict reached for another one. Every
+  // issuance re-reads the durable anchor, so a new process and a mid-process
+  // identity change are decided the same way, from disk.
+  //
+  // The back-fill runs first and only where it is safe (see
+  // `backfillIdentityAnchor`); it never throws and a refusal simply leaves
+  // the device unverifiable.
+  await backfillIdentityAnchor(session?.user?.id ?? null);
+  const continuity = await checkIdentityContinuity(session?.user?.id ?? null);
+  if (!continuity.ok) {
+    // Metadata only: a reason, never an id, never an email.
+    console.log('GC_OWNERSHIP_CONTINUITY_REFUSED', {
+      reason: continuity.reason,
+    });
+    return {
+      ok: false,
+      reason:
+        continuity.reason === 'mismatch'
+          ? 'continuity_mismatch'
+          : 'continuity_unverifiable',
+      name: null,
+    };
   }
 
   // The ONLY place this cast appears. Everything downstream receives an
