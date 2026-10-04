@@ -1398,6 +1398,93 @@ cifras de arriba.
 
 ---
 
+## `GC-EXPORT-CONCAT-001` — el export de vídeo entregaba un MP4 engañoso
+
+```
+GC-EXPORT-CONCAT-001 = FIXED IN CODE / TESTED / NOT HARDWARE VALIDATED
+                       (registrado y corregido el 2026-10-04)
+```
+
+**No es pérdida de evidencia.** Ni un byte se perdió, ni se corrompió, ni la
+copia remota se tocó. Es un defecto de **montaje** que producía una afirmación
+falsa en la pantalla del usuario, que es lo que §8 y §14 prohíben.
+
+### Lo observado, medido
+
+Artefacto real exportado desde el BENCH el 2026-10-04 por la opción de export
+existente. Congelado en
+`D:\guardian-cloud-evidence\2026-10-04-saf-single-mp4-triage\`,
+`sha256 75edceeb…d56391`, 1 764 814 bytes.
+
+```
+cajas ftyp / moov / mdat dentro del fichero      5 / 5 / 5
+duración que declara un reproductor           3,181134 s
+timeline real contenida                      25,170431 s
+alcanzable                                        12,6 %
+contenedores que abren, con ambas pistas         5 de 5
+errores al recorrer sus samples                   ninguno
+```
+
+Un lector de MP4 consume el primer `moov`, reproduce su tramo y se detiene. El
+87,4 % restante está **dentro del fichero** y es invisible para cualquier
+reproductor.
+
+### La causa, demostrada
+
+`src/api/export.ts` concatena los bytes de los chunks descargados. Para
+**audio/legacy es correcto**: esos chunks son rangos de bytes de una sola
+grabación, y unirlos reconstruye el fichero original. La captura de vídeo
+nativa segmentada rompe esa premisa, porque **cada chunk es un MP4 completo**.
+
+El defecto no distinguía: aplicaba la operación de audio a contenedores
+independientes.
+
+### Alcance de la corrección
+
+Corregido el mismo día por el remux `MediaExtractor → MediaMuxer`
+(`EXPORT-MP4 · REMUX`, `05c4b2b` y los dos commits anteriores): el ensamblado
+de vídeo pasa a copiar samples comprimidos a un solo contenedor, sin
+recodificar, y la decisión entre concatenar y remuxear la toma el campo
+`media` **por chunk** —no `session.mode`, no la extensión—.
+
+**Lo que la corrección NO acredita todavía:**
+
+- **ningún artefacto instalado la contiene.** El remux se validó llamando al
+  módulo nativo desde un test instrumentado sobre 17 segmentos reales, **no**
+  desde la pantalla de export de la app;
+- **nadie ha reproducido el resultado a ojo**, ni comprobado la sincronía A/V
+  tras varias fronteras;
+- **no está ejecutada** la regresión de mala red, kill, segundo plano y
+  reinicio;
+- **el invariante «export usable» no se declara satisfecho.**
+
+Detalle completo de la validación y de sus límites en
+[`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md), sección
+`EXPORT-MP4 · REMUX`.
+
+### Residual: las sesiones de vídeo anteriores a G3''
+
+Sus chunks no declaran medio. Concatenar es demostrablemente incorrecto para
+ellas y no hay metadata de la que decidir, así que **se rechazan**: el export
+no produce nada en vez de producir el artefacto engañoso. Siguen teniendo la
+copia remota y el salvage de segmentos de D3, ambos intactos.
+
+### Nota aritmética sobre `GC-SEGMENT-CONTINUITY-001`
+
+Medir esto obligó a reconstruir la timeline correctamente, y conviene dejar
+escrito lo que salió, **sin tocar ese finding**:
+
+- la cifra registrada de **66,765 s** es la **suma ingenua** de duraciones de
+  contenedor, que cuenta dos veces el `audioLead` de cada frontera;
+- la reconstrucción correcta de esa misma corrida da **66,664 s**;
+- por tanto la diferencia contra `capture_ms` pasa de 5,786 s a **5,887 s**.
+
+**El algoritmo correcto no explica la observación: la agranda en 101 ms.** No
+se atribuye causa, no se investiga aquí y
+**`GC-SEGMENT-CONTINUITY-001` sigue `OBSERVATION / INVESTIGATION OPEN`**.
+
+---
+
 ## `GC-AUTH-RECOVERABLE-IDENTITY-PRIMITIVE-001` — primitiva de identidad recuperable
 
 ```

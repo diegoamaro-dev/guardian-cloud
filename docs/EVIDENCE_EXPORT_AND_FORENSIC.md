@@ -60,8 +60,16 @@ Límites que condicionan cualquier afirmación forense futura:
 
 - **el recovery autónomo tras reiniciar el dispositivo (`I5c`) no está
   implementado**;
-- **no existe export final `.mp4`**: una sesión de vídeo sube fragmentos
-  verificables, pero no hay reconstrucción utilizable como pieza única;
+- **el export final `.mp4` existe en código desde el 2026-10-04 y todavía no
+  está acreditado como pieza utilizable**: el remux `MediaExtractor →
+  MediaMuxer` está implementado y probado, y validado en dispositivo sobre 17
+  segmentos reales —un solo contenedor, duración exacta, hashes de origen
+  intactos—, pero **ninguna corrida de extremo a extremo desde la app lo
+  respalda** y nadie lo ha reproducido a ojo. Hasta entonces, para un peritaje
+  sigue sin haber pieza única acreditada. Alcance en
+  [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md), sección
+  `EXPORT-MP4 · REMUX`, y el defecto que lo motivó en
+  [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md), `GC-EXPORT-CONCAT-001`;
 - **el cifrado local no está implementado**.
 
 > **Salvage local de segmentos (D3), desde el 2026-08-24.** Existe una salida
