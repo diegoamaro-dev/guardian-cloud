@@ -112,10 +112,15 @@ describe('TEST_IDENTITY_MARKER_IS_IDEMPOTENT', () => {
   it('writes a marker when none exists', async () => {
     // GC-AUTH-MIGRATION-001: the write now reports whether it landed, so
     // the caller can refuse to treat an unrecorded identity as settled.
-    const { marker, persisted } = await markIdentityInitialized(
+    const write = await markIdentityInitialized(
       '9095c9e7-9d19-48d4-a465-8b7',
     );
-    expect(persisted).toBe(true);
+    expect(write.persisted).toBe(true);
+    // GC-AUTH-ANCHOR-MALFORMED-001 — the result is a union now: a refusal
+    // carries no marker, so reading one requires establishing we got it.
+    const marker = write.marker;
+    expect(marker).not.toBeNull();
+    if (marker === null) throw new Error('unreachable: the write reported persisted');
     expect(marker.version).toBe(1);
     expect(marker.sub_prefix).toBe('9095c9e7');
     expect(marker.migrated_from_legacy).toBe(false);
@@ -125,8 +130,10 @@ describe('TEST_IDENTITY_MARKER_IS_IDEMPOTENT', () => {
   it('never overwrites an existing marker', async () => {
     const first = await markIdentityInitialized('aaaaaaaa-1111');
     const second = await markIdentityInitialized('bbbbbbbb-2222');
-    expect(second.marker.initialized_at).toBe(first.marker.initialized_at);
-    expect(second.marker.sub_prefix).toBe('aaaaaaaa');
+    expect(first.marker).not.toBeNull();
+    expect(second.marker).not.toBeNull();
+    expect(second.marker?.initialized_at).toBe(first.marker?.initialized_at);
+    expect(second.marker?.sub_prefix).toBe('aaaaaaaa');
     // An already-durable marker reports as persisted without rewriting.
     expect(second.persisted).toBe(true);
   });
@@ -154,7 +161,7 @@ describe('TEST_IDENTITY_MARKER_IS_IDEMPOTENT', () => {
 
   it('tolerates a missing user id', async () => {
     const { marker } = await markIdentityInitialized(null);
-    expect(marker.sub_prefix).toBeNull();
+    expect(marker?.sub_prefix).toBeNull();
   });
 });
 

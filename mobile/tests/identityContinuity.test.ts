@@ -35,11 +35,19 @@ const getSession = vi.fn(async () => ({
 vi.mock('@react-native-async-storage/async-storage', () => {
   const store = new Map<string, string>();
   const failWrites = new Set<string>();
+  // GC-AUTH-ANCHOR-MALFORMED-001 — a read that THROWS is its own state now,
+  // so the harness has to be able to produce one. Same seam
+  // `legacyProbeSeal.test.ts` already uses.
+  const failReads = new Set<string>();
   return {
     default: {
       __store__: store,
       __failWrites__: failWrites,
-      getItem: vi.fn(async (k: string) => store.get(k) ?? null),
+      __failReads__: failReads,
+      getItem: vi.fn(async (k: string) => {
+        if (failReads.has(k)) throw new Error('storage read failed');
+        return store.get(k) ?? null;
+      }),
       setItem: vi.fn(async (k: string, v: string) => {
         if (failWrites.has(k)) throw new Error('storage write failed');
         store.set(k, v);
@@ -87,8 +95,11 @@ import {
 } from '@/auth/identityMarker';
 import {
   __resetOwnershipLatchForTests,
+  getOwnershipAccessToken,
   getOwnershipToken,
+  isOwnershipGateOpen,
 } from '@/auth/store';
+import { supabase } from '@/auth/supabase';
 
 const HISTORICAL = '11111111-2222-3333-4444-555555555555';
 const OTHER = '99999999-8888-7777-6666-555555555555';
@@ -99,6 +110,7 @@ const SAME_PREFIX_OTHER = '11111111-ffff-ffff-ffff-ffffffffffff';
 type MockedStorage = typeof AsyncStorage & {
   __store__: Map<string, string>;
   __failWrites__: Set<string>;
+  __failReads__: Set<string>;
 };
 const storage = AsyncStorage as MockedStorage;
 
@@ -120,6 +132,8 @@ async function writeMarker(marker: Record<string, unknown>): Promise<void> {
 beforeEach(() => {
   storage.__store__.clear();
   storage.__failWrites__.clear();
+  storage.__failReads__.clear();
+  vi.clearAllMocks();
   getSession.mockReset();
   __resetOwnershipLatchForTests();
 });
@@ -129,16 +143,16 @@ describe('G-R1 · creación de identidad nueva', () => {
     const { marker, persisted } = await markIdentityInitialized(HISTORICAL);
 
     expect(persisted).toBe(true);
-    expect(marker.user_id).toBe(HISTORICAL);
+    expect(marker?.user_id).toBe(HISTORICAL);
     // Y el diagnóstico sigue siendo el diagnóstico.
-    expect(marker.sub_prefix).toBe('11111111');
-    expect(marker.version).toBe(1);
+    expect(marker?.sub_prefix).toBe('11111111');
+    expect(marker?.version).toBe(1);
   });
 
   it('sin id disponible no inventa un ancla', async () => {
     const { marker } = await markIdentityInitialized(null);
-    expect(marker.user_id).toBeUndefined();
-    expect(marker.sub_prefix).toBeNull();
+    expect(marker?.user_id).toBeUndefined();
+    expect(marker?.sub_prefix).toBeNull();
   });
 });
 
@@ -193,13 +207,48 @@ describe('G-R1 · back-fill — sólo donde es justificable', () => {
     expect((await readIdentityMarker())?.user_id).toBeUndefined();
   });
 
-  it('un marker malformed NO permite back-fill', async () => {
+  it('un marker corrupt NO permite back-fill', async () => {
     storage.__store__.set(IDENTITY_KEY, '{not json');
 
     expect(await backfillIdentityAnchor(HISTORICAL)).toEqual({
       anchored: false,
-      reason: 'marker_malformed',
+      reason: 'marker_corrupt',
     });
+  });
+
+  it('un marker ilegible NO permite back-fill, y se dice por qué', async () => {
+    storage.__failReads__.add(IDENTITY_KEY);
+
+    expect(await backfillIdentityAnchor(HISTORICAL)).toEqual({
+      anchored: false,
+      reason: 'marker_unreadable',
+    });
+  });
+
+  // El invariante de compatibilidad, en dos tests que van juntos: una
+  // PROPIEDAD ausente es elegible; una propiedad presente e inválida no.
+  it.each([
+    ['cadena vacía', ''],
+    ['null', null],
+    ['un número', 42],
+    ['un objeto', { nested: true }],
+  ])('user_id inválido (%s) NO es elegible para back-fill', async (_l, bad) => {
+    await writeMarker({
+      version: 1,
+      initialized_at: 123,
+      sub_prefix: '11111111',
+      migrated_from_legacy: false,
+      user_id: bad,
+    });
+    const before = storage.__store__.get(IDENTITY_KEY);
+
+    expect(await backfillIdentityAnchor(OTHER)).toEqual({
+      anchored: false,
+      reason: 'marker_corrupt',
+    });
+    // Y sobre todo: el valor inválido SOBREVIVE. No se sustituye por la
+    // identidad de la sesión viva, que es justo la causa 2 de H1.
+    expect(storage.__store__.get(IDENTITY_KEY)).toBe(before);
   });
 
   it('sin marker no hay nada que anclar', async () => {
@@ -398,78 +447,297 @@ describe('G-R1 · compatibilidad y ausencia de latch', () => {
 });
 
 /**
- * H1 — KNOWN LIMIT / BLOCKER BEFORE RECOVERY ENTRY.
+ * GC-AUTH-ANCHOR-MALFORMED-001 — el marker ilegible ya no se sustituye.
  *
- * ESTE BLOQUE NO DESCRIBE UN COMPORTAMIENTO DESEADO. Fija el que existe
- * HOY, para que nadie lo cambie —ni lo arregle— sin verlo, y para que la
- * deuda sea visible desde la suite y no sólo desde un documento.
+ * ESTOS TESTS DOCUMENTABAN EL DEFECTO. Ahora fijan la conducta corregida.
  *
- * `readIdentityMarker()` colapsa `malformed` en `null` para los callers del
- * camino feliz, y `markIdentityInitialized()` sólo preserva lo existente
- * cuando ese valor es truthy. Un marker ilegible es por tanto
- * INDISTINGUIBLE de un slot vacío para esa función: lo SUSTITUYE, y desde
- * G-R1 la sustitución incluye un `user_id` nuevo anclado a la sesión del
- * momento. Convierte «existió una identidad y no podemos decir cuál» en un
- * ancla confiada.
+ * Causa 1: `readIdentityMarker()` colapsaba `corrupt` y `unreadable` en el
+ * mismo `null` que produce una ranura vacía, y `markIdentityInitialized()`
+ * leía ese `null` como «aquí no hay nada» y SUSTITUÍA los bytes, fabricando
+ * un `user_id` anclado a la sesión que hubiera viva.
  *
- * Por qué esto NO emite hoy un token para una identidad incorrecta: la
- * única ruta que instala una sesión en este build es
- * `signInAnonymously()`, y exige `FIRST_IDENTITY`, que exige un marker
- * `absent` —no `malformed`—. La sesión viva sólo puede ser la histórica.
- * Esa propiedad es de ESTE build y de ninguno posterior: deja de valer en
- * cuanto exista OTP o cualquier entrada de recuperación, y entonces esta
- * ruta ancla a quien esté firmado en ese instante.
+ * Causa 2: la guarda write-once del back-fill era «¿es una string no
+ * vacía?», de modo que un `user_id` PRESENTE PERO INVÁLIDO no contaba como
+ * ancla y caía directamente en la escritura.
  *
- * Registrado como `GC-AUTH-ANCHOR-MALFORMED-001` en KNOWN_LIMITS.md §5,
- * ligado a `GC-AUTH-SESSION-RECOVERY-001`. No se corrige en G-R1.
+ * La regla ahora: la validez se decide en `readIdentityMarkerState()`, y
+ * `setItem` sólo ocurre si el estado observado es exactamente `absent`.
+ * Negarse a escribir ES la preservación: nada borra la clave.
  */
-describe('H1 · KNOWN LIMIT — marker ilegible y ancla fabricada', () => {
-  it('BLOCKER BEFORE RECOVERY · un marker malformed se sustituye y la sesión viva pasa a ser el ancla', async () => {
-    // Bytes presentes —algo escribió aquí una vez— pero JSON truncado:
-    // `readIdentityMarkerState` lo lee como 'malformed', que significa
-    // «existió una identidad y no podemos decir cuál».
+describe('GC-AUTH-ANCHOR-MALFORMED-001 · la tabla de lectura', () => {
+  it('null es la ÚNICA ausencia', async () => {
+    expect(await readIdentityMarkerState()).toEqual({ kind: 'absent' });
+  });
+
+  it('una lectura que lanza es unreadable, no una ausencia', async () => {
+    storage.__failReads__.add(IDENTITY_KEY);
+    expect(await readIdentityMarkerState()).toEqual({ kind: 'unreadable' });
+  });
+
+  it.each([
+    ['cadena vacía', ''],
+    ['JSON truncado', '{"version":1,"initialized_at":'],
+    ['JSON basura', 'garbage'],
+    ['no es un objeto', '"soy una cadena"'],
+    ['null literal', 'null'],
+    ['version futura', '{"version":2,"initialized_at":1}'],
+    ['version desconocida', '{"version":99,"initialized_at":1}'],
+    ['initialized_at no numérico', '{"version":1,"initialized_at":"ayer"}'],
+    ['initialized_at ausente', '{"version":1}'],
+    ['user_id vacío', '{"version":1,"initialized_at":1,"user_id":""}'],
+    ['user_id null', '{"version":1,"initialized_at":1,"user_id":null}'],
+    ['user_id numérico', '{"version":1,"initialized_at":1,"user_id":42}'],
+  ])('%s es corrupt, nunca absent', async (_label, raw) => {
+    storage.__store__.set(IDENTITY_KEY, raw);
+    expect(await readIdentityMarkerState()).toEqual({ kind: 'corrupt' });
+  });
+
+  // El invariante de compatibilidad, leído desde la propia lectura.
+  it('la PROPIEDAD user_id ausente sigue siendo un marker válido pre-G-R1', async () => {
+    await writeMarker({
+      version: 1,
+      initialized_at: 123,
+      sub_prefix: 'abcdefff',
+      migrated_from_legacy: false,
+    });
+    const read = await readIdentityMarkerState();
+    expect(read.kind).toBe('present');
+    if (read.kind !== 'present') throw new Error('unreachable');
+    expect('user_id' in read.marker).toBe(false);
+  });
+
+  it('una user_id string no vacía es un marker anclado', async () => {
+    await writeMarker({
+      version: 1,
+      initialized_at: 123,
+      sub_prefix: '11111111',
+      migrated_from_legacy: false,
+      user_id: HISTORICAL,
+    });
+    const read = await readIdentityMarkerState();
+    expect(read.kind).toBe('present');
+    if (read.kind !== 'present') throw new Error('unreachable');
+    expect(read.marker.user_id).toBe(HISTORICAL);
+  });
+});
+
+describe('GC-AUTH-ANCHOR-MALFORMED-001 · la escritura sólo ocurre en absent', () => {
+  it('absent crea el marker', async () => {
+    const w = await markIdentityInitialized(HISTORICAL);
+    expect(w).toMatchObject({ persisted: true, source: 'created' });
+    expect(w.marker?.user_id).toBe(HISTORICAL);
+  });
+
+  it('present devuelve el existente sin reescribir', async () => {
+    await writeMarker({
+      version: 1,
+      initialized_at: 123,
+      sub_prefix: '11111111',
+      migrated_from_legacy: false,
+      user_id: HISTORICAL,
+    });
+    const before = storage.__store__.get(IDENTITY_KEY);
+
+    const w = await markIdentityInitialized(OTHER);
+
+    expect(w).toMatchObject({ persisted: true, source: 'existing' });
+    expect(storage.__store__.get(IDENTITY_KEY)).toBe(before);
+  });
+
+  it('corrupt RECHAZA, sin marker y sin reclamar durabilidad', async () => {
     const CORRUPT = '{"version":1,"initialized_at":';
     storage.__store__.set(IDENTITY_KEY, CORRUPT);
-    expect((await readIdentityMarkerState()).kind).toBe('malformed');
 
-    // AISLADO, el back-fill SÍ rechaza, y no toca los bytes: inventar un
-    // ancla aquí sería inventar la respuesta. Su docstring lo dice.
-    expect(await backfillIdentityAnchor(OTHER)).toEqual({
+    expect(await markIdentityInitialized(OTHER)).toEqual({
+      persisted: false,
+      marker: null,
+      reason: 'marker_corrupt',
+    });
+    expect(storage.__store__.get(IDENTITY_KEY)).toBe(CORRUPT);
+  });
+
+  it('unreadable RECHAZA, y no escribe nada en la ranura', async () => {
+    storage.__failReads__.add(IDENTITY_KEY);
+
+    expect(await markIdentityInitialized(OTHER)).toEqual({
+      persisted: false,
+      marker: null,
+      reason: 'marker_unreadable',
+    });
+    expect(storage.__store__.has(IDENTITY_KEY)).toBe(false);
+  });
+});
+
+describe('GC-AUTH-ANCHOR-MALFORMED-001 · la composición, que es el corazón', () => {
+  it('corrupt + latch cerrado + sesión viva: ni sustituye bytes ni emite token', async () => {
+    const CORRUPT = '{"version":1,"initialized_at":';
+    storage.__store__.set(IDENTITY_KEY, CORRUPT);
+    withSession(OTHER);
+
+    const own = await getOwnershipToken();
+
+    // 1 · los bytes originales sobreviven BYTE A BYTE.
+    expect(storage.__store__.get(IDENTITY_KEY)).toBe(CORRUPT);
+    // 2 · no aparece ningún ancla fabricada.
+    expect(await readIdentityMarkerState()).toEqual({ kind: 'corrupt' });
+    // 3 · y la puerta NO concede.
+    expect(own).toEqual({
+      ok: false,
+      reason: 'marker_not_durable',
+      name: null,
+    });
+  });
+
+  it('un marker legacy corrupto no pierde su guarda por sustitución', async () => {
+    const LEGACY_CORRUPT =
+      '{"version":1,"initialized_at":1,"sub_prefix":null,"migrated_from_legacy":true';
+    storage.__store__.set(IDENTITY_KEY, LEGACY_CORRUPT);
+    withSession(HISTORICAL);
+
+    await getOwnershipToken();
+
+    // `migrated_from_legacy: true` es una guarda del back-fill. Antes se
+    // perdía silenciosamente al sustituir; ahora los bytes siguen ahí.
+    expect(storage.__store__.get(IDENTITY_KEY)).toBe(LEGACY_CORRUPT);
+  });
+
+  it('version futura + sesión viva: tampoco sustituye (rollback desde v2)', async () => {
+    const V2 = '{"version":2,"initialized_at":999,"user_id":"quien-sea"}';
+    storage.__store__.set(IDENTITY_KEY, V2);
+    withSession(OTHER);
+
+    expect((await getOwnershipToken()).ok).toBe(false);
+    expect(storage.__store__.get(IDENTITY_KEY)).toBe(V2);
+  });
+
+  it('un unreadable transitorio no deja secuela cuando la lectura vuelve', async () => {
+    await writeMarker({
+      version: 1,
+      initialized_at: 123,
+      sub_prefix: '11111111',
+      migrated_from_legacy: false,
+      user_id: HISTORICAL,
+    });
+    const before = storage.__store__.get(IDENTITY_KEY);
+    withSession(HISTORICAL);
+
+    // Fallo transitorio: se niega, sin escribir.
+    storage.__failReads__.add(IDENTITY_KEY);
+    expect((await getOwnershipToken()).ok).toBe(false);
+    expect(storage.__store__.get(IDENTITY_KEY)).toBe(before);
+
+    // La lectura vuelve a funcionar y la puerta abre con el ancla ORIGINAL.
+    storage.__failReads__.clear();
+    expect((await getOwnershipToken()).ok).toBe(true);
+    expect(storage.__store__.get(IDENTITY_KEY)).toBe(before);
+  });
+
+  it('el marker anclado + la sesión correcta sigue funcionando igual', async () => {
+    await writeMarker({
+      version: 1,
+      initialized_at: 123,
+      sub_prefix: '11111111',
+      migrated_from_legacy: false,
+      user_id: HISTORICAL,
+    });
+    withSession(HISTORICAL);
+
+    expect((await getOwnershipToken()).ok).toBe(true);
+  });
+
+  it('el marker pre-G-R1 sin la propiedad user_id sigue recibiendo back-fill', async () => {
+    await writeMarker({
+      version: 1,
+      initialized_at: 123,
+      sub_prefix: 'abcdefff',
+      migrated_from_legacy: false,
+    });
+    withSession(HISTORICAL);
+
+    expect((await getOwnershipToken()).ok).toBe(true);
+    expect((await readIdentityMarker())?.user_id).toBe(HISTORICAL);
+    // Y lo histórico no se toca.
+    expect((await readIdentityMarker())?.initialized_at).toBe(123);
+  });
+
+  it('ninguna de estas rutas borra gc.identity.v1', async () => {
+    const CORRUPT = '{"version":1,"initialized_at":';
+    for (const raw of [CORRUPT, '', 'garbage']) {
+      storage.__store__.set(IDENTITY_KEY, raw);
+      withSession(OTHER);
+      await getOwnershipToken();
+      expect(storage.__store__.get(IDENTITY_KEY)).toBe(raw);
+    }
+    expect(AsyncStorage.removeItem).not.toHaveBeenCalled();
+  });
+
+  it('la captura local no queda bloqueada: nunca lanza, sólo devuelve null', async () => {
+    storage.__store__.set(IDENTITY_KEY, '{not json');
+    withSession(OTHER);
+
+    await expect(getOwnershipAccessToken()).resolves.toBeNull();
+  });
+
+  // El caso que faltaba: la corrupción llega DESPUÉS de que la puerta se
+  // abriera legítimamente. `markerKnownDurable` cachea un hecho
+  // irreversible y sigue abierto, así que es la continuidad —releída del
+  // disco en cada emisión— la única cosa que puede negar aquí. Si la
+  // autoridad anterior se pudiera reutilizar, este test pasaría token.
+  it('corrupción TRAS abrir el latch: la autoridad anterior no se reutiliza', async () => {
+    const GOOD = {
+      version: 1,
+      initialized_at: 123,
+      sub_prefix: '11111111',
+      migrated_from_legacy: false,
+      user_id: HISTORICAL,
+    };
+    await writeMarker(GOOD);
+    withSession(HISTORICAL);
+
+    // 1-3 · marker válido, sesión histórica coincidente, puerta abierta
+    //       legítimamente.
+    expect((await getOwnershipToken()).ok).toBe(true);
+    expect(isOwnershipGateOpen()).toBe(true);
+
+    // 4 · y AHORA se corrompe el almacenamiento.
+    const CORRUPT = '{"version":1,"initialized_at":';
+    storage.__store__.set(IDENTITY_KEY, CORRUPT);
+    const writesBefore = (
+      AsyncStorage.setItem as unknown as { mock: { calls: unknown[] } }
+    ).mock.calls.length;
+
+    // 5 · la llamada posterior.
+    const own = await getOwnershipToken();
+
+    // No se emite token, y el motivo es el fail-closed de continuidad:
+    // con el latch abierto no se pasa por `ensureIdentityMarkerDurable`,
+    // así que quien niega es `checkIdentityContinuity`.
+    expect(own).toEqual({
+      ok: false,
+      reason: 'continuity_unverifiable',
+      name: null,
+    });
+
+    // Los bytes corruptos NO se sustituyen, y no hubo back-fill: cero
+    // escrituras nuevas en la ranura.
+    expect(storage.__store__.get(IDENTITY_KEY)).toBe(CORRUPT);
+    expect(
+      (AsyncStorage.setItem as unknown as { mock: { calls: unknown[] } })
+        .mock.calls.length,
+    ).toBe(writesBefore);
+    expect(await backfillIdentityAnchor(HISTORICAL)).toEqual({
       anchored: false,
-      reason: 'marker_malformed',
+      reason: 'marker_corrupt',
     });
     expect(storage.__store__.get(IDENTITY_KEY)).toBe(CORRUPT);
 
-    // EN LA COMPOSICIÓN REAL ese rechazo llega tarde. Con el latch cerrado,
-    // `getOwnershipToken` pasa primero por `ensureIdentityMarkerDurable`.
-    withSession(OTHER);
-    const own = await getOwnershipToken();
+    // Ninguna identidad nueva y ningún borrado.
+    expect(supabase.auth.signInAnonymously).not.toHaveBeenCalled();
+    expect(AsyncStorage.removeItem).not.toHaveBeenCalled();
 
-    // 1 · el marker malformed ha sido REEMPLAZADO.
-    const raw = storage.__store__.get(IDENTITY_KEY)!;
-    expect(raw).not.toBe(CORRUPT);
-    // 2 · y aparece un `user_id` nuevo, anclado a la sesión del momento.
-    expect(JSON.parse(raw).user_id).toBe(OTHER);
-    // 3 · y la puerta concede token para esa sesión.
-    //     Hoy correcto por lo dicho arriba; mañana, no garantizado.
-    expect(own.ok).toBe(true);
-  });
-
-  it('BLOCKER BEFORE RECOVERY · el reemplazo pierde la marca legacy, que es una guarda', async () => {
-    // `migrated_from_legacy: true` es precisamente lo que hace que el
-    // back-fill se niegue: el probe INFIRIÓ la identidad y no sabe cuál es.
-    // Si esos bytes se vuelven ilegibles, el reemplazo vuelve con la guarda
-    // a `false` y con `initialized_at` reescrito.
-    storage.__store__.set(
-      IDENTITY_KEY,
-      '{"version":1,"initialized_at":1,"sub_prefix":null,"migrated_from_legacy":true',
-    );
-    withSession(HISTORICAL);
-    await getOwnershipToken();
-
-    const marker = JSON.parse(storage.__store__.get(IDENTITY_KEY)!);
-    expect(marker.migrated_from_legacy).toBe(false);
-    expect(marker.user_id).toBe(HISTORICAL);
-    expect(marker.initialized_at).toBeGreaterThan(1);
+    // Y el punto del test: el latch de DURABILIDAD sigue abierto —es un
+    // hecho que no revierte— y aun así no hay token. La durabilidad por sí
+    // sola dejó de ser autoridad suficiente.
+    expect(isOwnershipGateOpen()).toBe(true);
   });
 });

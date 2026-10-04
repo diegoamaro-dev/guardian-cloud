@@ -5636,7 +5636,8 @@ export default function Index() {
           from_legacy_probe: fromLegacyProbe,
           // GC-AUTH-MIGRATION-001: which durable record decided it.
           // 'seal' / 'probe' distinguishes a boundary crossing from every
-          // boot after it; 'marker_malformed' is the conservative refusal.
+          // boot after it; 'marker_corrupt' and 'marker_unreadable' are the
+          // conservative refusals, split by GC-AUTH-ANCHOR-MALFORMED-001.
           identity_source: identitySource,
           probe_version: LEGACY_PROBE_VERSION,
           // True only when the probe said "no prior identity" and that

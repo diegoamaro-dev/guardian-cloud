@@ -234,81 +234,187 @@ export function decideIdentityState(input: {
  * marker here, and only an established identity (or a completed legacy
  * migration) ever writes one. That is enough to refuse minting.
  *
- * A storage read that THROWS is reported as `malformed` for the same
- * reason `decideIdentityState` refuses to mint on `hasError`: not being
- * able to find out is not the same as finding nothing.
+ * GC-AUTH-ANCHOR-MALFORMED-001 — A STORAGE READ THAT THROWS AND BROKEN
+ * BYTES ARE NOT THE SAME FACT, and reporting both as one `malformed`
+ * answer is what hid the defect. A throw observed NO BYTES and says
+ * nothing about the marker; it is retryable. Corrupt bytes ARE the
+ * marker, broken; no retry fixes them. Both refuse to mint for the same
+ * reason `decideIdentityState` refuses on `hasError` — not being able to
+ * find out is not the same as finding nothing — but only one of them can
+ * come right on the next read, and a caller that cannot tell them apart
+ * cannot say why it refused.
+ *
+ * VALIDITY IS DECIDED HERE AND NOWHERE ELSE. `present` guarantees the
+ * whole schema, `user_id` included: either the property is absent — a
+ * valid pre-G-R1 marker, eligible for the anchor back-fill — or it is a
+ * non-empty string, and the marker is anchored. A `user_id` that is
+ * PRESENT BUT INVALID (`''`, null, a number) is `corrupt`, never
+ * `present`: "present but invalid" is not "absent", and collapsing the
+ * two is what let a live session overwrite an anchor it could not read.
+ * Writers therefore carry no validity guard of their own — there is one
+ * authority on what a valid marker is, and this is it.
  */
 export type IdentityMarkerRead =
   | { kind: 'present'; marker: IdentityMarker }
   | { kind: 'absent' }
-  | { kind: 'malformed' };
+  /**
+   * `getItem` threw: no bytes were observed. Says nothing about the
+   * marker, and the next read may well succeed.
+   */
+  | { kind: 'unreadable' }
+  /**
+   * Bytes were observed and are not a valid marker. NEVER overwritten:
+   * they are the only remaining trace of the identity this device held,
+   * and inventing a replacement would invent its owner.
+   */
+  | { kind: 'corrupt' };
 
 export async function readIdentityMarkerState(): Promise<IdentityMarkerRead> {
   let raw: string | null;
   try {
     raw = await AsyncStorage.getItem(IDENTITY_KEY);
   } catch {
-    return { kind: 'malformed' };
+    return { kind: 'unreadable' };
   }
-  if (raw === null || raw === '') return { kind: 'absent' };
+  // ONLY `null` means absence. An empty string is a slot that EXISTS and
+  // does not hold a marker, which is a corruption and not an absence —
+  // `JSON.parse('')` throws, so it lands in `corrupt` below. Nothing in
+  // this app can write one: every write here is `JSON.stringify` of a
+  // marker object.
+  if (raw === null) return { kind: 'absent' };
+
+  let parsed: unknown;
   try {
-    const parsed: unknown = JSON.parse(raw);
-    if (
-      typeof parsed === 'object' &&
-      parsed !== null &&
-      (parsed as IdentityMarker).version === IDENTITY_MARKER_VERSION &&
-      typeof (parsed as IdentityMarker).initialized_at === 'number'
-    ) {
-      return { kind: 'present', marker: parsed as IdentityMarker };
-    }
-    return { kind: 'malformed' };
+    parsed = JSON.parse(raw);
   } catch {
-    return { kind: 'malformed' };
+    return { kind: 'corrupt' };
   }
+  if (
+    typeof parsed !== 'object' ||
+    parsed === null ||
+    (parsed as IdentityMarker).version !== IDENTITY_MARKER_VERSION ||
+    typeof (parsed as IdentityMarker).initialized_at !== 'number'
+  ) {
+    // An unknown or FUTURE `version` lands here, never in `absent`: a
+    // marker this build cannot interpret is still a marker, and a
+    // rollback from a later schema must not look like a fresh install.
+    return { kind: 'corrupt' };
+  }
+  // The anchor, if the property is there at all. `in` and not
+  // `=== undefined`, because JSON cannot encode `undefined`: a parsed
+  // object either carries the key or it does not, and that difference is
+  // the contract — absent means "pre-G-R1, back-fillable", invalid means
+  // "broken, hands off".
+  if ('user_id' in (parsed as object)) {
+    const anchor = (parsed as IdentityMarker).user_id;
+    if (typeof anchor !== 'string' || anchor.length === 0) {
+      return { kind: 'corrupt' };
+    }
+  }
+  return { kind: 'present', marker: parsed as IdentityMarker };
 }
 
-/** Reads the marker, collapsing "absent" and "malformed" into `null`.
- *  Kept for callers that only need the happy path — `markIdentityInitialized`
- *  runs exclusively on success paths where an identity is already known to
- *  exist. Decisions that could open the minting gate must use
- *  `readIdentityMarkerState` instead, which keeps the two apart. */
+/** Reads the marker, collapsing every non-`present` answer into `null`.
+ *
+ *  GC-AUTH-ANCHOR-MALFORMED-001 — NO PRODUCTION CODE CALLS THIS, and none
+ *  may. The collapse it performs IS the defect: it made `corrupt` and
+ *  `unreadable` indistinguishable from `absent`, and its one caller —
+ *  `markIdentityInitialized` — read that `null` as an empty slot and
+ *  overwrote the bytes, fabricating an anchor for whatever session was
+ *  live. That caller now reads `readIdentityMarkerState` directly.
+ *
+ *  Kept for diagnostics and for tests that only want the happy path. Any
+ *  decision about writing, minting or ownership uses
+ *  `readIdentityMarkerState`, which keeps the four answers apart. */
 export async function readIdentityMarker(): Promise<IdentityMarker | null> {
   const read = await readIdentityMarkerState();
   return read.kind === 'present' ? read.marker : null;
 }
 
 /**
- * Records that an identity exists on this device. Idempotent: an existing
- * marker is never overwritten, so `initialized_at` keeps pointing at the
- * FIRST identity we ever saw and `migrated_from_legacy` is not rewritten
- * by a later observation.
+ * The outcome of a marker write, as a discriminated union.
  *
- * Called from two places, both on the success path: right after a
- * successful `signInAnonymously()`, and after any `getSession()` that
- * yields a session (the back-fill that covers devices which already had a
- * live identity when this code shipped).
+ * GC-AUTH-ANCHOR-MALFORMED-001 — a union and not a struct, because a
+ * REFUSAL HAS NO MARKER TO REPORT and must not be able to pretend
+ * otherwise. Returning a fabricated marker object alongside
+ * `persisted: false` would be the same category error this finding is
+ * about, one layer up.
+ *
+ * `persisted` keeps its exact previous meaning, so the only consumer that
+ * reads it — `ensureIdentityMarkerDurable` — needs no change: a refusal
+ * reports `false` and the ownership gate stays shut. With corrupt bytes an
+ * identity demonstrably existed, but WHICH one is unknown, so the marker
+ * is not usable as the authority and `false` is the honest answer.
+ *
+ * What `persisted` means, and why the caller has to be able to see it:
+ *
+ *   `false` means an identity exists but nothing on disk records it.
+ *
+ *   GC-AUTH-MIGRATION-001 — this used to be swallowed. The comment that
+ *   stood here said a failed write "is not fatal for THIS run" because
+ *   "the back-fill will retry on the next boot". That is only true while
+ *   the session survives to the next boot. Once a durable negative seal
+ *   exists, the combination
+ *
+ *     mint succeeds → marker write fails → session later lost
+ *
+ *   reads, on the next boot, as marker-absent + seal-false + no session,
+ *   i.e. FIRST_IDENTITY — and mints a SECOND identity, silently orphaning
+ *   everything the first one uploaded. The caller has to be able to see
+ *   this and act on it.
  */
-export interface IdentityMarkWrite {
-  marker: IdentityMarker;
-  /**
-   * Whether the marker is now DURABLE. `false` means an identity exists
-   * but nothing on disk records it.
-   *
-   * GC-AUTH-MIGRATION-001 — this used to be swallowed. The comment that
-   * stood here said a failed write "is not fatal for THIS run" because
-   * "the back-fill will retry on the next boot". That is only true while
-   * the session survives to the next boot. Once a durable negative seal
-   * exists, the combination
-   *
-   *   mint succeeds → marker write fails → session later lost
-   *
-   * reads, on the next boot, as marker-absent + seal-false + no session,
-   * i.e. FIRST_IDENTITY — and mints a SECOND identity, silently orphaning
-   * everything the first one uploaded. The caller has to be able to see
-   * this and act on it.
-   */
-  persisted: boolean;
-}
+export type IdentityMarkWrite =
+  | {
+      persisted: true;
+      marker: IdentityMarker;
+      /** `created` wrote it just now; `existing` found it already there. */
+      source: 'created' | 'existing';
+    }
+  | {
+      persisted: false;
+      /** The marker we TRIED to write: storage refused it, we did not. */
+      marker: IdentityMarker;
+      reason: 'write_failed';
+    }
+  | {
+      persisted: false;
+      /**
+       * Nothing was read and NOTHING WAS WRITTEN. There is no marker to
+       * return and inventing one would repeat the defect.
+       */
+      marker: null;
+      reason: 'marker_corrupt' | 'marker_unreadable';
+    };
+
+/**
+ * Records that an identity exists on this device.
+ *
+ * IDEMPOTENT, AND NOW LITERALLY SO. An existing marker is never
+ * overwritten, so `initialized_at` keeps pointing at the FIRST identity we
+ * ever saw and `migrated_from_legacy` is not rewritten by a later
+ * observation.
+ *
+ * GC-AUTH-ANCHOR-MALFORMED-001 — that promise used to hold only for a
+ * marker this build could PARSE. The read went through
+ * `readIdentityMarker`, which collapsed `corrupt` and `unreadable` into
+ * the same `null` an empty slot produces, so unreadable bytes were
+ * replaced by a brand-new marker anchored to whatever session happened to
+ * be live — and since G-R1 that replacement fabricated the very field
+ * ownership depends on.
+ *
+ * SO THE RULE IS NOW EXACT: `setItem` happens if and only if the observed
+ * state is `absent`. `present` returns what is already there; `corrupt`
+ * and `unreadable` refuse without touching a byte.
+ *
+ * REFUSING IS THE PRESERVATION. Nothing in this app deletes the key, so
+ * declining to write leaves the original bytes verbatim — no salvage slot,
+ * no second durable key, nothing new to keep consistent.
+ *
+ * Called from the success paths where a session is already in hand: right
+ * after a successful `signInAnonymously()`, after any `getSession()` that
+ * yields one, and from the legacy stamp in
+ * `resolveIdentityInitializedUncached`.
+ */
 
 export async function markIdentityInitialized(
   /**
@@ -320,9 +426,23 @@ export async function markIdentityInitialized(
   userId: string | null,
   opts: { migratedFromLegacy?: boolean } = {},
 ): Promise<IdentityMarkWrite> {
-  const existing = await readIdentityMarker();
-  if (existing) return { marker: existing, persisted: true };
+  const read = await readIdentityMarkerState();
+  if (read.kind === 'present') {
+    return { persisted: true, marker: read.marker, source: 'existing' };
+  }
+  if (read.kind === 'unreadable' || read.kind === 'corrupt') {
+    // The one thing this function must never do. Metadata only: a reason,
+    // never the bytes, never an id.
+    console.log('GC_IDENTITY_MARK_REFUSED', { reason: read.kind });
+    return {
+      persisted: false,
+      marker: null,
+      reason:
+        read.kind === 'corrupt' ? 'marker_corrupt' : 'marker_unreadable',
+    };
+  }
 
+  // `absent`, and only `absent`, may create a marker.
   const marker: IdentityMarker = {
     version: IDENTITY_MARKER_VERSION,
     initialized_at: Date.now(),
@@ -339,9 +459,9 @@ export async function markIdentityInitialized(
     console.log('GC_IDENTITY_MARK_FAILED', {
       err: err instanceof Error ? err.message : String(err),
     });
-    return { marker, persisted: false };
+    return { persisted: false, marker, reason: 'write_failed' };
   }
-  return { marker, persisted: true };
+  return { persisted: true, marker, source: 'created' };
 }
 
 export type AnchorBackfillResult =
@@ -350,7 +470,11 @@ export type AnchorBackfillResult =
       anchored: false;
       reason:
         | 'no_marker'
-        | 'marker_malformed'
+        /** `getItem` threw: no bytes observed. */
+        | 'marker_unreadable'
+        /** Bytes observed that are not a valid marker — `user_id` present
+         *  but invalid among them. Never overwritten. */
+        | 'marker_corrupt'
         | 'migrated_from_legacy'
         | 'no_session_id'
         | 'recovery_entry_exists'
@@ -371,8 +495,14 @@ export type AnchorBackfillResult =
  * Every state where that argument fails is refused instead:
  *
  *   no marker            nothing to augment; creation handles that case
- *   malformed            "an identity existed, we cannot say which" — writing
- *                        an anchor here would invent the answer
+ *   unreadable           the slot could not be read at all; no bytes were
+ *                        observed, so nothing here is known
+ *   corrupt              "an identity existed, we cannot say which" — writing
+ *                        an anchor here would invent the answer. A `user_id`
+ *                        that is PRESENT BUT INVALID lands here too, decided
+ *                        by `readIdentityMarkerState`: present-but-invalid is
+ *                        not absent, so it is not eligible and not
+ *                        overwritable
  *   migrated_from_legacy the probe INFERRED the identity from traces and
  *                        recorded `sub_prefix: null` precisely because it did
  *                        not know which one. A later session does not prove
@@ -399,13 +529,23 @@ export async function backfillIdentityAnchor(
 
   const read = await readIdentityMarkerState();
   if (read.kind === 'absent') return { anchored: false, reason: 'no_marker' };
-  if (read.kind === 'malformed') {
-    return { anchored: false, reason: 'marker_malformed' };
+  if (read.kind === 'unreadable') {
+    return { anchored: false, reason: 'marker_unreadable' };
+  }
+  if (read.kind === 'corrupt') {
+    return { anchored: false, reason: 'marker_corrupt' };
   }
 
   const marker = read.marker;
   // WRITE-ONCE. An anchor that disagrees with this session is NOT corrected
   // here; the gate refuses the session instead.
+  //
+  // GC-AUTH-ANCHOR-MALFORMED-001 — this test is now exactly right without
+  // changing a character of it, because `present` guarantees the anchor is
+  // either an absent PROPERTY or a non-empty string. So `true` means
+  // genuinely anchored (and `anchored: true` is honest), while `false` can
+  // only mean the property is absent, i.e. a valid pre-G-R1 marker. An
+  // invalid value never reaches here: it is `corrupt` above.
   if (typeof marker.user_id === 'string' && marker.user_id.length > 0) {
     return { anchored: true, source: 'already_present' };
   }
@@ -615,9 +755,18 @@ export async function hasProvenIdentityEvidence(): Promise<boolean> {
  * why a re-ask can never mint over an identity.
  *
  * Malformed, unreadable and version-mismatched all collapse to `null`
- * here. That is deliberate and is the ONLY place in this module where a
- * collapse like that is allowed, because every one of those outcomes
- * leads to the same conservative action: ask the probe again.
+ * here. That is deliberate, and it is allowed because every one of those
+ * outcomes leads to the same conservative action: ask the probe again.
+ *
+ * This docstring used to claim it was "the ONLY place in this module where
+ * a collapse like that is allowed". That was already false when it was
+ * written — `readIdentityMarker` collapses the same way 400 lines above —
+ * and GC-AUTH-ANCHOR-MALFORMED-001 is what the contradiction was hiding:
+ * the collapse up there fed a WRITE decision, where the outcomes do NOT
+ * lead to the same action, and an unreadable marker got replaced. The
+ * difference is not the collapse, it is what the caller does with it.
+ * Here the answer is "re-ask", which is safe for all of them. There it
+ * was "write", which was not.
  */
 export async function readLegacyProbeSeal(): Promise<LegacyProbeSeal | null> {
   let raw: string | null;
@@ -737,8 +886,17 @@ export async function invalidateLegacyProbeSeal(): Promise<boolean> {
 export type IdentityInitializedSource =
   /** A well-formed marker. The authority. */
   | 'marker'
-  /** Something is in the marker slot but it does not parse. Conservative. */
-  | 'marker_malformed'
+  /**
+   * Bytes in the marker slot that are not a valid marker. Conservative:
+   * an identity existed here and we cannot say which, so minting stays
+   * shut. GC-AUTH-ANCHOR-MALFORMED-001 split this from `marker_unreadable`.
+   */
+  | 'marker_corrupt'
+  /**
+   * The marker slot could not be read at all. Same conservative answer,
+   * different fact: no bytes were observed, and the next read may work.
+   */
+  | 'marker_unreadable'
   /** No marker; a sealed migration answer decided it. */
   | 'seal'
   /**
@@ -770,9 +928,10 @@ export type IdentityInitializedSource =
  * Precedence, and why each step is where it is:
  *
  *   1. Marker present    → an identity was established. The authority.
- *   2. Marker malformed  → something wrote a marker once. Refuse to mint.
- *                          Checked BEFORE the seal so a sealed negative
- *                          can never wave a rotted marker through.
+ *   2. Corrupt or        → something wrote a marker once, or we could not
+ *      unreadable          find out. Either way, refuse to mint. Checked
+ *                          BEFORE the seal so a sealed negative can never
+ *                          wave a rotted marker through.
  *   3. Seal usable       → the migration question is already answered.
  *                          The probe is never consulted again.
  *   4. Otherwise         → ask the probe, seal the answer immediately.
@@ -876,14 +1035,17 @@ async function resolveIdentityInitializedUncached(): Promise<IdentityResolution>
       boundaryUnsealed: false,
     };
   }
-  if (read.kind === 'malformed') {
-    // Conservative on purpose. We cannot say WHICH identity this was, and
-    // we will not mint a replacement to make the unknown go away.
+  if (read.kind === 'corrupt' || read.kind === 'unreadable') {
+    // Conservative on purpose, and identically for both. We cannot say
+    // WHICH identity this was, and we will not mint a replacement to make
+    // the unknown go away. `initialized: true` is what keeps
+    // FIRST_IDENTITY — and therefore `signInAnonymously()` — shut.
     return {
       initialized: true,
       fromLegacyProbe: false,
       marker: null,
-      source: 'marker_malformed',
+      source:
+        read.kind === 'corrupt' ? 'marker_corrupt' : 'marker_unreadable',
       boundaryUnsealed: false,
     };
   }

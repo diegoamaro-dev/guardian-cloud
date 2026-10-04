@@ -534,7 +534,7 @@ describe('TEST_MARKER_ABSENT_IS_NOT_MARKER_MALFORMED', () => {
     expect(r.state).toBe('IDENTITY_DEGRADED');
     expect(r.minted).toBe(false);
     expect(signInAnonymously).not.toHaveBeenCalled();
-    expect(r.source).toBe('marker_malformed');
+    expect(r.source).toBe('marker_corrupt');
   });
 
   it('16. a sealed negative NEVER waves a malformed marker through', async () => {
@@ -551,19 +551,22 @@ describe('TEST_MARKER_ABSENT_IS_NOT_MARKER_MALFORMED', () => {
     expect(signInAnonymously).not.toHaveBeenCalled();
   });
 
-  it('16b. a marker of the wrong shape counts as malformed, not absent', async () => {
+  it('16b. a marker of the wrong shape counts as corrupt, not absent', async () => {
     store.set(IDENTITY_KEY, JSON.stringify({ version: 99, initialized_at: 1 }));
 
     const read = await readIdentityMarkerState();
-    expect(read.kind).toBe('malformed');
+    expect(read.kind).toBe('corrupt');
     expect((await bootstrapOnce({})).state).toBe('IDENTITY_DEGRADED');
   });
 
-  it('16c. an unreadable marker slot is malformed, never absent', async () => {
+  // GC-AUTH-ANCHOR-MALFORMED-001 made this test more precise rather than
+  // changing what it protects: a throw observed no bytes, which is a
+  // different fact from broken bytes, and neither is an absence.
+  it('16c. an unreadable marker slot is unreadable, never absent', async () => {
     mock.__failReads__.add(IDENTITY_KEY);
 
     const read = await readIdentityMarkerState();
-    expect(read.kind).toBe('malformed');
+    expect(read.kind).toBe('unreadable');
     expect((await bootstrapOnce({})).minted).toBe(false);
   });
 
