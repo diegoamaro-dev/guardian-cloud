@@ -40,6 +40,12 @@ import { supabase } from '@/auth/supabase';
 import { apiFetch, ApiError } from './client';
 import { type DestinationType } from './destinations';
 import { type SessionMode } from './history';
+import {
+  type ChunkMedium,
+  decideAssembly,
+  remuxPartsToMp4,
+  startsWithFtyp,
+} from '@/recording/mp4Remux';
 import { log, error } from '@/utils/log';
 
 /**
@@ -62,6 +68,16 @@ export interface ChunkMeta {
   size: number;
   status: 'pending' | 'uploaded' | 'failed';
   remote_reference: string | null;
+  /**
+   * G3'' — medium of THIS chunk's bytes, as the backend stores it.
+   *
+   * Already on the wire: `listChunksForSession` selects every column, so
+   * declaring it here reads a field the server has been sending, not a new
+   * contract. Optional, and NULL/absent means "not declared" — never
+   * "video". That semantics is the backend's, stated at the registration
+   * schema, and `decideAssembly` is the only thing allowed to interpret it.
+   */
+  media?: 'video' | 'audio' | null;
 }
 
 interface ListChunksResponse {
@@ -164,6 +180,12 @@ export interface ExportResult {
     | 'download_failed'
     | 'auth_failed'
     | 'cancelled'
+    /**
+     * The verified chunks could not be assembled into one artifact without
+     * making a claim the metadata does not support. Nothing was written.
+     * See `decideAssembly` for the two cases that produce it.
+     */
+    | 'assembly_refused'
     | null;
 }
 
@@ -545,6 +567,12 @@ export interface ChunkRef {
   chunk_index: number;
   hash: string;
   size: number;
+  /**
+   * Per-chunk medium, when the caller has it. The recovery exporter builds
+   * its refs from a manifest, which carries the same field; a v1 manifest
+   * has none, and that absence stays an absence.
+   */
+  media?: 'video' | 'audio' | null;
 }
 
 /**
@@ -657,6 +685,15 @@ export async function exportFromChunkRefs(
 
   const corruptIndexes: number[] = [];
   const accumulated: Uint8Array[] = [];
+  // EXPORT-MP4 · REMUX — what the assembly decision is made from. Collected
+  // here rather than re-derived later so it describes exactly the prefix that
+  // was downloaded AND hash-verified, not whatever the listing claimed.
+  const assembled: { chunk_index: number; media?: ChunkMedium | null }[] = [];
+  // Whether the chunks after the first each open their own MP4 container.
+  // Evaluated per chunk, never by scanning the joined bytes — an `ftyp`
+  // sequence can occur inside media data by chance, at offset 4 of a chunk it
+  // cannot.
+  let independentContainers = false;
   let validChunks = 0;
   // The chunk_index where we stopped concatenating (first gap, or
   // -1 if we made it all the way through). Surfaced in logs so an
@@ -672,6 +709,7 @@ export async function exportFromChunkRefs(
     | 'download_failed'
     | 'auth_failed'
     | 'cancelled'
+    | 'assembly_refused'
     | null =
     null;
   // Mirror of the container extension picked by the post-concat
@@ -783,6 +821,10 @@ export async function exportFromChunkRefs(
       }
 
       accumulated.push(bytes);
+      assembled.push({ chunk_index: idx, media: meta.media ?? null });
+      if (accumulated.length > 1 && startsWithFtyp(bytes)) {
+        independentContainers = true;
+      }
       validChunks += 1;
 
       log('EXPORT CHUNK DOWNLOADED', {
@@ -964,64 +1006,119 @@ export async function exportFromChunkRefs(
     };
   }
 
-  try {
-    // TODO(export-large): writing the whole file in one base64 blob holds
-    // the recording fully in memory (bytes + base64). For multi-hundred-MB
-    // sessions this will OOM. Move to an incremental append (e.g. the
-    // modern `FileSystem.File.write` stream API) when sessions get bigger.
-    const fullBytes = concatBytes(accumulated);
+  // EXPORT-MP4 · REMUX — WHICH assembly these bytes need, decided from the
+  // per-chunk `media` metadata and never from the session mode or the file
+  // extension. See `decideAssembly`.
+  const assembly = decideAssembly(assembled, independentContainers);
+  log('GC_EXPORT_ASSEMBLY', {
+    sessionId,
+    kind: assembly.kind,
+    reason: assembly.kind === 'refuse' ? assembly.reason : null,
+    chunks: assembled.length,
+    independentContainers,
+  });
 
-    // Decide the output extension. Two paths:
-    //
-    // (1) Video override: when the caller has told us this is a video
-    //     session, force '.mp4'. The byte-sniff cannot distinguish video
-    //     MP4 from audio M4A (both start with `ftyp`) and would otherwise
-    //     misclassify video as `.m4a`. Mode is the authoritative signal
-    //     for the container format; the sniff is only a fallback for when
-    //     the caller does not supply it.
-    //
-    // (2) Sniff fallback (audio path, unchanged from pre-video baseline):
-    //     - MP4/M4A: 'ftyp' FourCC at offset 4 (strict box-type position).
-    //     - AAC ADTS: sync word 0xFFF in bits 0-11 of the first two bytes;
-    //                 the mask `(byte[1] & 0xF6) === 0xF0` also asserts
-    //                 the two zero layer bits.
-    //     - Neither → '.bin' forensic dump, keeps the concat visible.
-    let extension: string;
-    let hasFtyp = false;
-    let hasAacSync = false;
-    if (mode === 'video') {
-      extension = '.mp4';
-    } else {
-      hasFtyp =
-        fullBytes.length >= 8 &&
-        fullBytes[4] === 0x66 &&
-        fullBytes[5] === 0x74 &&
-        fullBytes[6] === 0x79 &&
-        fullBytes[7] === 0x70;
-      hasAacSync =
-        fullBytes.length >= 2 &&
-        fullBytes[0] === 0xff &&
-        ((fullBytes[1] ?? 0) & 0xf6) === 0xf0;
-      extension = hasFtyp ? '.m4a' : hasAacSync ? '.aac' : '.bin';
-    }
-    filePath = `${docDir}${filenamePrefix}_${sessionId}${extension}`;
-    // Mirror to the function-scope variable so every return path
-    // (including the write_final catch below) can include it in the
-    // diagnostic payload. The narrowing is exhaustive — the assigns
-    // above only ever produce one of these four literals.
-    sniffedExtension = extension as '.aac' | '.m4a' | '.mp4' | '.bin';
-    log('EXPORT EXT SNIFF', {
+  if (assembly.kind === 'refuse') {
+    // FAIL CLOSED. The remote evidence and any local salvage are untouched;
+    // what is withheld is only this derived artifact, because producing it
+    // would assert something the metadata does not support.
+    error('EXPORT ASSEMBLY REFUSED', {
       sessionId,
-      extension,
-      mode,
-      hasFtyp,
-      hasAacSync,
+      reason: assembly.reason,
+      chunks: assembled.length,
+      independentContainers,
     });
+    return {
+      status: 'failed',
+      filePath: null,
+      totalChunks,
+      validChunks,
+      missingIndexes,
+      corruptIndexes,
+      extension: sniffedExtension,
+      stoppedAt,
+      stopReason: 'assembly_refused',
+    };
+  }
 
-    const fullBase64 = bytesToBase64(fullBytes);
-    await FileSystem.writeAsStringAsync(filePath, fullBase64, {
-      encoding: FileSystem.EncodingType.Base64,
-    });
+  try {
+    if (assembly.kind === 'remux') {
+      // Independent MP4 containers. Joining their bytes yields a file a
+      // player reads only to the first `moov`, so the samples are copied
+      // into one container instead — no re-encoding, every byte of media
+      // preserved, and the result is a DERIVED artifact whose hash matches
+      // none of the sources.
+      filePath = `${docDir}${filenamePrefix}_${sessionId}.mp4`;
+      sniffedExtension = '.mp4';
+      const report = await remuxPartsToMp4(sessionId, accumulated, filePath);
+      log('GC_EXPORT_REMUX_DONE', {
+        sessionId,
+        segments: report.segments,
+        durationUs: report.durationUs,
+        videoSamples: report.videoSamples,
+        audioSamples: report.audioSamples,
+        sizeBytes: report.sizeBytes,
+        method: report.method,
+      });
+    } else {
+      // TODO(export-large): writing the whole file in one base64 blob holds
+      // the recording fully in memory (bytes + base64). For multi-hundred-MB
+      // sessions this will OOM. Move to an incremental append (e.g. the
+      // modern `FileSystem.File.write` stream API) when sessions get bigger.
+      const fullBytes = concatBytes(accumulated);
+
+      // Decide the output extension. Two paths:
+      //
+      // (1) Video override: when the caller has told us this is a video
+      //     session, force '.mp4'. The byte-sniff cannot distinguish video
+      //     MP4 from audio M4A (both start with `ftyp`) and would otherwise
+      //     misclassify video as `.m4a`. Mode is the authoritative signal
+      //     for the container format; the sniff is only a fallback for when
+      //     the caller does not supply it.
+      //
+      // (2) Sniff fallback (audio path, unchanged from pre-video baseline):
+      //     - MP4/M4A: 'ftyp' FourCC at offset 4 (strict box-type position).
+      //     - AAC ADTS: sync word 0xFFF in bits 0-11 of the first two bytes;
+      //                 the mask `(byte[1] & 0xF6) === 0xF0` also asserts
+      //                 the two zero layer bits.
+      //     - Neither → '.bin' forensic dump, keeps the concat visible.
+      let extension: string;
+      let hasFtyp = false;
+      let hasAacSync = false;
+      if (mode === 'video') {
+        extension = '.mp4';
+      } else {
+        hasFtyp =
+          fullBytes.length >= 8 &&
+          fullBytes[4] === 0x66 &&
+          fullBytes[5] === 0x74 &&
+          fullBytes[6] === 0x79 &&
+          fullBytes[7] === 0x70;
+        hasAacSync =
+          fullBytes.length >= 2 &&
+          fullBytes[0] === 0xff &&
+          ((fullBytes[1] ?? 0) & 0xf6) === 0xf0;
+        extension = hasFtyp ? '.m4a' : hasAacSync ? '.aac' : '.bin';
+      }
+      filePath = `${docDir}${filenamePrefix}_${sessionId}${extension}`;
+      // Mirror to the function-scope variable so every return path
+      // (including the write_final catch below) can include it in the
+      // diagnostic payload. The narrowing is exhaustive — the assigns
+      // above only ever produce one of these four literals.
+      sniffedExtension = extension as '.aac' | '.m4a' | '.mp4' | '.bin';
+      log('EXPORT EXT SNIFF', {
+        sessionId,
+        extension,
+        mode,
+        hasFtyp,
+        hasAacSync,
+      });
+
+      const fullBase64 = bytesToBase64(fullBytes);
+      await FileSystem.writeAsStringAsync(filePath, fullBase64, {
+        encoding: FileSystem.EncodingType.Base64,
+      });
+    }
   } catch (err) {
     error('EXPORT ERROR', {
       sessionId,
