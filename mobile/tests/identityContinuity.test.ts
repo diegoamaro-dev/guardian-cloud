@@ -741,3 +741,223 @@ describe('GC-AUTH-ANCHOR-MALFORMED-001 · la composición, que es el corazón', 
     expect(isOwnershipGateOpen()).toBe(true);
   });
 });
+
+/**
+ * R1 — un hueco vacío no siempre es una primera identidad.
+ *
+ * `markIdentityInitialized()` creaba un marker anclado a la sesión viva en
+ * cuanto la ranura estaba vacía. Para una instalación limpia eso es
+ * correcto: el mint acaba de crear ese id, no hay nada que contradecir.
+ * Pero la ranura también puede estar vacía porque existió una identidad y
+ * su marker nunca aterrizó, y ahí anclar la sesión del momento es una
+ * conjetura vestida de hecho.
+ *
+ * `hasProvenIdentityEvidence()` distingue los dos casos **en un solo
+ * sentido**: lee si alguna identidad ya consiguió un chunk confirmado fuera
+ * del dispositivo desde este install, lo que no es falsificable en local
+ * —esa escritura necesitó un `OwnershipToken`, que necesitó un marker
+ * durable—. Es un VETO y sólo un veto: prueba que existió ALGUNA identidad,
+ * jamás cuál, y nunca autoriza a la sesión actual.
+ *
+ * Hoy la identidad equivocada no es alcanzable —la única ruta que instala
+ * sesión es el mint anónimo, que exige marker ausente—, pero eso es una
+ * propiedad de este build y es justo lo que elimina una entrada de
+ * recuperación. `BLOCKER BEFORE RECOVERY ENTRY`.
+ */
+describe('R1 · la evidencia previa veta el anclaje, y nada más', () => {
+  const QUEUE_KEY = 'test.pending_retry';
+
+  /** Un chunk confirmado fuera del dispositivo: necesitó un OwnershipToken. */
+  async function writeProvenEvidence(): Promise<void> {
+    storage.__store__.set(
+      QUEUE_KEY,
+      JSON.stringify([
+        {
+          session_id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+          session_completed: false,
+          chunks: [
+            { chunk_index: 0, status: 'uploaded', remote_reference: '1AbCdEf' },
+          ],
+        },
+      ]),
+    );
+  }
+
+  /** Rastros de captura local-first: NO prueban que nada saliera del móvil. */
+  async function writeUnprovenTraces(): Promise<void> {
+    storage.__store__.set(
+      QUEUE_KEY,
+      JSON.stringify([
+        {
+          session_id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+          session_completed: false,
+          chunks: [
+            { chunk_index: 0, status: 'pending', remote_reference: null },
+          ],
+        },
+      ]),
+    );
+  }
+
+  it('instalación limpia: sigue creando el ancla', async () => {
+    const w = await markIdentityInitialized(HISTORICAL);
+
+    expect(w).toMatchObject({ persisted: true, source: 'created' });
+    expect(w.marker?.user_id).toBe(HISTORICAL);
+  });
+
+  it('una cola SIN confirmación remota no veta: sigue creando el ancla', async () => {
+    await writeUnprovenTraces();
+
+    const w = await markIdentityInitialized(HISTORICAL);
+
+    expect(w).toMatchObject({ persisted: true, source: 'created' });
+    expect(w.marker?.user_id).toBe(HISTORICAL);
+  });
+
+  it('absent + evidencia previa + sesión viva: NO fabrica ancla', async () => {
+    await writeProvenEvidence();
+
+    expect(await markIdentityInitialized(HISTORICAL)).toEqual({
+      persisted: false,
+      marker: null,
+      reason: 'prior_identity_unverifiable',
+    });
+    expect(storage.__store__.has(IDENTITY_KEY)).toBe(false);
+  });
+
+  it('session_completed también cuenta como evidencia', async () => {
+    storage.__store__.set(
+      QUEUE_KEY,
+      JSON.stringify([{ session_id: 'x', session_completed: true, chunks: [] }]),
+    );
+
+    expect((await markIdentityInitialized(HISTORICAL)).persisted).toBe(false);
+    expect(storage.__store__.has(IDENTITY_KEY)).toBe(false);
+  });
+
+  it('la sesión candidata no se convierte en histórica, y no hay token', async () => {
+    await writeProvenEvidence();
+    const queueBefore = storage.__store__.get(QUEUE_KEY);
+    withSession(OTHER);
+
+    const own = await getOwnershipToken();
+
+    // Sin token, y por la razón honesta: el marker no es durable.
+    expect(own).toEqual({
+      ok: false,
+      reason: 'marker_not_durable',
+      name: null,
+    });
+    // Y sobre todo: OTHER no aparece en ninguna parte del almacenamiento.
+    expect(storage.__store__.has(IDENTITY_KEY)).toBe(false);
+    for (const v of storage.__store__.values()) {
+      expect(v).not.toContain(OTHER);
+    }
+    // La cola intacta, byte a byte, y nada borrado.
+    expect(storage.__store__.get(QUEUE_KEY)).toBe(queueBefore);
+    expect(AsyncStorage.removeItem).not.toHaveBeenCalled();
+    // Ninguna segunda identidad anónima.
+    expect(supabase.auth.signInAnonymously).not.toHaveBeenCalled();
+  });
+
+  it('la captura local sigue disponible: devuelve null sin lanzar', async () => {
+    await writeProvenEvidence();
+    withSession(OTHER);
+
+    await expect(getOwnershipAccessToken()).resolves.toBeNull();
+  });
+
+  it('reinicio tras un fallo de escritura: otra sesión no se adopta', async () => {
+    // Proceso 1: la identidad histórica existe, su marker NO llega a disco.
+    await writeProvenEvidence();
+    storage.__failWrites__.add(IDENTITY_KEY);
+    withSession(HISTORICAL);
+    expect((await markIdentityInitialized(HISTORICAL)).persisted).toBe(false);
+    expect(storage.__store__.has(IDENTITY_KEY)).toBe(false);
+
+    // Proceso 2: almacenamiento sano otra vez, pero la sesión es OTRA.
+    storage.__failWrites__.clear();
+    __resetOwnershipLatchForTests();
+    withSession(OTHER);
+
+    expect((await getOwnershipToken()).ok).toBe(false);
+    expect(storage.__store__.has(IDENTITY_KEY)).toBe(false);
+  });
+
+  it('P3 · el estampado legacy (userId null) NO se veta', async () => {
+    await writeProvenEvidence();
+
+    const w = await markIdentityInitialized(null, {
+      migratedFromLegacy: true,
+    });
+
+    expect(w.persisted).toBe(true);
+    expect(w.marker?.migrated_from_legacy).toBe(true);
+    expect(w.marker?.user_id).toBeUndefined();
+  });
+
+  it('G-R1 · un marker pre-G-R1 present sigue recibiendo back-fill', async () => {
+    // El veto vive en la rama `absent`. Un marker presente sin anclar no
+    // cambia de comportamiento, haya evidencia o no.
+    await writeProvenEvidence();
+    await writeMarker({
+      version: 1,
+      initialized_at: 123,
+      sub_prefix: 'abcdefff',
+      migrated_from_legacy: false,
+    });
+    withSession(HISTORICAL);
+
+    expect((await getOwnershipToken()).ok).toBe(true);
+    expect((await readIdentityMarker())?.user_id).toBe(HISTORICAL);
+    expect((await readIdentityMarker())?.initialized_at).toBe(123);
+  });
+
+  it('H1 · corrupt se sigue rechazando como corrupt, no como R1', async () => {
+    await writeProvenEvidence();
+    storage.__store__.set(IDENTITY_KEY, '{not json');
+
+    expect(await markIdentityInitialized(HISTORICAL)).toEqual({
+      persisted: false,
+      marker: null,
+      reason: 'marker_corrupt',
+    });
+  });
+
+  it('H1 · unreadable se sigue rechazando como unreadable', async () => {
+    await writeProvenEvidence();
+    storage.__failReads__.add(IDENTITY_KEY);
+
+    expect(await markIdentityInitialized(HISTORICAL)).toEqual({
+      persisted: false,
+      marker: null,
+      reason: 'marker_unreadable',
+    });
+  });
+
+  it('un marker ya anclado conserva su write-once', async () => {
+    await writeProvenEvidence();
+    await writeMarker({
+      version: 1,
+      initialized_at: 123,
+      sub_prefix: '11111111',
+      migrated_from_legacy: false,
+      user_id: HISTORICAL,
+    });
+    const before = storage.__store__.get(IDENTITY_KEY);
+
+    const w = await markIdentityInitialized(OTHER);
+
+    expect(w).toMatchObject({ persisted: true, source: 'existing' });
+    expect(storage.__store__.get(IDENTITY_KEY)).toBe(before);
+  });
+
+  it('una cola ilegible no veta: el veto falla a favor de lo anterior', async () => {
+    // `hasProvenIdentityEvidence()` devuelve false ante un JSON roto. Es un
+    // falso negativo deliberado: degrada a la conducta previa, no inventa.
+    storage.__store__.set(QUEUE_KEY, '{not json');
+
+    expect((await markIdentityInitialized(HISTORICAL)).persisted).toBe(true);
+  });
+});

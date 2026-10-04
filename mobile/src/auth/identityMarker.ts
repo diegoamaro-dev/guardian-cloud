@@ -383,7 +383,7 @@ export type IdentityMarkWrite =
        * return and inventing one would repeat the defect.
        */
       marker: null;
-      reason: 'marker_corrupt' | 'marker_unreadable';
+      reason: 'marker_corrupt' | 'marker_unreadable' | 'prior_identity_unverifiable';
     };
 
 /**
@@ -409,6 +409,13 @@ export type IdentityMarkWrite =
  * REFUSING IS THE PRESERVATION. Nothing in this app deletes the key, so
  * declining to write leaves the original bytes verbatim — no salvage slot,
  * no second durable key, nothing new to keep consistent.
+ *
+ * R1 — AND AN EMPTY SLOT IS NOT ALWAYS A FIRST IDENTITY. Where the device
+ * still holds durable proof that some identity already put evidence in the
+ * cloud from this install, an absent marker means "it existed and its
+ * marker never landed", not "nobody was ever here". Anchoring the live
+ * session there would fabricate the answer, so it is refused. See the veto
+ * below for why this cannot affect a clean first install.
  *
  * Called from the success paths where a session is already in hand: right
  * after a successful `signInAnonymously()`, after any `getSession()` that
@@ -442,7 +449,49 @@ export async function markIdentityInitialized(
     };
   }
 
-  // `absent`, and only `absent`, may create a marker.
+  // `absent`, and only `absent`, may create a marker — and R1 narrows
+  // even that.
+  //
+  // R1 — DO NOT INVENT AN ANCHOR FOR A SESSION NOBODY CAN VOUCH FOR.
+  //
+  // An empty slot normally means a first identity, and anchoring the live
+  // session is then correct: the mint created that id a moment ago, so
+  // there is nothing it could contradict. But an empty slot can also mean
+  // an identity existed here and its marker never landed — and in THAT
+  // state anchoring the live session is a guess dressed as a fact.
+  //
+  // `hasProvenIdentityEvidence()` tells the two apart, in one direction
+  // only. It reads whether some identity already got a chunk confirmed
+  // off-device from this install, which is unfakeable locally: that write
+  // needed an `OwnershipToken`, which needed a durable marker. So a clean
+  // install CANNOT satisfy it — the dependency is circular and the circle
+  // never closes — and FIRST_IDENTITY is untouched.
+  //
+  // IT IS A VETO AND ONLY A VETO. It proves that AN identity existed, never
+  // WHICH, and it must never be read as positive proof of ownership. Its
+  // false negatives are the safe direction: a reaped queue loses the proof
+  // and we simply fall back to the previous behaviour. A false positive
+  // only ever closes a door.
+  //
+  // Scoped to `userId != null` on purpose. The legacy stamp passes null —
+  // it writes no anchor and claims nothing — and vetoing that would break
+  // the GC-AUTH-MIGRATION-001 path outright.
+  //
+  // NOT CURRENTLY REACHABLE with a wrong identity: the only route that
+  // installs a session is the anonymous mint, which requires an absent
+  // marker. That is a property of this build, not of the design, and it is
+  // exactly what a recovery entry removes. Hence: fail closed now.
+  if (userId !== null && (await hasProvenIdentityEvidence())) {
+    console.log('GC_IDENTITY_MARK_REFUSED', {
+      reason: 'prior_identity_unverifiable',
+    });
+    return {
+      persisted: false,
+      marker: null,
+      reason: 'prior_identity_unverifiable',
+    };
+  }
+
   const marker: IdentityMarker = {
     version: IDENTITY_MARKER_VERSION,
     initialized_at: Date.now(),
