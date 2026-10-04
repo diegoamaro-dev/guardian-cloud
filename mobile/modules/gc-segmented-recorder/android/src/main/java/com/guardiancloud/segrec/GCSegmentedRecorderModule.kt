@@ -4,6 +4,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
+import expo.modules.kotlin.exception.CodedException
 import expo.modules.kotlin.modules.Module
 import expo.modules.kotlin.modules.ModuleDefinition
 import java.io.File
@@ -183,6 +184,27 @@ class GCSegmentedRecorderModule : Module() {
      */
     Function("getState") {
       coordinator?.state?.name ?: GateState.IDLE.name
+    }
+
+    /**
+     * EXPORT-MP4 · REMUX — assembles closed segments into one playable `.mp4`.
+     *
+     * Deliberately NOT part of capture. It reads files that are already
+     * closed, takes no lock, touches no coordinator, no generation token and
+     * no session state, and is indifferent to whether a capture is running:
+     * an export must never be able to disturb one.
+     *
+     * Refusals arrive as a rejected promise carrying the reason code, never as
+     * a half-written file — [SegmentRemuxer] deletes a partial output before
+     * raising. The caller cannot mistake a refusal for a result.
+     */
+    AsyncFunction("remuxSegmentsToMp4") { inputPaths: List<String>, outputPath: String ->
+      try {
+        SegmentRemuxer.remux(inputPaths, outputPath)
+      } catch (e: SegmentRemuxer.RemuxRefused) {
+        Log.w(TAG, "GC_REMUX_REFUSED reason=${e.reason} ${e.message}")
+        throw CodedException("ERR_REMUX_${e.reason.uppercase()}", e.message, e)
+      }
     }
 
     OnDestroy { stopCapture() }

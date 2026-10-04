@@ -48,6 +48,21 @@ export type NativeCleanupResult =
   | 'SESSION_ID_INVALID'
   | 'DIR_UNAVAILABLE';
 
+/**
+ * What a successful remux reports. `method` names HOW the timeline was
+ * rebuilt, so a later reader is not left to assume it.
+ */
+export type NativeRemuxReport = {
+  segments: number;
+  durationUs: number;
+  videoSamples: number;
+  audioSamples: number;
+  sizeBytes: number;
+  /** Session-relative start of each segment on the output timeline, in µs. */
+  offsetsUs: number[];
+  method: string;
+};
+
 export type NativeCleanupOutcome = {
   result: NativeCleanupResult;
   /** Files removed by this call. */
@@ -82,6 +97,28 @@ type GCSegmentedRecorderModuleType = {
   cleanupCompletedSession(sessionId: string): Promise<NativeCleanupOutcome>;
   /** Diagnostic read of the coordinator state machine. */
   getState(): string;
+  /**
+   * Assembles closed segments into ONE playable `.mp4`, copying compressed
+   * samples without re-encoding.
+   *
+   * Not part of capture: it reads files that are already closed, takes no
+   * lock and touches no session state, so it cannot disturb a running
+   * capture.
+   *
+   * `inputPaths` MUST already be in `chunk_index` order and contiguous. The
+   * native side cannot verify that — a segment is rebased to its own origin
+   * and carries nothing that says where it sat in the session — so a
+   * shuffled set is assembled without complaint. Order is the caller's
+   * contract.
+   *
+   * Rejects with `ERR_REMUX_<REASON>` on anything inconsistent, having
+   * deleted the partial output first: a refusal never leaves a file that
+   * could pass for a finished export.
+   */
+  remuxSegmentsToMp4(
+    inputPaths: string[],
+    outputPath: string,
+  ): Promise<NativeRemuxReport>;
   addListener<K extends keyof GCSegmentedRecorderEvents>(
     event: K,
     listener: GCSegmentedRecorderEvents[K],
