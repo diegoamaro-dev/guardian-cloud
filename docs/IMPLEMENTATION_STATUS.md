@@ -8,12 +8,12 @@
 | Producto usado para la revalidación de `GC-DEST-PAUSE-001` | **`22a9b26`** (APK release `2b3be062…`) |
 | Producto usado para la validación de `GC-START-LATENCY-001` | **`e643b01`** (APK release `1cb80fea…`) |
 | Producto usado para la validación de **D3 local segment salvage** | **`cb59c7e`** (APK release `8151c338…`) |
-| Última suite automática registrada | **2026-10-03**, sobre el árbol del gate **E1-BENCH-OAUTH-SCHEME** medido antes de commitearlo — **1021/1021 en 47 ficheros** · typecheck **12 errores heredados, cero nuevos**. Cortes anteriores ya anclados: 1014/1014 tras **`b1f73aa`** y 1007/1007 tras **`ccbf4fa`**. Esta cifra se anclará a su hash cuando el gate quede commiteado |
+| Última suite automática registrada | **2026-10-04**, anclada a **`39d6d059ee4d55ae307d96f29be75913bdcb3ecd`** — **1040/1040 en 48 ficheros** · typecheck **12 errores heredados, cero nuevos**, por tanto **NO** verde. Cortes anteriores ya anclados: **1021/1021 en 47 ficheros** el 2026-10-03 sobre el árbol del gate **E1-BENCH-OAUTH-SCHEME** medido antes de commitearlo, 1014/1014 tras **`b1f73aa`** y 1007/1007 tras **`ccbf4fa`** |
 | Aislamiento de build y de proyecto Supabase | **`ccbf4fa`** — ver [la sección propia](#aislamiento-de-build-e1--android-y-proyecto-supabase) |
 
 > Las fechas y los commits son distintos a propósito, y no deben fundirse. La
-> suite vigente —958/958 en 43 ficheros— se midió sobre el árbol posterior a
-> `eb86340`; las tres validaciones de hardware se hicieron en dispositivo, no
+> suite vigente —1040/1040 en 48 ficheros— se midió sobre el árbol de
+> `39d6d05`; las tres validaciones de hardware se hicieron en dispositivo, no
 > corriendo la suite, y cada una sobre **su propio APK**:
 > `GC-DEST-PAUSE-001` sobre `22a9b26`, `GC-START-LATENCY-001` sobre `e643b01` y
 > **D3** sobre `cb59c7e`. **Ninguna cifra de tests describe un APK.**
@@ -542,8 +542,12 @@ Demostrado **sólo por pruebas automáticas**, pendiente de hardware:
 
 ## Findings abiertos de identidad, destino y herramientas
 
-Ocho findings registrados entre el 20/08 y el 24/08. **Ninguno está CLOSED
-salvo donde se indica explícitamente.** Los estados de §1–§6 son los de
+**Nueve findings.** Los **ocho** originales se registraron entre el 20/08 y el
+24/08. El **noveno** —`GC-AUTH-ANCHOR-MALFORMED-001`— se registró el
+**2026-10-04**, durante la revisión adversarial de G-R1, **fuera de esa
+ventana**. **Ninguno está CLOSED salvo donde se indica explícitamente.**
+Esta tabla es la **única** fuente de estado de los nueve: no existe una
+segunda tabla ni un registro paralelo. Los estados de §1–§6 son los de
 [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md). `GC-START-LATENCY-001` **ya tiene
 registro propio** desde el 24/08 —§6—; sólo `GC-DEST-STATUS-001` sigue
 proviniendo de una ficha de evidencia congelada fuera del repositorio.
@@ -557,6 +561,7 @@ proviniendo de una ficha de evidencia congelada fuera del repositorio.
 | `HARDWARE REVALIDATION REQUIRED` | Corregido en código; la corrida física que lo cerraría no se ha completado |
 | `HARDWARE REVALIDATED` | Una corrección ya implementada ha sido **reejecutada y revalidada con éxito en dispositivo real**, con evidencia fechada. Se escribe junto a `FIXED IN CODE`, no en su lugar |
 | `OPEN` | Observado y caracterizado. **Sin corregir** |
+| `IMPLEMENTED / TESTED` | Capacidad implementada y cubierta por pruebas automáticas. **No** implica validación en hardware, ni cierre del finding o del producto asociado. **No es `FIXED IN CODE`**: se reserva para una capacidad o garantía **añadida**, no para la corrección de un finding |
 
 > **`HARDWARE REVALIDATED` no es `CLOSED IN HARDWARE`.** En el segundo, el
 > dispositivo **reprodujo** el fallo y luego verificó su corrección: el ciclo
@@ -573,10 +578,11 @@ proviniendo de una ficha de evidencia congelada fuera del repositorio.
 | **GC-DEV-RESET-001** | RELEASE BLOCKER · `FIXED IN CODE` / revalidación hardware **no requerida** | `e289dcb` | El defecto es de política de borrado, demostrable en pruebas. 62 tests en `devResetGuard.test.ts` |
 | **GC-DEST-PAUSE-001** | `FIXED IN CODE` / **`HARDWARE REVALIDATED`** | `3fae4f6` | Revalidado el 24/08 como **cross-build durable-state recovery validation**: la pausa la escribió el build `34412a0`-era y la retiró producto `22a9b26`. Reconexión real por OAuth → pausa retirada → 10/10 chunks con referencias remotas distintas → `/complete` → cleanup, en ese orden. Identidad estable (`08c0875e`). La corrida del 21/08 había quedado **anulada** por GC-DEV-RESET-001. Detalle en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §3 |
 | **GC-AUTH-001** | `FIXED IN CODE` · ruta de identidad **PASS en hardware** · flujo extremo a extremo **no alcanzado** | `ad8756b`…`8615ba6`, integrados en `e215e5c` | La Vía 2 del 21/08 dio `Identity PASS` y `Registration PASS`, pero `Upload BLOCKED`, `Completion NOT REACHED` y `Cleanup NOT EXECUTED`. **No es un cierre** |
-| **GC-AUTH-SESSION-RECOVERY-001** | **`OPEN`** · prevención **validada en banco** · **evidencia incidental en hardware** · **validación dirigida en dispositivo PENDIENTE**; supervivencia (D3) **`HARDWARE FUNCTIONAL PASS`**; primitiva de identidad recuperable **`PASS / OBSERVADO EN PoC DESECHABLE`** (2026-09-16), **integración PARCIAL**: `2cef552` publicó la vinculación diferida de email (E1); la **entrada por OTP y la reconexión con la evidencia pendiente siguen NO IMPLEMENTADAS** | D0 `02551a1`+`34412a0` · D2-B `08e3cd2` · D2-C `22a9b26` · D3 `cb59c7e` | Tras una ventana offline prolongada la sesión de Supabase desaparecía y 87 chunks quedaron sin poder subirse (22/08). **D2-B** (upgrade a 2.112.3) corrige la destrucción ante `500` / `502` / `525-529` y añade proactive-preserve y un cooldown de 60 s. **D2-C** clasifica `429` en el refresh como reintentable; todo lo demás hace pass-through fail-closed. **D3** es de otra naturaleza: no previene nada, da **salida local** a la evidencia de vídeo nativo segmentado que ya quedó varada. Validado en hardware el 24/08 (OnePlus A6000, modo avión, 12/12 segmentos, `status: complete`). **Ninguna de las tres cierra el finding**: la identidad sigue sin recuperarse, la subida sigue sin reanudarse y el ownership sigue sin restaurarse. El 2026-09-16 pasó, en un proyecto Supabase desechable, la **primitiva** de la prevención elegida: un usuario anónimo con email vinculado y sin ninguna sesión vuelve a entrar por OTP y recupera **el mismo `user.id`**. **Tampoco cierra el finding**: lo único integrado en la app es pedir y enviar la vinculación del email —`2cef552`, implementado y con pruebas unitarias, **nunca validado**—; no hay entrada por OTP, no se ha probado contra producción y no recupera identidades ya perdidas. Detalle en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §5 |
+| **GC-AUTH-SESSION-RECOVERY-001** | **`OPEN`** · prevención **validada en banco** · **evidencia incidental en hardware** · **validación dirigida en dispositivo PENDIENTE**; supervivencia (D3) **`HARDWARE FUNCTIONAL PASS`**; primitiva de identidad recuperable **`PASS / OBSERVADO EN PoC DESECHABLE`** (2026-09-16), **integración PARCIAL**: `2cef552` publicó la vinculación diferida de email (E1); la **entrada por OTP y la reconexión con la evidencia pendiente siguen NO IMPLEMENTADAS**; continuidad de ownership **`IMPLEMENTED / TESTED`** / **`NOT HARDWARE VALIDATED`** desde el 2026-10-04 | D0 `02551a1`+`34412a0` · D2-B `08e3cd2` · D2-C `22a9b26` · D3 `cb59c7e` · continuidad `39d6d05` | Tras una ventana offline prolongada la sesión de Supabase desaparecía y 87 chunks quedaron sin poder subirse (22/08). **D2-B** (upgrade a 2.112.3) corrige la destrucción ante `500` / `502` / `525-529` y añade proactive-preserve y un cooldown de 60 s. **D2-C** clasifica `429` en el refresh como reintentable; todo lo demás hace pass-through fail-closed. **D3** es de otra naturaleza: no previene nada, da **salida local** a la evidencia de vídeo nativo segmentado que ya quedó varada. Validado en hardware el 24/08 (OnePlus A6000, modo avión, 12/12 segmentos, `status: complete`). **Ninguna de las tres cierra el finding**: la identidad sigue sin recuperarse, la subida sigue sin reanudarse y el ownership sigue sin restaurarse. El 2026-09-16 pasó, en un proyecto Supabase desechable, la **primitiva** de la prevención elegida: un usuario anónimo con email vinculado y sin ninguna sesión vuelve a entrar por OTP y recupera **el mismo `user.id`**. **Tampoco cierra el finding**: lo único integrado en la app es pedir y enviar la vinculación del email —`2cef552`, implementado y con pruebas unitarias, **nunca validado**—; no hay entrada por OTP, no se ha probado contra producción y no recupera identidades ya perdidas. El 2026-10-04, `39d6d059ee4d55ae307d96f29be75913bdcb3ecd` añadió la **puerta de continuidad de ownership**: `gc.identity.v1` gana `user_id` —el `user.id` completo, write-once— y `getOwnershipToken()` no emite ningún `OwnershipToken` si el `user.id` de la sesión viva no es byte a byte el anclado; la **ausencia de ancla NO es coincidencia**, y `sub_prefix` no decide nada. Queda **`IMPLEMENTED / TESTED`** —suite 1040/1040 en 48 ficheros el 2026-10-04— y **`NOT HARDWARE VALIDATED`**. **No cierra este finding, ni total ni parcialmente**: es una **precondición de seguridad para la futura recuperación**, no recuperación. La identidad perdida **sigue sin poder recuperarse** y el recovery por OTP sigue **NOT IMPLEMENTED**. Detalle en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §5 |
 | **GC-START-LATENCY-001** | `FIXED IN CODE` / **`HARDWARE VALIDATED`** | producto `e643b01` · guardas de test `3c10994` | `startRecording` esperaba a `getOwnershipAccessToken()` antes de abrir la grabadora, y esa ruta de auth **no lleva timeout en ninguna capa**. La lectura se movió dentro de `sessionCreatePromise`, que no se espera antes del productor. Validado en hardware el 24/08 en dos escenarios: **remoto vivo** — 531 ms tap→productor, 163 ms de lógica propia, 28/29 fragmentos confirmados **antes** de PARAR — y **token caducado + modo avión** — 243 ms tap→productor, 102 ms de lógica propia, con auth resolviendo **10,72 s después** de que el productor ya grababa. **auth no se volvió rápida: dejó de bloquear START.** Recuperación tras restaurar red: mismo `localSessionId`, 1 `POST /sessions`, 77/77 confirmados, cleanup posterior a `http_200`. Detalle en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §6 |
 | **GC-DEST-STATUS-001** | **`OPEN`** · defecto de **backend** | — | Ningún camino de código escribe `revoked` ni `error`. Un destino Drive con refresh token revocado sigue reportándose `connected`. Ver [`API_SPEC.md`](./API_SPEC.md#estado-de-los-destinos--defecto-abierto) |
 | **GC-AUTH-RETRY-CLASSIFICATION-001** | **causa suficiente demostrada** · relación causal con el 22/08 **no probada** | banco `9d682bc` · D2-B `08e3cd2` · D2-C `22a9b26` | Dejó de ser estático: el banco reproduce de forma determinista que un `429` / `500` en el refresh destruye una credencial **intacta** (`refresh_present: true`). Corregido para `500` por D2-B y para `429` por D2-C. **Sigue sin demostrarse** que el incidente del 22/08 fuera uno de esos dos: la respuesta nunca se capturó |
+| **GC-AUTH-ANCHOR-MALFORMED-001** | **`OPEN`** · `PREEXISTING` · **`BLOCKER BEFORE RECOVERY ENTRY`** | — · sin corregir | **Noveno finding, registrado el 2026-10-04** en la revisión adversarial de G-R1, no en la ventana 20/08–24/08. `readIdentityMarker()` colapsa `malformed` en `null` para los callers del camino feliz, y `markIdentityInitialized()` **sustituye** un marker ilegible, de modo que desde G-R1 la sustitución fabrica además un `user_id` anclado a la sesión del momento. **Hoy no se ha demostrado emisión para una identidad incorrecta**, y por una única razón: este build **no tiene una segunda ruta de sesión** —no existen `signInWithOtp`, `verifyOtp` ni `setSession()`, y `signInWithPassword()` no tiene caller—. Esa razón desaparece con la primera entrada de recuperación, así que **bloquea abrirla en G-R2/G-R3**. **No implica pérdida de `GC_QUEUE` ni de evidencia.** Fijado por test en `mobile/tests/identityContinuity.test.ts` sin corregirlo. Detalle en [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §5 |
 
 ### Consecuencia sobre el veredicto
 
@@ -613,16 +619,37 @@ asimetría es deuda documental conocida, no un descuido de este documento.
 
 ### Validación automática actual
 
-Ejecutada el 2026-08-31 sobre el árbol posterior a `eb86340`.
+Ejecutada el **2026-10-04** sobre el árbol de
+`39d6d059ee4d55ae307d96f29be75913bdcb3ecd`.
 
 | Comprobación | Resultado |
 |---|---|
-| Suite completa | **958/958**, en **43 ficheros** |
-| Typecheck | **12 errores TypeScript históricos, cero nuevos** — typecheck **NO** verde |
+| Suite completa | **1040/1040**, en **48 ficheros** |
+| Typecheck | **12 errores TypeScript heredados, cero nuevos** — typecheck **NO** verde |
 | `git diff --check` | Limpio |
 
-> **La cifra reconcilia dos incrementos, no uno.** El salto desde la anterior
-> registrada no es atribuible a un solo commit:
+> **Lo atribuible y lo no atribuible.** El salto desde el corte anterior no es
+> de un solo commit, y este documento sólo acredita la parte que midió:
+>
+> ```
+>  958 / 43   corte del 2026-08-31, tras eb86340
+> 1007        medido tras ccbf4fa          ← cortes que este documento
+> 1014        medido tras b1f73aa            ya tenía anclados
+> 1021 / 47   medido el 2026-10-03, árbol del gate E1-BENCH-OAUTH-SCHEME
+>  +19 / +1   39d6d05 — identityContinuity.test.ts, la aportación COMPLETA
+>             de G-R1: la actualización de los dos contratos antiguos
+>             (identityBootstrap, ownershipGate) sustituyó aserciones y
+>             NO añadió ningún test
+> 1040 / 48   medido el 2026-10-04 sobre 39d6d05
+> ```
+>
+> Del tramo 958 → 1021 este documento conserva los cortes intermedios que ya
+> había anclado, pero **no atribuye esos incrementos a commits concretos**:
+> «medido tras X» significa medido después de X, no aportado por X. El único
+> incremento atribuido es el de G-R1.
+
+> **El corte de 958/43 reconciliaba a su vez dos incrementos, no uno**, y esa
+> cuenta se conserva tal como se registró el 2026-08-31:
 >
 > ```
 > 936 / 42   corte anterior de este documento, tras fc9a20e
@@ -632,7 +659,8 @@ Ejecutada el 2026-08-31 sobre el árbol posterior a `eb86340`.
 > ```
 
 > Cortes anteriores: **360/360** el 20/08, **781/781 en 40 ficheros** el 23/08
-> sobre `34412a0` y **792/792 en 41 ficheros** el 24/08 tras `3c10994`. El
+> sobre `34412a0`, **792/792 en 41 ficheros** el 24/08 tras `3c10994` y
+> **958/958 en 43 ficheros** el 2026-08-31 sobre `eb86340`. El
 > fichero 41 es `startLatencyDecoupling.test.ts`, que aportó 11 tests entre
 > `e643b01` y `3c10994`. El fichero 42 es `localAssembly.test.ts`, que aportó
 > los 108 tests de D3 en `cb59c7e`. Del resto de incrementos históricos **no hay

@@ -22,6 +22,36 @@ el alcance de su evidencia. El estado vigente se reconstruye desde:
 > ese bloque**. La tabla completa está en
 > [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md#findings-abiertos-de-identidad-destino-y-herramientas).
 
+### Lo que cambió el 2026-10-04
+
+Una sesión de Supabase válida ya **no basta** para crear propiedad remota sobre
+la evidencia. `39d6d05` ancla en `gc.identity.v1` el `user.id` completo de la
+identidad histórica —campo `user_id`, write-once— y `getOwnershipToken()` deja
+de emitir cualquier `OwnershipToken` si el `user.id` de la sesión viva no es
+byte a byte el anclado. **La ausencia de ancla no cuenta como coincidencia**, y
+`sub_prefix` sigue siendo diagnóstico: no decide nada.
+
+Nivel de evidencia, sin ascender: **`IMPLEMENTED / TESTED`** —suite móvil
+**1040/1040 en 48 ficheros**, typecheck en 12 errores heredados y cero nuevos,
+por tanto **NO** verde— y **`NOT HARDWARE VALIDATED`**: esta capacidad no se ha
+ejercitado en ningún dispositivo.
+
+**Lo que NO cambió**, y conviene no leer de más:
+
+* **`GC-AUTH-SESSION-RECOVERY-001` sigue `OPEN`.** G-R1 no lo cierra ni total
+  ni parcialmente: establece una **precondición de seguridad para la futura
+  recuperación**. La identidad perdida **sigue sin poder recuperarse**.
+* **El recovery por OTP sigue `NOT IMPLEMENTED`.** No existen `signInWithOtp`
+  ni `verifyOtp` en el código.
+* **`GC-AUTH-ANCHOR-MALFORMED-001` queda abierto** —noveno finding del bloque
+  de identidad, registrado ese mismo día—: un marker ilegible se sustituye y
+  la sesión del momento pasa a ser el ancla. Es **preexistente** y
+  **`BLOCKER BEFORE RECOVERY ENTRY`**: mientras siga abierto, G-R2 y G-R3 **no
+  pueden abrir una entrada de recuperación**. Registro en
+  [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §5; estado por capacidad en
+  [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md#findings-abiertos-de-identidad-destino-y-herramientas).
+* El sistema sigue **NO APTO PARA RELEASE**.
+
 ### Lo que cambió el 2026-10-03
 
 Un build de **banco** y uno de **producción** ya no pueden confundirse ni
@@ -95,9 +125,10 @@ La cifra de esa tabla —**936 tests móviles en 42 ficheros**— es la del cort
 2026-08-27, medida sobre el mismo objeto `tree` de `mobile/` que publica
 `main@63099d8`. **Ya no es la vigente**: la cifra actual la fija
 [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md), y en el corte del
-2026-10-03, tras `ccbf4fa`, es **1007/1007 en 47 ficheros**. El typecheck sigue
-en 12 errores heredados. La medición anterior, del 2026-08-26 tras `fc9a20e`, dio la
-misma cifra. Los **cortes históricos anteriores** fueron 900/900 en 42 ficheros
+**2026-10-04**, anclado a `39d6d05`, es **1040/1040 en 48 ficheros**. El
+typecheck sigue en 12 errores heredados, por tanto **NO** verde. La medición
+del 2026-08-26 tras `fc9a20e` dio la misma cifra que la de esta tabla. Los
+**cortes históricos anteriores** fueron 1007/1007 tras `ccbf4fa`, 900/900 en 42 ficheros
 tras `cb59c7e` y 792/792 en 41 ficheros tras `3c10994`, y ninguno describe ya
 la suite actual. El fichero 41 era `startLatencyDecoupling.test.ts`, que aportó
 11 tests; el fichero 42 es `localAssembly.test.ts`, que aporta los 108 tests de
