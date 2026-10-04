@@ -1797,6 +1797,103 @@ producción.
 
 ---
 
+### H-2 · el OTP por correo, desbloqueado y verificado en banco (2026-10-04)
+
+```
+H-2 = PASS CON LÍMITES   (2026-10-04)
+```
+
+**Sólo BANCO**, en `guaria-auth-test`. **Producción NO se tocó**: ni SMTP, ni
+plantillas, ni ajustes, ni usuarios.
+
+Lo que desbloqueó la precondición registrada el 2026-09-24 —la plantilla no
+imprimía `{{ .Token }}` y su edición estaba bloqueada— fue configuración manual
+del operador, no código:
+
+- **Custom SMTP con Resend**, con `guardiancloud.app` **verificado**, remitente
+  `noreply@guardiancloud.app`;
+- plantilla **`Magic link or OTP`** modificada para contener **`{{ .Token }}`**,
+  con **`{{ .ConfirmationURL }}` eliminado** — correo **OTP-only**, sin enlace
+  accionable;
+- **OTP de 8 dígitos / 3600 s**.
+
+El registro del 2026-09-24 **no se reescribe**: conserva su fecha y su alcance.
+Lo que esta entrada añade es que esa precondición **ya no bloquea en banco**.
+
+#### La corrida prospectiva
+
+**Sujeto: `dfeeb771-5e5b-45f1-8950-43baec55629b`.** Se nombra explícitamente
+porque **no es el identificador que este documento tenía escrito**, y conviene
+que conste: la evidencia de H-2 **no se apoya en ningún id registrado antes de
+esa sesión de trabajo**. Se eligió por ser el único cuyo buzón está bajo
+control, que es lo que hace la prueba ejecutable.
+
+**La propiedad del email sobre ese `user.id` se demostró ANTES**, por lectura de
+sólo lectura de `auth.users`. Y el **criterio del `user.id` quedó fijado antes
+de emitir el OTP**, en una variable de entorno que el propio script compara: la
+comparación no la hizo el ojo del operador después de ver el resultado.
+
+| Paso | Observado |
+|---|---|
+| `signInWithOtp({ shouldCreateUser: false })` | **sin error** |
+| correo recibido | remitente y asunto correctos · **código de 8 dígitos** · **sin botón ni enlace de autenticación** |
+| OTP introducido | **sin eco en pantalla**, 8 caracteres, sólo en la máquina del operador |
+| `verifyOtp({ type: 'email' })` | **sin error** |
+| `user.id` devuelto | **`dfeeb771-5e5b-45f1-8950-43baec55629b`** — exacto |
+| `is_anonymous` | **`false`** |
+| sesión | **presente** |
+| comparación | **`MATCH`** |
+
+Una sola emisión y una sola verificación, sin reintentos ni fallback, con
+`persistSession`, `autoRefreshToken` y `detectSessionInUrl` desactivados, y con
+`@supabase/supabase-js` 2.112.3 —la versión de la app—. Script **fuera del
+repositorio**. No se registran OTP, direcciones de correo, tokens ni claves.
+
+#### Observaciones que NO cuadraron con lo predicho, sin reinterpretar
+
+Dos comprobantes accesorios fallaron. Ninguno sostenía la prueba, y se registran
+tal cual:
+
+- **`auth.one_time_tokens` para el sujeto = 0 filas** tras la verificación. Se
+  había predicho 1 fila con `updated_at` actualizado. **`OBSERVADO`**: 0 filas.
+  **`NO DEMOSTRADO`**: el mecanismo interno de consumo, eliminación o reemplazo
+  del OTP. **No se investiga.**
+- **3 sesiones y 3 refresh tokens activos** observados para el sujeto. Se habían
+  predicho 2. El **origen individual de cada una NO SE ATRIBUYE**: puede haber
+  estado histórico. **No se investiga.**
+
+#### El primer OTP
+
+La primera emisión quedó **expuesta accidentalmente en una captura compartida**.
+Se trató como **COMPROMETIDO y NO SE UTILIZÓ**: no se intentó verificarlo, ni
+para comprobar que estuviera muerto. **Su invalidación es `NO DEMOSTRADA`** — la
+hipótesis de que una emisión posterior sobrescribe la anterior se apoyaba en el
+modelo de `one_time_tokens` que la lectura de 0 filas dejó sin respaldo.
+
+#### Lo que H-2 NO cierra
+
+- **la prueba negativa de `shouldCreateUser: false` con un email inexistente
+  sigue `PENDIENTE`**, y nunca se ha ejecutado. Es la que demostraría que una
+  entrada de recuperación no puede acuñar identidad;
+- **H-3 sigue `PENDIENTE`**: no sabemos si Manual Linking es *necesario* para
+  `updateUser({ email })` o simplemente estaba activado. Esta corrida no vinculó
+  ningún email nuevo, así que no lo toca;
+- **la identidad del PoC del 2026-09-16 sigue sin reconstruirse.** Su `user.id`
+  nunca se escribió: la evidencia se comunicó verbalmente y no hay paquete;
+- **`ac20eed5-6cba-43ca-a186-eee779cb7223` no fue el sujeto ejercitable de H-2**:
+  su buzón no está bajo control. Su `recovery_token` del 2026-09-18 sigue en su
+  sitio, caducado, y es ajeno a esta entrada;
+- **producción NO TOCADA**;
+- **G-R3 / OTP sigue `NOT IMPLEMENTED`**: sin UI, sin entrada de recuperación en
+  la app, sin persistencia de la sesión recuperada;
+- **el recovery real de la app NO ESTÁ VALIDADO**: no se reconectó ningún
+  ownership ni se reanudó ninguna subida;
+- **`RECOVERY_ENTRY_IMPLEMENTED = false`**, sin cambios;
+- **`GC-AUTH-SESSION-RECOVERY-001` sigue `OPEN`**;
+- **producto `NO APTO PARA RELEASE`**.
+
+---
+
 ## `GC-AUTH-ANCHOR-MALFORMED-001` — un marker ilegible **se sustituía** y la sesión del momento pasaba a ser el ancla
 
 ### Estado
