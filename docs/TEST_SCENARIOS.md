@@ -81,14 +81,17 @@ de vídeo y la primera de audio. Ver
 Los findings del bloque de identidad no tienen escenario numerado en este
 documento, pero sí cobertura automática densa: `legacyProbeSeal` (52),
 `devResetGuard` (62), `authDiagnostics` (46), `ownershipGate` (26),
-`identityContinuity` (19), `destinationPauseClear` (17), `ownershipBrand` (10).
+`identityContinuity` (51), `destinationPauseClear` (17), `ownershipBrand` (10).
 Su estado exacto está en
 [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md#findings-abiertos-de-identidad-destino-y-herramientas).
 
-`identityContinuity` cubre la **puerta de continuidad de ownership** que añadió
-`39d6d05` el 2026-10-04: `IMPLEMENTED / TESTED`, **nunca ejercitada en
-dispositivo**. Dos de sus 19 tests fijan `GC-AUTH-ANCHOR-MALFORMED-001` —el
-noveno finding del bloque— **sin corregirlo**.
+`identityContinuity` cubre dos cosas, ambas del 2026-10-04 y ninguna
+ejercitada en dispositivo. La **puerta de continuidad de ownership** que
+añadió `39d6d05`: `IMPLEMENTED / TESTED`. Y la corrección de
+`GC-AUTH-ANCHOR-MALFORMED-001` —el noveno finding del bloque— en `ee53962`:
+**29 de sus 51 tests** fijan la conducta **corregida** —la tabla de lectura,
+la escritura sólo en `absent` y la composición—, no el defecto.
+`FIXED IN CODE / TESTED / NOT HARDWARE VALIDATED`.
 
 **Sólo `GC-AUTH-MIGRATION-001` está `HARDWARE_VALIDATED`.**
 
@@ -117,15 +120,16 @@ noveno finding del bloque— **sin corregirlo**.
   aditivo**: el salvage no interfiere con la convergencia normal posterior. **No
   reproduce** el escenario del finding, que sigue `OPEN`.
 * Validación automática vigente, ejecutada el **2026-10-04** sobre el árbol de
-  `39d6d059ee4d55ae307d96f29be75913bdcb3ecd`: **1040/1040 tests en 48
+  `ee539629b61e8a186e1eb5b52812cf79115b31ba`: **1072/1072 tests en 48
   ficheros**; 12 errores TypeScript heredados y cero nuevos —typecheck **NO**
   verde—; `git diff --check` limpio.
   `compileDebugKotlin` dio `BUILD SUCCESSFUL` el 20/08 y **no se ha reejecutado
   desde entonces**.
   *(Cifras anteriores de esta línea: 360/360 en el corte del 20/08, 781/781 en
   el del 23/08 sobre `34412a0`, 792/792 en 41 ficheros el 24/08 tras `3c10994`,
-  900/900 en 42 ficheros el 24/08 tras `cb59c7e` y 936/936 en 42 ficheros el
-  2026-08-26 sobre `fc9a20e`.)*
+  900/900 en 42 ficheros el 24/08 tras `cb59c7e`, 936/936 en 42 ficheros el
+  2026-08-26 sobre `fc9a20e` y 1040/1040 en 48 ficheros el 2026-10-04 sobre
+  `39d6d05`.)*
 * **No** se declaran validados: recovery completo de vídeo, export final
   `.mp4`, cobertura multi-dispositivo, Android 13+ ni las rutas artificiales de
   fallo del scheduler.

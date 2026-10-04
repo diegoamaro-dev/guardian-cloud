@@ -19,11 +19,12 @@ Detalle completo en [`releases/v0.3.0-rc.1.md`](./releases/v0.3.0-rc.1.md) §7.
   (tipos de `ExpoConfig`/`ManifestService`), 4 en `app/index.tsx` y 2 en
   `src/api/*` (`Uint8Array<ArrayBufferLike>` vs `BufferSource`/`BodyInit`).
 - **No hay CI.** Los tests corren sólo en la máquina del desarrollador —
-  **1040/1040 en 48 ficheros el 2026-10-04**, sobre
-  `39d6d059ee4d55ae307d96f29be75913bdcb3ecd`. *(Cifras anteriores de esta
+  **1072/1072 en 48 ficheros el 2026-10-04**, sobre
+  `ee539629b61e8a186e1eb5b52812cf79115b31ba`. *(Cifras anteriores de esta
   línea: «los 198 tests» del corte de `v0.3.0-rc.1`, 781 el 2026-08-23 sobre
   `34412a0`, 792/792 en 41 ficheros tras `3c10994`, 900/900 en 42 ficheros
-  tras `cb59c7e` y 936/936 en 42 ficheros el 2026-08-26 tras `fc9a20e`.
+  tras `cb59c7e`, 936/936 en 42 ficheros el 2026-08-26 tras `fc9a20e` y
+  1040/1040 en 48 ficheros el 2026-10-04 sobre `39d6d05`.
   **La deuda de CI no ha cambiado: sigue sin existir CI.**)*
 - **La suite del backend NO está verde.** Cuatro fallos de integración,
   **preexistentes en `HEAD`** y medidos por primera vez el 2026-08-26:

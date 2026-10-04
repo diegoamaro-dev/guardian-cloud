@@ -1797,38 +1797,47 @@ producción.
 
 ---
 
-## `GC-AUTH-ANCHOR-MALFORMED-001` — un marker ilegible se sustituye y la sesión del momento pasa a ser el ancla
+## `GC-AUTH-ANCHOR-MALFORMED-001` — un marker ilegible **se sustituía** y la sesión del momento pasaba a ser el ancla
 
 ### Estado
 
-**OPEN.** Sin corregir, y **deliberadamente** no corregido en G-R1. Detectado el
-2026-10-04 en la revisión adversarial de la composición de G-R1, donde se
-registró como **H1** y se clasificó:
+**FIXED IN CODE / TESTED / NOT HARDWARE VALIDATED.** Corregido el 2026-10-04 en
+`ee539629b61e8a186e1eb5b52812cf79115b31ba`.
 
 ```
-PREEXISTING / OBSERVED IN CODE / BLOCKER BEFORE RECOVERY ENTRY
+PREEXISTING / FIXED IN CODE / TESTED / NOT HARDWARE VALIDATED
 ```
 
-**El origen es preexistente a G-R1.** La ruta existía antes del gate y el gate
-no la introdujo. Lo que G-R1 cambia es su **gravedad**, no su mecánica.
+Detectado el 2026-10-04 en la revisión adversarial de la composición de G-R1,
+donde se registró como **H1**. **El origen es preexistente a G-R1**: la ruta
+existía antes del gate y el gate no la introdujo; lo que G-R1 cambió fue su
+**gravedad**, no su mecánica.
 
-### Hecho demostrado
+> **No está validado en hardware.** Ni esta corrección ni la puerta de
+> continuidad que la precede se han ejercitado en ningún dispositivo. Lo que
+> hay es evidencia automatizada, y `TESTED` no asciende a validación por
+> acumulación.
 
-Es un hecho de código, y desde el 2026-10-04 está **fijado por test** en
-`mobile/tests/identityContinuity.test.ts` → `H1 · KNOWN LIMIT — marker ilegible
-y ancla fabricada`. Esos tests existen para que el comportamiento no cambie sin
-que nadie lo vea; **no lo legitiman**.
+Evidencia vigente, en su nivel exacto: suite móvil **1072/1072 en 48 ficheros**
+y typecheck en **12 errores heredados, cero nuevos** —comparado error por error
+contra el baseline, por tanto **NO** verde—. En
+`mobile/tests/identityContinuity.test.ts`, **51 tests**, de los cuales **29**
+fijan este finding.
 
-Dos piezas, ambas en `mobile/src/auth/identityMarker.ts`:
+### El defecto — descripción HISTÓRICA
 
-1. **`readIdentityMarker()` colapsa `malformed` en `null`.** Es la lectura que
-   usan los callers del camino feliz. `readIdentityMarkerState()` sí distingue
-   `absent` de `malformed` —y ese reparto es justo lo que exigió
-   GC-AUTH-MIGRATION-001—, pero la versión colapsada sigue existiendo y sigue
-   usándose.
-2. **`markIdentityInitialized()` sólo preserva lo existente cuando esa lectura
-   es truthy.** Para esa función un marker ilegible es por tanto indistinguible
-   de un slot vacío: **lo SUSTITUYE**.
+> Todo este apartado describe el comportamiento **anterior a `ee53962`**. No
+> describe el sistema actual.
+
+Dos causas, y las dos tenían la misma forma: *«no sabemos»* se trataba como
+*«no hay»*.
+
+1. **`readIdentityMarker()` colapsaba `malformed` en `null`**, el mismo valor
+   que produce una ranura vacía. Era la lectura del camino feliz, y su único
+   caller era el escritor.
+2. **`markIdentityInitialized()` sólo preservaba lo existente cuando esa
+   lectura era truthy.** Para esa función un marker ilegible era por tanto
+   indistinguible de un slot vacío: **lo SUSTITUÍA**.
 
 La secuencia completa, con el latch de durabilidad cerrado:
 
@@ -1837,7 +1846,7 @@ marker ilegible  (bytes corruptos · JSON inválido · version ≠ 1 · getItem 
   → getOwnershipToken()            markerKnownDurable === false
   → ensureIdentityMarkerDurable(sessionUserId)
   → markIdentityInitialized(sessionUserId)
-        readIdentityMarker() → null        ← malformed colapsado
+        readIdentityMarker() → null        ← el colapso
         ESCRIBE un marker nuevo:  user_id = sessionUserId
                                   initialized_at → Date.now()
                                   migrated_from_legacy → false
@@ -1847,87 +1856,141 @@ marker ilegible  (bytes corruptos · JSON inválido · version ≠ 1 · getItem 
   → OwnershipToken EMITIDO
 ```
 
-### La asimetría es el defecto
+Y una segunda causa, de la misma familia y por otra vía: la guarda write-once
+del back-fill preguntaba *«¿es una string no vacía?»*, de modo que un `user_id`
+**presente pero inválido** —`''`, `null`, un número— no contaba como ancla y
+caía directamente en la escritura, sin pasar por ninguna rama de ilegibilidad.
 
-`backfillIdentityAnchor()` **rechaza** `marker_malformed` y lo justifica en su
-propio docstring: escribir un ancla ahí sería *inventar la respuesta*. Pero
-`markIdentityInitialized()` alcanza el mismo slot de almacenamiento un paso
-antes y hace exactamente eso. Consecuencia observada: con el latch cerrado, la
-rama `marker_malformed` del back-fill es **inalcanzable** desde
-`getOwnershipToken()` —el marker ya fue sustituido—. Sólo se alcanza cuando la
-corrupción ocurre **después** de abrirse el latch, y entonces sí se rechaza
-correctamente con `continuity_unverifiable`.
+**La asimetría era el defecto.** `backfillIdentityAnchor()` rechazaba el marker
+ilegible y lo justificaba en su propio docstring —escribir un ancla ahí sería
+*inventar la respuesta*—, pero `markIdentityInitialized()` alcanzaba el mismo
+slot un paso antes y hacía exactamente eso. Consecuencia observada entonces:
+con el latch cerrado, esa rama del back-fill era **inalcanzable** desde
+`getOwnershipToken()`, porque el marker ya había sido sustituido. **Eso ya no
+ocurre**: hoy nadie sustituye el marker antes, así que la rama es alcanzable y
+es la que decide.
 
-### Qué cambió con G-R1, y qué no
+### La corrección
 
-| | antes de G-R1 | desde G-R1 |
+**La validez se decide en `readIdentityMarkerState()` y en ningún otro sitio.**
+Responde cuatro hechos distintos, y ninguno de ellos se confunde con otro:
+
+| Observado | `kind` | Significa |
 |---|---|---|
-| mecánica | idéntica | idéntica |
-| qué se pierde | `initialized_at`, `migrated_from_legacy` | lo mismo |
-| qué se fabrica | nada | **`user_id`: el campo del que depende la autorización** |
-| clasificación | defecto de integridad | **defecto de autorización latente** |
+| `getItem` devolvió `null` | `absent` | **la única ausencia real** |
+| `getItem` lanzó | `unreadable` | no se observaron bytes; la próxima lectura puede acertar |
+| bytes que no son un marker válido | `corrupt` | el marker existe y está roto; ninguna relectura lo arregla |
+| esquema completo válido | `present` | marker utilizable |
 
-### Por qué NO se ha demostrado emisión para una identidad incorrecta
+* **`absent` sólo significa ausencia real.** Una cadena vacía no es una
+  ausencia: la ranura existe y no contiene un marker, así que es `corrupt`.
+* **`corrupt != absent`** y **`unreadable != absent`.** Una `version`
+  desconocida o futura cae en `corrupt`, nunca en `absent`, de modo que un
+  rollback desde un esquema posterior no puede parecer una instalación nueva.
+* **`present` garantiza el esquema completo, `user_id` incluido**: o la
+  propiedad está ausente —marker válido pre-G-R1— o es una string no vacía. La
+  distinción se decide por presencia real de la propiedad, no por
+  `=== undefined`, porque JSON no puede codificar `undefined`.
 
-Porque **este build no dispone de una segunda ruta de sesión**. Enumeración
-exhaustiva del 2026-10-04 sobre `mobile/src` + `mobile/app`:
+De ahí se siguen las reglas de escritura:
 
-- `signInAnonymously()` — `app/index.tsx`, única ruta activa, y sólo bajo
-  `FIRST_IDENTITY`, que exige un marker **`absent`**. Un marker `malformed`
-  resuelve `initialized: true` → `IDENTITY_DEGRADED` → **no acuña**.
-- `signInWithPassword()` — existe en `src/auth/store.ts` y **no tiene ningún
-  caller** en `src/` ni en `app/`: ruta muerta en el artefacto enviado.
-- `updateUser({ email })` (`linkEmail`) — no instala sesión, conserva el
-  `user.id` y rechaza explícitamente con `identity_changed` si cambiara.
-- `signInWithOtp` / `verifyOtp` / `setSession()` — **no existen en el código**.
+* **`markIdentityInitialized()` ejecuta `setItem` si y sólo si el estado
+  observado es `absent`.** `present` devuelve lo que ya hay; `corrupt` y
+  `unreadable` rechazan sin tocar un byte, sin marker que devolver y sin
+  reclamar durabilidad.
+* **`user_id` presente pero inválido no permite back-fill.** Es `corrupt`: no
+  es ancla válida, no autoriza ownership, no es elegible y no se sobrescribe.
+  La segunda causa se cerró **sin añadir una sola guarda** al back-fill, porque
+  `present` ya excluye un ancla inválida.
+* **Un marker pre-G-R1 válido sin la propiedad `user_id` mantiene la
+  compatibilidad con el back-fill**, mientras la entrada de recuperación no
+  esté habilitada. Los dos tests que fijan esa frontera van juntos: propiedad
+  ausente ⇒ ancla; propiedad presente e inválida ⇒ bloqueado.
+* **La corrupción posterior a abrir el latch tampoco permite emitir
+  `OwnershipToken`.** El latch cachea durabilidad, que es un hecho que no
+  revierte, y sigue abierto; la continuidad se relee del disco en cada emisión
+  y niega igualmente, con `continuity_unverifiable`. **La durabilidad dejó de
+  ser autoridad suficiente.**
+* **Negarse a escribir ES la preservación.** Nada en la app borra la clave, así
+  que los bytes originales sobreviven verbatim: **sin ranura de salvage, sin
+  segunda clave durable, sin estado nuevo que mantener consistente.**
 
-De ahí se sigue que, hoy, la sesión viva sólo puede ser la identidad histórica,
-y el token que se emite es el correcto. **Esa propiedad es de este build y de
-ninguno posterior.** No es una garantía del diseño: es una consecuencia de que
-todavía no exista recuperación.
+Los dos caminos de rechazo son fail closed y los dos tienen test propio:
+`marker_not_durable` antes de que se abra el latch de durabilidad, y
+`continuity_unverifiable` después.
 
-### Residuales de la misma causa
+### Qué no cambió
 
-- **Pérdida de `migrated_from_legacy: true`.** Un marker legacy que se vuelva
-  ilegible reaparece con la guarda en `false`, lo que **habilita** un back-fill
-  que debía rechazarse.
-- **`initialized_at` reescrito.** Se pierde la marca de la primera identidad
-  observada en el dispositivo.
+* **`GC_QUEUE`, worker, recovery y evidencia no fueron modificados.** El commit
+  toca cinco ficheros —`identityMarker.ts`, tres de test y un comentario de
+  `app/index.tsx`— y ninguno pertenece a cola, worker, uploader, cleanup,
+  completion, export ni captura.
+* **`RECOVERY_ENTRY_IMPLEMENTED = false`**, sin cambios.
+* **`sub_prefix` sigue siendo diagnóstico**: ninguna decisión lo lee.
+* **La captura local no queda bloqueada.** `getOwnershipAccessToken()` sigue sin
+  rechazar nunca: cualquier fallo resuelve a `null` y enruta al diferido ya
+  existente.
+* **H1 no cierra `GC-AUTH-SESSION-RECOVERY-001`, ni total ni parcialmente.** Era
+  una precondición de seguridad para una recuperación futura, no recuperación.
+  **Una identidad perdida sigue sin poder recuperarse.**
+
+### Residuales
+
+Cerrados por `ee53962`: la pérdida de `migrated_from_legacy: true` y la
+reescritura de `initialized_at` por sustitución.
+
+Siguen abiertos:
+
 - **TOCTOU del back-fill.** `backfillIdentityAnchor()` hace read-modify-write
   sin lock. No puede desplazar un ancla **establecida** —ambas lecturas verían
   `already_present`—, así que no emite token incorrecto; queda registrado por
   completitud.
+- **`guardUndurableIdentity` se dispara en un rechazo** y retira el sello
+  legacy. Trazado e **inofensivo**: con el marker corrupto,
+  `resolveIdentityInitialized` devuelve `initialized: true` en la rama del
+  marker **antes** de leer el sello, así que el sello nunca se consulta. Inútil,
+  no dañino.
+- **`readIdentityMarker()` sigue exportada y sin caller de producción.** La
+  conservan los tests. Queda desarmada por documentación, no por el compilador.
+- **Un supuesto sin verificar en dispositivo**: que AsyncStorage devuelve `null`
+  —y no `''`— para una clave inexistente. Comprobado que la app nunca escribe
+  `''`; el comportamiento de la plataforma está **inferido**, no observado.
 
-### Qué NO implica
+### Precondiciones vigentes antes de habilitar una entrada de recuperación
 
-- **No implica pérdida de `GC_QUEUE` ni de evidencia.** La cola no se toca en
-  ninguna rama de esta ruta. Una refusal de continuidad **pausa** la creación de
-  ownership remoto: no borra, no descarta y no vacía el transporte. La captura
-  local es independiente.
-- **No es una regresión de G-R1** ni un fallo de sus tests. G-R1 pasó la
-  revisión adversarial; esta entrada es lo que esa revisión encontró **al lado**.
+> **La precondición H1 está satisfecha en código y tests. Eso NO autoriza abrir
+> todavía la entrada de recuperación.**
 
-### Condición de cierre — vinculante para G-R2 / G-R3
+El mecanismo de bloqueo **ya existe en el código**: `backfillIdentityAnchor()`
+está guardado por `RECOVERY_ENTRY_IMPLEMENTED` y, cuando ese flag sea `true`,
+devuelve `recovery_entry_exists` y **no escribe**. Lo que queda pendiente son
+dos cosas distintas de eso, y ninguna se diseña aquí.
 
-> **Mientras `GC-AUTH-ANCHOR-MALFORMED-001` siga abierto, G-R2 y G-R3 NO pueden
-> abrir una entrada de recuperación.**
+**A · Ordenación / atomicidad.** La barrera que deshabilita el back-fill debe
+estar activa **antes o atómicamente junto con** cualquier ruta capaz de producir
+una sesión mediante recuperación. **No puede existir una ventana** en la que la
+recuperación ya produzca sesiones mientras el back-fill pre-G-R1 siga
+habilitado. Hoy esto es una **precondición y una convención escrita**, no una
+garantía estructural demostrada.
 
-La propiedad que hoy hace inofensiva esta ruta —que no haya segunda ruta de
-sesión— es exactamente la que una entrada de recuperación elimina. En el momento
-en que exista OTP, recuperación o cualquier segundo sign-in, esta ruta ancla a
-**quien esté firmado en ese instante** y emite token para esa identidad. El
-orden correcto es cerrar esto **antes** de que `RECOVERY_ENTRY_IMPLEMENTED` pase
-a `true`, nunca después: ese flag guarda `backfillIdentityAnchor()` y **no cubre
-esta vía**.
+**B · Instalaciones pre-G-R1 sin ancla.** Una instalación que alcance el build
+de recuperación con un `gc.identity.v1` válido pero **sin `user_id` durable**
+dejará de poder recibir el back-fill en cuanto la barrera se active. Con el
+diseño actual eso conduce a `continuity_unverifiable` **sin una vía de retorno
+ya implementada**. Debe resolverse o decidirse antes de habilitar la
+recuperación.
 
-**No se declara el recovery seguro mientras esta entrada esté abierta**, por
-bien que salgan las corridas de las capacidades vecinas.
+La documentación vigente de `RECOVERY_ENTRY_IMPLEMENTED` ya apunta a que un
+registro durable tipo `recovery_attempted` debería decidirse antes de G-R3. **Se
+conserva esa referencia como tal: no es un diseño aprobado.**
+
+**No se declara el recovery seguro.** Y no se escribe en ningún sitio que G-R2 o
+G-R3 queden desbloqueados: lo que está satisfecho es la precondición H1.
 
 ### Lo que esta entrada NO hace
 
-No diseña la solución. La elección —rechazar y dejar el dispositivo sin
-ownership, o sanear el slot bajo condiciones— es una decisión de diseño que
-pertenece a su propio gate y **no se toma aquí**.
+No diseña la solución de A ni de B. Siguen siendo decisiones de diseño que
+pertenecen a su propio gate y **no se toman aquí**.
 
 ---
 
@@ -1985,11 +2048,15 @@ pertenece a su propio gate y **no se toma aquí**.
   [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md#aislamiento-de-build-e1--android-y-proyecto-supabase).
   **No cierra este finding ni ninguna parte de él**: separar builds no recupera
   ninguna identidad.
-- **`GC-AUTH-ANCHOR-MALFORMED-001`** — ver el apartado inmediatamente
-  anterior. Un marker ilegible se sustituye y la sesión del momento pasa a ser
-  el ancla de continuidad. Hoy no emite token para una identidad incorrecta
-  porque este build no tiene una segunda ruta de sesión, y **esa es la única
-  razón**. Bloquea abrir una entrada de recuperación en G-R2 / G-R3.
+- **`GC-AUTH-ANCHOR-MALFORMED-001`** — **corregido** el 2026-10-04 en
+  `ee539629b61e8a186e1eb5b52812cf79115b31ba`:
+  `FIXED IN CODE / TESTED / NOT HARDWARE VALIDATED`. Un marker ilegible ya no
+  se sustituye, y la razón ya **no** es que a este build le falte una segunda
+  ruta de sesión: el código se niega por sí mismo. **Sin validación en
+  hardware.** La precondición H1 queda satisfecha, y eso **no autoriza** abrir
+  la entrada de recuperación: siguen pendientes la **ordenación/atomicidad**
+  de la barrera y el destino de las **instalaciones pre-G-R1 sin ancla**. Ver
+  el apartado inmediatamente anterior.
 
 ---
 

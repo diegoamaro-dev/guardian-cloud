@@ -32,9 +32,32 @@ byte a byte el anclado. **La ausencia de ancla no cuenta como coincidencia**, y
 `sub_prefix` sigue siendo diagnóstico: no decide nada.
 
 Nivel de evidencia, sin ascender: **`IMPLEMENTED / TESTED`** —suite móvil
-**1040/1040 en 48 ficheros**, typecheck en 12 errores heredados y cero nuevos,
+**1072/1072 en 48 ficheros**, typecheck en 12 errores heredados y cero nuevos,
 por tanto **NO** verde— y **`NOT HARDWARE VALIDATED`**: esta capacidad no se ha
 ejercitado en ningún dispositivo.
+
+Y ese mismo día, `ee53962` cerró el finding que la revisión adversarial de
+G-R1 encontró al lado: **`GC-AUTH-ANCHOR-MALFORMED-001`**, el noveno del
+bloque de identidad. Un marker ilegible **ya no se sustituye**. La validez se
+decide en un único sitio y `absent` significa **sólo** ausencia real: un
+`getItem` que lanza es `unreadable`, unos bytes que no son un marker válido
+son `corrupt` —`version` futura incluida, y un `user_id` presente pero
+inválido también—, y la escritura ocurre **si y sólo si** la ranura está
+realmente vacía. Un marker pre-G-R1 válido sin la propiedad `user_id`
+conserva el back-fill. Negarse a escribir **es** la preservación: ninguna
+clave durable nueva. Queda
+`FIXED IN CODE / TESTED / NOT HARDWARE VALIDATED` —1072/1072, de los que 29
+tests fijan este finding— y **no tocó `GC_QUEUE`, worker, recovery ni
+evidencia**.
+
+**La precondición H1 queda satisfecha, y eso NO autoriza abrir la entrada de
+recuperación.** Siguen pendientes dos cosas antes de habilitarla: que la
+barrera que apaga el back-fill esté activa **antes o atómicamente junto con**
+cualquier ruta que pueda producir una sesión por recuperación —hoy es una
+precondición escrita, no una garantía estructural—, y qué pasa con las
+**instalaciones pre-G-R1 sin ancla**, que al activarse la barrera quedarían en
+`continuity_unverifiable` sin vía de retorno implementada. Registro en
+[`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §5.
 
 **Lo que NO cambió**, y conviene no leer de más:
 
@@ -43,13 +66,12 @@ ejercitado en ningún dispositivo.
   recuperación**. La identidad perdida **sigue sin poder recuperarse**.
 * **El recovery por OTP sigue `NOT IMPLEMENTED`.** No existen `signInWithOtp`
   ni `verifyOtp` en el código.
-* **`GC-AUTH-ANCHOR-MALFORMED-001` queda abierto** —noveno finding del bloque
-  de identidad, registrado ese mismo día—: un marker ilegible se sustituye y
-  la sesión del momento pasa a ser el ancla. Es **preexistente** y
-  **`BLOCKER BEFORE RECOVERY ENTRY`**: mientras siga abierto, G-R2 y G-R3 **no
-  pueden abrir una entrada de recuperación**. Registro en
-  [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md) §5; estado por capacidad en
+* **El recovery sigue sin autorizar.** `GC-AUTH-ANCHOR-MALFORMED-001` está
+  corregido, pero eso satisface una precondición y no habilita nada: la
+  entrada de recuperación **sigue sin estar autorizada**, y
+  `RECOVERY_ENTRY_IMPLEMENTED` sigue en `false`. Estado por capacidad en
   [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md#findings-abiertos-de-identidad-destino-y-herramientas).
+* **Nada de esto está validado en hardware.**
 * El sistema sigue **NO APTO PARA RELEASE**.
 
 ### Lo que cambió el 2026-10-03
@@ -125,10 +147,11 @@ La cifra de esa tabla —**936 tests móviles en 42 ficheros**— es la del cort
 2026-08-27, medida sobre el mismo objeto `tree` de `mobile/` que publica
 `main@63099d8`. **Ya no es la vigente**: la cifra actual la fija
 [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md), y en el corte del
-**2026-10-04**, anclado a `39d6d05`, es **1040/1040 en 48 ficheros**. El
+**2026-10-04**, anclado a `ee53962`, es **1072/1072 en 48 ficheros**. El
 typecheck sigue en 12 errores heredados, por tanto **NO** verde. La medición
 del 2026-08-26 tras `fc9a20e` dio la misma cifra que la de esta tabla. Los
-**cortes históricos anteriores** fueron 1007/1007 tras `ccbf4fa`, 900/900 en 42 ficheros
+**cortes históricos anteriores** fueron 1040/1040 en 48 ficheros sobre `39d6d05`,
+1007/1007 tras `ccbf4fa`, 900/900 en 42 ficheros
 tras `cb59c7e` y 792/792 en 41 ficheros tras `3c10994`, y ninguno describe ya
 la suite actual. El fichero 41 era `startLatencyDecoupling.test.ts`, que aportó
 11 tests; el fichero 42 es `localAssembly.test.ts`, que aporta los 108 tests de
