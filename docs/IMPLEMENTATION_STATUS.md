@@ -9,12 +9,12 @@
 | Producto usado para la validación de `GC-START-LATENCY-001` | **`e643b01`** (APK release `1cb80fea…`) |
 | Producto usado para la validación de **D3 local segment salvage** | **`cb59c7e`** (APK release `8151c338…`) |
 | Producto usado para la **revalidación S1 BENCH** (G-R1 + H1 + R1 presentes) | **`3a68699`** (APK de banco, build EAS `5999431a-d487-4330-8692-84ad00c23c62`) |
-| Última suite automática registrada | **2026-10-04**, anclada a **`8ea3fea1a876a44f0b0f57e37dc1f928fb3592ea`** — **1094/1094 en 49 ficheros** · typecheck **12 errores heredados, cero nuevos**, por tanto **NO** verde. Cortes anteriores ya anclados: **1072/1072 en 48 ficheros** sobre **`ee53962`**, **1040/1040 en 48 ficheros** sobre **`39d6d05`**, **1021/1021 en 47 ficheros** el 2026-10-03 sobre el árbol del gate **E1-BENCH-OAUTH-SCHEME** medido antes de commitearlo, 1014/1014 tras **`b1f73aa`** y 1007/1007 tras **`ccbf4fa`** |
+| Última suite automática registrada | **2026-10-04**, anclada a **`d9bf343158e04c0d7779332baea60d2ad9033a78`** — **1102/1102 en 49 ficheros** · typecheck **12 errores heredados, cero nuevos**, por tanto **NO** verde. Cortes anteriores ya anclados: **1094/1094 en 49 ficheros** sobre **`8ea3fea`**, **1072/1072 en 48 ficheros** sobre **`ee53962`**, **1040/1040 en 48 ficheros** sobre **`39d6d05`**, **1021/1021 en 47 ficheros** el 2026-10-03 sobre el árbol del gate **E1-BENCH-OAUTH-SCHEME** medido antes de commitearlo, 1014/1014 tras **`b1f73aa`** y 1007/1007 tras **`ccbf4fa`** |
 | Aislamiento de build y de proyecto Supabase | **`ccbf4fa`** — ver [la sección propia](#aislamiento-de-build-e1--android-y-proyecto-supabase) |
 
 > Las fechas y los commits son distintos a propósito, y no deben fundirse. La
-> suite vigente —1094/1094 en 49 ficheros— se midió sobre el árbol de
-> `8ea3fea`; las tres validaciones de hardware se hicieron en dispositivo, no
+> suite vigente —1102/1102 en 49 ficheros— se midió sobre el árbol de
+> `d9bf343`; las tres validaciones de hardware se hicieron en dispositivo, no
 > corriendo la suite, y cada una sobre **su propio APK**:
 > `GC-DEST-PAUSE-001` sobre `22a9b26`, `GC-START-LATENCY-001` sobre `e643b01` y
 > **D3** sobre `cb59c7e`. **Ninguna cifra de tests describe un APK.**
@@ -261,6 +261,47 @@ cerrado, **preservando `GC_QUEUE` y la evidencia local**.
 - **Ninguno de los dos añade validación en hardware**, ni adversarial ni de
   ningún otro tipo. S1 sólo acreditó el camino legítimo de primera identidad.
 - **El veredicto de producto sigue siendo `NO APTO PARA RELEASE`.**
+
+#### H-1 · el acoplamiento ya no depende de una lista escrita a mano
+
+**`FIXED IN TESTS / AUTOMATED VALIDATION` · `NOT HARDWARE VALIDATED`**, corregido
+en `d9bf343158e04c0d7779332baea60d2ad9033a78`.
+
+El test de acoplamiento tenía dos huecos, y los dos habrían afectado al primer
+commit de G-R3:
+
+- **falso negativo**: escaneaba una lista de siete ficheros escrita a mano, así
+  que una ruta de recovery en una pantalla nueva —que es exactamente donde
+  viviría— le resultaba invisible. Ahora recorre **los árboles completos** de
+  `mobile/src` y `mobile/app`, sólo ficheros de producción. Se justificó en su
+  primera ejecución: encontró un identificador en un fichero que la lista
+  anterior no cubría;
+- **falso positivo**: se apoyaba en el identificador `verifyOtp`, que **no se
+  puede clasificar por su nombre**. Con `type: 'email_change'` confirma un
+  cambio sobre la sesión ya viva —la Fase 1 de G-R3, vincular un email de
+  recuperación— y no puede producir sesión para otra identidad.
+  **`verifyOtp(type:'email_change')` no se considera recovery**, y el tipo se
+  lee como token entrecomillado completo para que `email_change` no case como
+  subcadena de `email`.
+
+**Las rutas capaces de crear o restaurar una sesión sí exigen la barrera**:
+`signInWithOtp`, `exchangeCodeForSession`, `signInWithOAuth`,
+`signInWithIdToken`, `verifyOtp` con cualquier tipo que devuelva sesión, y
+`setSession` cuando la llamada va sobre un objeto `auth`. `signInAnonymously`
+queda fuera: es el acuñado legítimo, no una recuperación.
+
+**Los casos ambiguos fallan cerrado**: un `verifyOtp` cuyo `type` no se puede
+leer cuenta como recovery. Ante la duda, exigir la barrera.
+
+Los límites del barrido de texto —un alias desestructurado se escaparía, y
+`signInWithPassword` queda fuera de la lista a propósito— están escritos en el
+propio test y quedan como **limitación aceptada**, no como trabajo pendiente.
+
+**`RECOVERY_ENTRY_IMPLEMENTED = false` sigue siendo el estado productivo** y la
+única declaración del repositorio; el único sitio que la pone en `true` es el
+mock del fichero de test. **G-R3 / OTP sigue `NOT IMPLEMENTED`**,
+**`GC-AUTH-SESSION-RECOVERY-001` sigue `OPEN`** y el veredicto de producto no se
+mueve: **`NO APTO PARA RELEASE`**.
 
 ### Revalidación hardware S1 — BENCH, 2026-10-04
 
@@ -761,11 +802,11 @@ asimetría es deuda documental conocida, no un descuido de este documento.
 ### Validación automática actual
 
 Ejecutada el **2026-10-04** sobre el árbol de
-`8ea3fea1a876a44f0b0f57e37dc1f928fb3592ea`.
+`d9bf343158e04c0d7779332baea60d2ad9033a78`.
 
 | Comprobación | Resultado |
 |---|---|
-| Suite completa | **1094/1094**, en **49 ficheros** |
+| Suite completa | **1102/1102**, en **49 ficheros** |
 | Typecheck | **12 errores TypeScript heredados, cero nuevos** — typecheck **NO** verde |
 | `git diff --check` | Limpio |
 
@@ -790,13 +831,15 @@ Ejecutada el **2026-10-04** sobre el árbol de
 >   +9 / +1   8ea3fea — precondición A, fichero nuevo
 >             recoveryBarrier.test.ts
 > 1094 / 49   medido el 2026-10-04 sobre 8ea3fea
+>   +8 / +0   d9bf343 — H-1, en recoveryBarrier.test.ts (9 → 17)
+> 1102 / 49   medido el 2026-10-04 sobre d9bf343
 > ```
 >
 > Del tramo 958 → 1021 este documento conserva los cortes intermedios que ya
 > había anclado, pero **no atribuye esos incrementos a commits concretos**:
 > «medido tras X» significa medido después de X, no aportado por X. Los
 > incrementos atribuidos a un commit concreto son los cuatro marcados con
-> `+`: G-R1, H1, R1 y la precondición A.
+> `+`: G-R1, H1, R1, la precondición A y H-1.
 
 > **El corte de 958/43 reconciliaba a su vez dos incrementos, no uno**, y esa
 > cuenta se conserva tal como se registró el 2026-08-31:
