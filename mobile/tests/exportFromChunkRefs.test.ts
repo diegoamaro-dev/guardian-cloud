@@ -82,16 +82,40 @@ vi.mock('@/api/client', () => {
   return { ApiError, apiFetch: vi.fn() };
 });
 
+// EXPORT-MP4 · the remuxer itself is native and is validated on device
+// (`SegmentRemuxTest`). Stub ONLY the native bridge and keep `decideAssembly`
+// and `startsWithFtyp` real, so the regression test below exercises the
+// actual decision logic rather than a reimplementation of it.
+vi.mock('@/recording/mp4Remux', async (importOriginal) => {
+  const real =
+    await importOriginal<typeof import('@/recording/mp4Remux')>();
+  return {
+    ...real,
+    remuxPartsToMp4: vi.fn(async (_sid: string, parts: Uint8Array[]) => ({
+      segments: parts.length,
+      durationUs: 57_000_000,
+      videoSamples: 1,
+      audioSamples: 1,
+      sizeBytes: 123,
+      method: 'audio_contiguity_v1',
+    })),
+  };
+});
+
 import * as FileSystem from 'expo-file-system/legacy';
 import * as Crypto from 'expo-crypto';
 
 import {
   exportFromChunkRefs,
+  exportSession,
   listSessionChunks,
+  type ChunkMeta,
   type ChunkRef,
   type ExportResult,
 } from '../src/api/export';
 import { ApiError, apiFetch } from '../src/api/client';
+import { getFreshAccessToken } from '@/auth/store';
+import { remuxPartsToMp4 } from '@/recording/mp4Remux';
 
 // --- Helpers ------------------------------------------------------------
 
@@ -587,5 +611,94 @@ describe('listSessionChunks — auth retry', () => {
     });
 
     expect(apiFetch).toHaveBeenCalledTimes(1);
+  });
+});
+
+// --- EXPORT-MP4 · the medium must survive ChunkMeta → ChunkRef -----------
+//
+// The E2E export of a real 9-segment session failed with
+// `assembly_refused` / `undeclared_multi_container` while every row in the
+// database carried `media='video'`. The medium reached `ChunkMeta` intact
+// and was dropped by the three-field projection that builds the
+// `ChunkRef[]` handed to `exportFromChunkRefs`.
+//
+// Nothing could catch it before: `media` is optional, so a literal without
+// the key satisfies `ChunkRef` and the compiler stays silent, and no test
+// traversed `ChunkMeta → projection → decideAssembly` with a declared
+// medium. These two tests do, in both directions — a declared video set
+// must REACH the remuxer, and an undeclared one must still be REFUSED.
+
+/** A complete MP4 container start: 4 size bytes, then the `ftyp` box type. */
+function ftypChunkBytes(): Uint8Array {
+  return new Uint8Array([
+    0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70, 0x41, 0x41, 0x41, 0x41,
+  ]);
+}
+
+/** `count` uploaded chunks, each its own MP4 container. */
+function videoChunkMetas(count: number, hashByte = 0xcd): ChunkMeta[] {
+  const hash = hashOfByte(hashByte);
+  return Array.from({ length: count }, (_, i) => ({
+    chunk_index: i,
+    hash,
+    size: 12,
+    status: 'uploaded' as const,
+    remote_reference: `drive-${i}`,
+    media: 'video' as const,
+  }));
+}
+
+function mockListAndDownload(chunks: ChunkMeta[]): void {
+  mockDigestConstant(0xcd);
+  vi.mocked(getFreshAccessToken).mockResolvedValue('tok');
+  vi.mocked(apiFetch).mockReset();
+  vi.mocked(apiFetch).mockResolvedValue({ chunks } as never);
+
+  // `downloadChunkSharedToken` uses global `fetch`, not `apiFetch`.
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      arrayBuffer: async () => ftypChunkBytes().buffer,
+    })),
+  );
+}
+
+describe('EXPORT-MP4 — `media` survives the ChunkMeta → ChunkRef projection', () => {
+  beforeEach(() => {
+    vi.mocked(remuxPartsToMp4).mockClear();
+  });
+
+  it('reaches the remuxer for a declared-video session instead of refusing it', async () => {
+    const chunks = videoChunkMetas(9);
+    mockListAndDownload(chunks);
+
+    const result = await exportSession('58499f5c-fixture', undefined, 'video');
+
+    // The assertion that would have failed before the fix: the projection
+    // dropped `media`, so `decideAssembly` saw nine undeclared chunks whose
+    // bytes were independent containers and refused the whole export.
+    expect(result.stopReason).not.toBe('assembly_refused');
+    expect(remuxPartsToMp4).toHaveBeenCalledTimes(1);
+
+    // And it must hand over every chunk, in order, not a prefix.
+    const parts = vi.mocked(remuxPartsToMp4).mock.calls[0]?.[1];
+    expect(parts).toHaveLength(9);
+  });
+
+  it('still refuses an undeclared set of independent containers', async () => {
+    // Same bytes, same hashes, same count — only the declaration removed.
+    // Keeps `undeclared_multi_container` honest: the fix must not turn the
+    // fail-closed rule into a pass-through.
+    const chunks = videoChunkMetas(9).map(({ media: _media, ...rest }) => rest);
+    mockListAndDownload(chunks as ChunkMeta[]);
+
+    const result = await exportSession('58499f5c-fixture', undefined, 'video');
+
+    expect(result.stopReason).toBe('assembly_refused');
+    expect(result.status).toBe('failed');
+    expect(remuxPartsToMp4).not.toHaveBeenCalled();
   });
 });

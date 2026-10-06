@@ -1680,12 +1680,26 @@ export async function exportSession(
   }
 
   // Project ChunkMeta → ChunkRef. The shared helper does not need
-  // status / remote_reference (already filtered) and only consumes
-  // chunk_index / hash / size.
+  // status / remote_reference (already filtered); it consumes
+  // chunk_index / hash / size AND `media`, which `decideAssembly` reads to
+  // choose concatenation vs remux.
+  //
+  // `media` MUST survive this projection. Dropping it is invisible to the
+  // compiler — the field is optional, so a literal without the key still
+  // satisfies `ChunkRef` — and it is indistinguishable downstream from a
+  // chunk that never declared a medium. The result is not a wrong export
+  // but no export at all: every video session fails closed with
+  // `undeclared_multi_container`, which is how this was found, on real
+  // evidence whose rows all carried `media='video'`.
+  //
+  // Omitted rather than set to `undefined` when absent: with
+  // `exactOptionalPropertyTypes` an explicit `undefined` is a type error,
+  // and an absent key is also the honest encoding of "not declared".
   const refs: ChunkRef[] = uploaded.map((c) => ({
     chunk_index: c.chunk_index,
     hash: c.hash,
     size: c.size,
+    ...(c.media != null ? { media: c.media } : {}),
   }));
 
   // Post-list cancellation check. Lets a cancel that arrived during
