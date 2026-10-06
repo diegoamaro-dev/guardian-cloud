@@ -1,5 +1,6 @@
 package com.guardiancloud.segrec
 
+import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
@@ -199,8 +200,33 @@ class GCSegmentedRecorderModule : Module() {
      * raising. The caller cannot mistake a refusal for a result.
      */
     AsyncFunction("remuxSegmentsToMp4") { inputPaths: List<String>, outputPath: String ->
+      // Every path crossing the bridge is resolved BEFORE `SegmentRemuxer`
+      // sees it. See `resolveBridgePath` for why, and for what the contract
+      // accepts. An unresolvable value is refused here with its own code: it
+      // must not reach the remuxer and surface as `input_missing`, which
+      // would describe a missing file when the real fault is the format of
+      // the string.
+      val inputs = inputPaths.map { raw ->
+        resolveBridgePath(raw) ?: run {
+          Log.w(TAG, "GC_REMUX_REFUSED reason=bad_input_uri scheme=${schemeOf(raw)}")
+          throw CodedException(
+            "ERR_REMUX_BAD_INPUT_URI",
+            "input is neither an absolute path nor a resolvable file: URI — $raw",
+            null,
+          )
+        }
+      }
+      val out = resolveBridgePath(outputPath) ?: run {
+        Log.w(TAG, "GC_REMUX_REFUSED reason=bad_output_uri scheme=${schemeOf(outputPath)}")
+        throw CodedException(
+          "ERR_REMUX_BAD_OUTPUT_URI",
+          "output is neither an absolute path nor a resolvable file: URI — $outputPath",
+          null,
+        )
+      }
+
       try {
-        SegmentRemuxer.remux(inputPaths, outputPath)
+        SegmentRemuxer.remux(inputs, out)
       } catch (e: SegmentRemuxer.RemuxRefused) {
         Log.w(TAG, "GC_REMUX_REFUSED reason=${e.reason} ${e.message}")
         throw CodedException("ERR_REMUX_${e.reason.uppercase()}", e.message, e)
@@ -1293,3 +1319,61 @@ class GCSegmentedRecorderModule : Module() {
     private const val INTAKE_DRAIN_ATTEMPTS = 40
   }
 }
+
+/**
+ * The JS→native path contract for [GCSegmentedRecorderModule.remuxSegmentsToMp4].
+ *
+ * ── Why this exists ─────────────────────────────────────────────────────
+ * `expo-file-system` exposes its directories as `file://` URIs, so every path
+ * the JS side builds from `cacheDirectory` or `documentDirectory` arrives here
+ * as a URI — while `SegmentRemuxer` consumes `java.io.File`. Both sides type
+ * the argument as `String`, so nothing could notice: a real export reached
+ * `File("file:///data/…/seg_000000.mp4").isFile`, which read it as a RELATIVE
+ * path and refused with `input_missing` — a correct guard giving a misleading
+ * reason.
+ *
+ * This module's other functions never take a path: they rebuild one from a
+ * validated session id. `remuxSegmentsToMp4` is the first boundary where the
+ * distinction can bite, which is why it had to be written down.
+ *
+ * ── The accepted contract, and nothing else ─────────────────────────────
+ *   absolute local path  `/data/…`                → accepted unchanged
+ *   `file:` URI with an empty authority           → decoded path
+ *   any other scheme (`content:`, `http:`, …)     → REFUSED
+ *   `file:` URI with no resolvable path           → REFUSED
+ *   `file:` URI naming a host                     → REFUSED
+ *   anything else (relative path, empty)          → REFUSED
+ *
+ * Refusing is deliberate: a `content:` URI cannot be opened with `File` at
+ * all, and passing it through would surface as a missing file instead of an
+ * unsupported source.
+ *
+ * ── Why `Uri.getPath()` and not prefix stripping ────────────────────────
+ * `getPath()` returns the DECODED path component, so `%20` and friends become
+ * real characters. Removing a `file://` prefix by hand leaves them encoded and
+ * yields a path that does not exist — silently, which is the expensive kind of
+ * wrong. The platform parser also handles the empty authority of `file:///…`.
+ *
+ * @return the filesystem path, or `null` when the value is outside the
+ *   contract. Never throws: the caller decides the error code.
+ */
+fun resolveBridgePath(raw: String): String? {
+  if (raw.startsWith("/")) return raw
+
+  val uri = Uri.parse(raw)
+  if (!"file".equals(uri.scheme, ignoreCase = true)) return null
+  // A named host would make this a remote file URI, whose `path` is a path on
+  // THAT host. Taking it as local would open the wrong file, or none.
+  if (!uri.authority.isNullOrEmpty()) return null
+  val path = uri.path
+  if (path.isNullOrEmpty() || !path.startsWith("/")) return null
+  // `file:///` parses to the root, which names no file. Accepting it would
+  // hand `/` to the remuxer and come back as `input_missing` — the misleading
+  // reason this boundary exists to prevent.
+  if (path == "/") return null
+  return path
+}
+
+/** Scheme of `raw`, for logs that must not carry a session id or a path. */
+private fun schemeOf(raw: String): String =
+  if (raw.startsWith("/")) "<absolute-path>" else Uri.parse(raw).scheme ?: "<none>"
