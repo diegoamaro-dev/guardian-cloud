@@ -1218,7 +1218,7 @@ concatenan**: unir contenedores MP4 byte a byte no produce un MP4 válido.
 ```
 NO recupera la identidad
 NO reanuda ownership ni subida
-NO es el export final .mp4  (sigue NO IMPLEMENTADO)
+NO es el export final .mp4  (que existe aparte desde el 2026-10-07)
 NO produce «vídeo reconstruido», «MP4 final» ni «grabación completa»
 ```
 
@@ -1401,8 +1401,9 @@ cifras de arriba.
 ## `GC-EXPORT-CONCAT-001` — el export de vídeo entregaba un MP4 engañoso
 
 ```
-GC-EXPORT-CONCAT-001 = FIXED IN CODE / TESTED / NOT HARDWARE VALIDATED
-                       (registrado y corregido el 2026-10-04)
+GC-EXPORT-CONCAT-001 = FIXED / VALIDATED IN A REAL RUN
+                       (registrado y corregido el 2026-10-04,
+                        acreditado en corrida E2E el 2026-10-07)
 ```
 
 **No es pérdida de evidencia.** Ni un byte se perdió, ni se corrompió, ni la
@@ -1447,16 +1448,26 @@ de vídeo pasa a copiar samples comprimidos a un solo contenedor, sin
 recodificar, y la decisión entre concatenar y remuxear la toma el campo
 `media` **por chunk** —no `session.mode`, no la extensión—.
 
-**Lo que la corrección NO acredita todavía:**
+**Acreditada en una corrida real el 2026-10-07.** Sesión
+`00176c0a-0a28-4c86-8742-13cdb4f4f555`, exportada por la ruta normal de la app
+con el artefacto `429333d`: 12 chunks descargados y verificados, **un único
+`.mp4`** de 64,92 s con un solo `ftyp`/`moov`/`mdat`, y **sincronía A/V
+comprobada por el propietario**.
 
-- **ningún artefacto instalado la contiene.** El remux se validó llamando al
-  módulo nativo desde un test instrumentado sobre 17 segmentos reales, **no**
-  desde la pantalla de export de la app;
-- **nadie ha reproducido el resultado a ojo**, ni comprobado la sincronía A/V
-  tras varias fronteras;
+Llegar ahí costó dos defectos más, los dos invisibles a compilador y suite:
+`880a366` —la proyección `ChunkMeta → ChunkRef` descartaba `media`, que es un
+campo opcional— y `429333d` —`expo-file-system` entrega URIs `file://` donde el
+remuxer espera rutas de sistema de archivos—.
+
+**Lo que esto NO acredita:**
+
 - **no está ejecutada** la regresión de mala red, kill, segundo plano y
-  reinicio;
-- **el invariante «export usable» no se declara satisfecho.**
+  reinicio. Es la cobertura mínima exigible a cualquier cambio que toque
+  export;
+- **una sola corrida, un solo dispositivo** (OnePlus A6000 / Android 11);
+- **`recoveryExport.ts` sigue perdiendo `media`** en su propia proyección;
+- **el mensaje de UI sigue siendo falso** cuando el export falla;
+- **el producto sigue `NO APTO PARA RELEASE`.**
 
 Detalle completo de la validación y de sus límites en
 [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md), sección

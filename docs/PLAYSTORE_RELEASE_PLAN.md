@@ -49,8 +49,10 @@ de entorno configurada**.
 3. **Recovery I5c** (automático tras reinicio del dispositivo, sin abrir la app)
    no implementado.
 4. **Cifrado local** no implementado, pese a aparecer en documentación histórica.
-5. **Export final `.mp4`** no implementado ni validado: una sesión de vídeo
-   sube fragmentos, pero no existe reconstrucción utilizable para el usuario.
+5. **Export final `.mp4`**: implementado y validado funcionalmente de extremo a
+   extremo el 2026-10-07 (remux sin recodificar, un único `.mp4` reproducible).
+   **Deja de ser un bloqueador por ausencia de capacidad**; lo que queda es la
+   regresión de supervivencia, que sigue sin ejecutarse.
 6. **Un solo dispositivo validado** — OnePlus A6000 / Android 11 / API 30. Sin
    cobertura multi-dispositivo ni Android 13+.
 

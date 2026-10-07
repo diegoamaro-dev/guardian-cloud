@@ -9,12 +9,12 @@
 | Producto usado para la validación de `GC-START-LATENCY-001` | **`e643b01`** (APK release `1cb80fea…`) |
 | Producto usado para la validación de **D3 local segment salvage** | **`cb59c7e`** (APK release `8151c338…`) |
 | Producto usado para la **revalidación S1 BENCH** (G-R1 + H1 + R1 presentes) | **`3a68699`** (APK de banco, build EAS `5999431a-d487-4330-8692-84ad00c23c62`) |
-| Última suite automática registrada | **2026-10-04**, anclada a **`05c4b2be646eb317390569833a5ede6c3d9327d2`** — **1125/1125 en 50 ficheros** · typecheck **12 errores heredados, cero nuevos**, por tanto **NO** verde. Cortes anteriores ya anclados: **1102/1102 en 49 ficheros** sobre **`d9bf343`**, **1094/1094 en 49 ficheros** sobre **`8ea3fea`**, **1072/1072 en 48 ficheros** sobre **`ee53962`**, **1040/1040 en 48 ficheros** sobre **`39d6d05`**, **1021/1021 en 47 ficheros** el 2026-10-03 sobre el árbol del gate **E1-BENCH-OAUTH-SCHEME** medido antes de commitearlo, 1014/1014 tras **`b1f73aa`** y 1007/1007 tras **`ccbf4fa`** |
+| Última suite automática registrada | **2026-10-07**, anclada a **`429333d679be5c1b139f7985cc7efce353473004`** — **1127/1127 en 50 ficheros** · typecheck **12 errores heredados, cero nuevos**, por tanto **NO** verde. Cortes anteriores ya anclados: **1102/1102 en 49 ficheros** sobre **`d9bf343`**, **1094/1094 en 49 ficheros** sobre **`8ea3fea`**, **1072/1072 en 48 ficheros** sobre **`ee53962`**, **1040/1040 en 48 ficheros** sobre **`39d6d05`**, **1021/1021 en 47 ficheros** el 2026-10-03 sobre el árbol del gate **E1-BENCH-OAUTH-SCHEME** medido antes de commitearlo, 1014/1014 tras **`b1f73aa`** y 1007/1007 tras **`ccbf4fa`** |
 | Aislamiento de build y de proyecto Supabase | **`ccbf4fa`** — ver [la sección propia](#aislamiento-de-build-e1--android-y-proyecto-supabase) |
 
 > Las fechas y los commits son distintos a propósito, y no deben fundirse. La
-> suite vigente —1125/1125 en 50 ficheros— se midió sobre el árbol de
-> `05c4b2b`; las tres validaciones de hardware se hicieron en dispositivo, no
+> suite vigente —1127/1127 en 50 ficheros— se midió sobre el árbol de
+> `429333d`; las tres validaciones de hardware se hicieron en dispositivo, no
 > corriendo la suite, y cada una sobre **su propio APK**:
 > `GC-DEST-PAUSE-001` sobre `22a9b26`, `GC-START-LATENCY-001` sobre `e643b01` y
 > **D3** sobre `cb59c7e`. **Ninguna cifra de tests describe un APK.**
@@ -78,14 +78,13 @@ contradiga es incorrecta.
 | Reliability Card | No se observó en Home durante la instalación de validación y la causa sigue sin determinar. Cubierta por pruebas unitarias, sin validación en dispositivo |
 | Comportamiento y permisos en Android 13+ | `POST_NOTIFICATIONS` es SDK 33+ y el único dispositivo probado es API 30. Las tres ramas están cubiertas por pruebas unitarias, pero **prueba unitaria no es validación en dispositivo** |
 | Matriz completa de resiliencia | Mala red, segundo plano prolongado, cierre forzado, reinicio, recovery y export, sin reejecutar con el artefacto vigente |
-| Exportación `.mp4` — remux de segmentos | `IMPLEMENTED / TESTED`. El remux está **validado en dispositivo sobre 17 segmentos reales**, pero **no** se ha ejercitado de extremo a extremo desde la app: no existe artefacto instalado que lo contenga. Falta la corrida por la ruta de export, la comprobación visual de sincronía y la regresión de estrés. Alcance exacto en la sección `EXPORT-MP4 · REMUX` |
+| Exportación `.mp4` — remux de segmentos | `IMPLEMENTED / FUNCTIONAL E2E VALIDATED` (2026-10-07). Corrida real completa desde la app: 12 chunks descargados y verificados, remux sin recodificar, **un único `.mp4` reproducible** con **sincronía A/V comprobada por el propietario**. Lo que falta es la **regresión de supervivencia** —mala red, cierre forzado, segundo plano, reinicio—, que **no** está ejecutada. Alcance exacto en la sección `EXPORT-MP4 · REMUX` |
 
 ### Nivel 3 — Planificado: no implementado ni validado
 
 | Capacidad | Estado |
 |---|---|
 | Recuperación completa del vídeo nativo | No consta validación integrada; no se declara implementada o validada por la evidencia actual |
-| Exportación `.mp4` — corrida de extremo a extremo por la app | No ejecutada. El remux existe y está probado (Nivel 2); lo que no existe es una sesión real exportada a un `.mp4` único **desde la app**, con reproducción comprobada por una persona |
 | Continuous Protection — continuidad `VIDEO_AUDIO → AUDIO_ONLY` al perder el primer plano | **Capacidad: no implementada ni validada.** Contrato aceptado el 2026-08-25. **Infraestructura parcial y precondiciones ya publicadas**, sin cambio de comportamiento observable: `8983bad` añadió la metadata durable `evidence_closed`, `6c6489c` desacopló el camino de **lectura** de terminalidad hacia `/complete`, `fc9a20e` añadió `media` por chunk y la clasificación **fail-closed** de D3, y `142c1f9` publicó el contrato de `media` por chunk en backend y manifiesto. La **escritura** sigue acoplada y la transición no existe: minimizar durante vídeo cierra la sesión igual que antes. Decide [`decisions/ADR-CONTINUOUS-PROTECTION.md`](./decisions/ADR-CONTINUOUS-PROTECTION.md); su criterio de prueba es el escenario 18 de [`TEST_SCENARIOS.md`](./TEST_SCENARIOS.md), que sigue `DEFINIDO` |
 
 > **`fc9a20e` es una precondición de INTEGRIDAD, no Continuous Protection
@@ -719,13 +718,12 @@ Demostrado **sólo por pruebas automáticas**, pendiente de hardware:
 * un reap diferido exitoso retira `GC_QUEUE` y vuelve a solicitar cleanup con
   motivo `finalized`.
 
-## `EXPORT-MP4 · REMUX` — el `.mp4` único (2026-10-04)
+## `EXPORT-MP4 · REMUX` — el `.mp4` único (2026-10-04 · E2E 2026-10-07)
 
 ```
-remux de segmentos        = IMPLEMENTED / TESTED
-                            componente validado en dispositivo sobre segmentos reales
-corrida por la app        = NO EJECUTADA
-GC-EXPORT-CONCAT-001      = FIXED IN CODE / NOT HARDWARE VALIDATED
+export final `.mp4`       = IMPLEMENTED / FUNCTIONAL E2E VALIDATED   (2026-10-07)
+regresión de supervivencia = NO EJECUTADA
+GC-EXPORT-CONCAT-001      = FIXED / VALIDATED IN A REAL RUN            (2026-10-07)
 GC-SEGMENT-CONTINUITY-001 = OBSERVATION / INVESTIGATION OPEN  (sin cambios)
 veredicto de producto     = NO APTO PARA RELEASE
 ```
@@ -824,7 +822,11 @@ parsers independientes**: `MediaExtractor` en el dispositivo y `ffmpeg` en el
 PC, donde el fichero de 12 segmentos **decodifica de principio a fin sin un
 solo error**.
 
-### Qué NO acredita
+### Qué NO acreditaba la validación del 2026-10-04
+
+**Lista histórica, con su fecha.** Los dos primeros puntos quedaron superados
+por la corrida E2E del 2026-10-07, al final de esta sección; el resto sigue
+vigente.
 
 - **No hay corrida de extremo a extremo por la app.** Ningún artefacto
   instalado contiene este código: el remux se ejercitó llamando al módulo
@@ -884,6 +886,120 @@ antes y después, comprobado por el test— y un rechazo borra la salida parcial
 antes de propagarse, para que nunca quede un fichero que pueda pasar por un
 export terminado. El método de reconstrucción viaja en el informe como
 `audio_contiguity_v1`, para que un lector posterior no tenga que suponerlo.
+
+---
+
+### Corrida E2E real — `FUNCTIONAL E2E VALIDATED`, 2026-10-07
+
+```
+MP4 EXPORT E2E                = FUNCTIONAL PASS      (2026-10-07, BENCH, OnePlus A6000)
+export usable                 = IMPLEMENTED / FUNCTIONAL E2E VALIDATED
+regresión de supervivencia    = NO EJECUTADA
+veredicto de producto         = NO APTO PARA RELEASE
+```
+
+Artefacto validado: `429333d679be5c1b139f7985cc7efce353473004`, APK BENCH
+`sha256 7c728cbbfcbc3a555b14cc88b1dd347e3188de6b901d0075d638f9e5dfc26acd`.
+
+Sesión **`00176c0a-0a28-4c86-8742-13cdb4f4f555`**, grabada y exportada por la
+ruta normal de la app. **Primera vez que la cadena completa funciona.**
+
+#### Precondiciones de la sesión
+
+| | |
+|---|---|
+| segmentos | **12**, `observed_contiguous_from_zero: true` |
+| subida durante la grabación | primer chunk durable **56,6 s antes** del PARAR |
+| adopción y durabilidad | `adoptions_settled: 12` · `durable_chunks: 12` |
+| cola | drenó a `entries: 0`, `HAS_PENDING_UPLOAD_WORK: false` |
+| completion | `GC_QUEUE session completed` · cleanup autorizado con `http_200` |
+| errores | ninguno. Un aviso: `muxer_stop_slow ms=505 segment=11` |
+
+Al confirmarse la subida, el cleanup borró los 12 segmentos locales — así que el
+export **descargó de la nube y remuxeó**, sin ningún atajo local.
+
+#### El export
+
+```
+GC_REMUX_DONE segments=12 total_us=64922993 video_samples=1928
+              audio_samples=2796 bytes=4569190
+
+GC_EXPORT_DIAG_VERDICT { cause: 'all_present', status: 'complete',
+  totalChunks: 12, validChunks: 12, missingCount: 0, corruptCount: 0,
+  stopReason: null, extension: '.mp4' }
+```
+
+Cero `GC_REMUX_REFUSED`, cero `assembly_refused`, cero
+`GC_EXPORT_HASH_MISMATCH`, cero `EXPORT CHUNK CORRUPT`, cero `EXPORT ERROR`.
+
+#### El artefacto, y lo que lo ata a esta corrida
+
+```
+guardian_export_00176c0a-….mp4   4 569 190 bytes
+sha256 d87fe1bacb03a2e5460e14a146479ca79067420d6a71fc21d4709ed22691130f
+```
+
+**4 569 190 bytes es exactamente el `bytes=4569190` que reportó el remux.** Un
+solo `.mp4` para esta sesión.
+
+| Inspección | Resultado |
+|---|---|
+| `ftyp` / `moov` / `mdat` | **1 / 1 / 1** |
+| duración del contenedor | **64,922993 s**, idéntica al `total_us` del remux |
+| vídeo | `h264`, **1928** paquetes, `start_pts 35928` (≈399 ms de latencia de cámara, conservada) |
+| audio | `aac` 44 100 Hz, **2796** paquetes, `start_pts 0` |
+| decodificación completa con `ffmpeg` | **sin un solo error** |
+
+Dos consistencias internas que no podrían cuadrar por azar: **2796 frames AAC ×
+1024/44100 = 64 923,0 ms**, idéntico al `total_us`; y los recuentos de paquetes
+que ve `ffmpeg` son los mismos que contó el remuxer — ni un sample perdido ni
+duplicado. El contrato de timeline se sostiene sobre datos nuevos, no sobre el
+fixture con el que se diseñó.
+
+#### Reproducción humana
+
+El propietario reprodujo el `.mp4` exportado y comprobó imagen, audio,
+**sincronía A/V** y correspondencia del conteo en voz alta con lo que ocurre en
+pantalla, sin saltos ni desincronización.
+
+Evidencia congelada en `D:\guardian-cloud-evidence\2026-10-07-mp4-e2e-first-pass\`.
+
+#### Dos defectos que esta corrida encontró, y que no habría encontrado ninguna otra
+
+Los dos eran invisibles a compilador y suite, y los dos se corrigieron:
+
+- **`880a366`** — la proyección `ChunkMeta → ChunkRef` de `export.ts` descartaba
+  `media`, así que `decideAssembly` veía los chunks sin declarar y rechazaba
+  **todo** export de vídeo con `undeclared_multi_container`. El campo es
+  opcional: un literal sin la clave satisface el tipo y el compilador calla;
+- **`429333d`** — `expo-file-system` entrega URIs `file://` y el remuxer consume
+  `java.io.File`, que las leía como rutas **relativas** y rechazaba con
+  `input_missing`. Ambos lados tipaban el argumento como `String`. El contrato
+  se resuelve ahora en la frontera Kotlin con `Uri.getPath()`, y `inputPaths` y
+  `outputPath` reciben el mismo tratamiento.
+
+La causa común, que conviene no olvidar: **el remuxer se validó con entradas que
+ningún llamador de producción usa** —rutas planas de `/data/local/tmp`— y con un
+campo que ningún test propagaba de punta a punta.
+
+#### Lo que esta corrida NO acredita
+
+- **no declara el producto apto para release**;
+- **la regresión de supervivencia sigue sin ejecutarse**: mala red, cierre
+  forzado, segundo plano y reinicio. Es la cobertura mínima que exige
+  `DEVELOPMENT_WORKFLOW.md` para cualquier cambio que toque export;
+- **un solo dispositivo y una sola corrida**, OnePlus A6000 / Android 11;
+- **`GC-AUTH-SESSION-RECOVERY-001` sigue `OPEN`**, y se materializó en este
+  mismo gate: desinstalar el BENCH huérfanó la sesión `58499f5c…`, cuya
+  evidencia remota está íntegra y es inaccesible;
+- **`GC-SEGMENT-CONTINUITY-001` sigue `OBSERVATION / INVESTIGATION OPEN`**;
+- **`recoveryExport.ts` sigue perdiendo `media`** en su propia proyección de
+  tres campos, y su arreglo toca el tipo del manifiesto de recovery. Deuda
+  registrada, **no corregida**;
+- **el mensaje de UI sigue siendo falso** cuando el export falla: dice que no
+  hay fragmentos válidos aunque el diagnóstico de la misma corrida informe
+  `validChunks: 12, corruptCount: 0`. Deuda registrada, **no corregida**;
+- ninguna deuda sin probar pasa a `PASS` por esta corrida.
 
 ---
 
@@ -974,12 +1090,13 @@ asimetría es deuda documental conocida, no un descuido de este documento.
 
 ### Validación automática actual
 
-Ejecutada el **2026-10-04** sobre el árbol de
-`05c4b2be646eb317390569833a5ede6c3d9327d2`.
+Ejecutada el **2026-10-07** sobre el árbol de
+`429333d679be5c1b139f7985cc7efce353473004`.
 
 | Comprobación | Resultado |
 |---|---|
-| Suite completa | **1125/1125**, en **50 ficheros** |
+| Suite completa | **1127/1127**, en **50 ficheros** |
+| Tests instrumentados en dispositivo | **14/14** en OnePlus A6000 — probe del extractor, remux sobre segmentos reales y contrato de rutas del puente |
 | Typecheck | **12 errores TypeScript heredados, cero nuevos** — typecheck **NO** verde |
 | `git diff --check` | Limpio |
 
@@ -1009,6 +1126,8 @@ Ejecutada el **2026-10-04** sobre el árbol de
 >  +23 / +1   05c4b2b — EXPORT-MP4 · REMUX, fichero nuevo
 >             mp4Remux.test.ts
 > 1125 / 50   medido el 2026-10-04 sobre 05c4b2b
+>   +2 / +0   880a366 — media en la proyección ChunkMeta → ChunkRef
+> 1127 / 50   medido el 2026-10-07 sobre 429333d
 > ```
 >
 > Del tramo 958 → 1021 este documento conserva los cortes intermedios que ya
@@ -1070,7 +1189,7 @@ Registrados el 2026-08-27. Su ficha completa vive en
 |---|---|
 | `GC-MANIFEST-BESTEFFORT-001` | **`OPEN`** — consecuencia ensayada en hardware el 27/08 para el manifiesto final; el caso sin ningún manifiesto **no** está validado. Sin severidad asignada |
 | `GC-OAUTH-SCHEME-COLLISION-001` | **`OPEN`** — hecho de código verificable; el desvío del deep link se observó en `G3''` **sin artefacto congelado**; explotabilidad no ensayada. Sin severidad asignada |
-| `GC-EXPORT-CONCAT-001` | **`FIXED IN CODE`** / **`TESTED`** / **`NOT HARDWARE VALIDATED`** — registrado el 2026-10-04 con medición sobre un artefacto real: el export de vídeo concatenaba contenedores MP4 completos y entregaba un `.mp4` aparentemente válido que reproduce **sólo el primero** (3,18 s de 25,17 s, sin un byte perdido). Corregido por el remux del mismo día; **ninguna corrida de extremo a extremo por la app lo acredita todavía** |
+| `GC-EXPORT-CONCAT-001` | **`FIXED`** / **`VALIDATED IN A REAL RUN`** (2026-10-07) — registrado el 2026-10-04 con medición sobre un artefacto real: el export de vídeo concatenaba contenedores MP4 completos y entregaba un `.mp4` aparentemente válido que reproduce **sólo el primero** (3,18 s de 25,17 s, sin un byte perdido). La corrida E2E del 2026-10-07 produjo **un único contenedor** de 64,92 s reproducible y sincronizado. **No convierte en `PASS` la regresión de supervivencia**, que sigue sin ejecutarse |
 | `GC-OAUTH-NOSTATE-001` | **`OPEN`** — trazado en código: `state` no se genera, no se valida y no se usa. El riesgo asociado es **inferido y no validado**. Sin severidad asignada |
 
 ---

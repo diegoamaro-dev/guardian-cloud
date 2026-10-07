@@ -93,7 +93,9 @@ drena**, pero **sólo cuando el usuario vuelve a abrir la aplicación**.
 Export:
 
 * **`.m4a` (audio) — implementado y validado**, usable fuera de la app
-* **`.mp4` (vídeo) — planificado, NO implementado ni validado**
+* **`.mp4` (vídeo) — implementado y validado funcionalmente de extremo a
+  extremo** (2026-10-07). Alcance y límites en `IMPLEMENTATION_STATUS.md`,
+  sección `EXPORT-MP4 · REMUX`
 
 ### D3 `LOCAL SEGMENT SALVAGE` no es el export final
 
@@ -152,7 +154,8 @@ Entre los motivos —**la lista completa y vigente está en
 
 * **cifrado local** no implementado
 * **recovery `I5c`** no implementado
-* **export final `.mp4`** no implementado
+* **export final `.mp4`**: implementado y validado funcionalmente de extremo a
+  extremo el 2026-10-07; **la regresión de supervivencia sigue sin ejecutarse**
 * **un solo dispositivo validado**: sin cobertura multi-dispositivo ni Android 13+
 * **findings de identidad y destino** todavía no cerrados
 * el **§0 de [`RELEASE_CHECKLIST_v0.3.md`](./RELEASE_CHECKLIST_v0.3.md)** —

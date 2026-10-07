@@ -236,7 +236,9 @@ El cliente es responsable de reconstruir la evidencia final:
 * concatena en orden
 * genera archivo final:
   * **`.m4a` (audio) — implementado y validado**
-  * **`.mp4` (vídeo) — planificado, no implementado ni validado**
+  * **`.mp4` (vídeo) — implementado y validado funcionalmente de extremo a
+    extremo** el 2026-10-07, por remux sin recodificar. Alcance exacto y
+    límites en `IMPLEMENTATION_STATUS.md`, sección `EXPORT-MP4 · REMUX`
 
 El flujo está implementado en cliente. **Sólo la ruta de audio (`.m4a`) forma
 parte del export validado**. Ya existen segmentos MP4 nativos independientes,

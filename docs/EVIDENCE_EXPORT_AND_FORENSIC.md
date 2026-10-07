@@ -60,13 +60,17 @@ Límites que condicionan cualquier afirmación forense futura:
 
 - **el recovery autónomo tras reiniciar el dispositivo (`I5c`) no está
   implementado**;
-- **el export final `.mp4` existe en código desde el 2026-10-04 y todavía no
-  está acreditado como pieza utilizable**: el remux `MediaExtractor →
-  MediaMuxer` está implementado y probado, y validado en dispositivo sobre 17
-  segmentos reales —un solo contenedor, duración exacta, hashes de origen
-  intactos—, pero **ninguna corrida de extremo a extremo desde la app lo
-  respalda** y nadie lo ha reproducido a ojo. Hasta entonces, para un peritaje
-  sigue sin haber pieza única acreditada. Alcance en
+- **el export final `.mp4` existe y está acreditado funcionalmente desde el
+  2026-10-07**: el remux `MediaExtractor → MediaMuxer` produjo, en una corrida
+  real por la ruta normal de la app, **una pieza única** —un solo
+  `ftyp`/`moov`/`mdat`, 64,92 s, sincronía A/V comprobada por el propietario—
+  a partir de 12 fragmentos descargados y verificados por `sha256`.
+
+  **Para un peritaje, dos precisiones que importan.** El `.mp4` final es un
+  artefacto **derivado**: su hash no coincide con ninguna fuente, por
+  construcción, y el método de reconstrucción viaja declarado como
+  `audio_contiguity_v1`. Y lo acredita **una sola corrida en un solo
+  dispositivo**, con la **regresión de supervivencia sin ejecutar**. Alcance en
   [`IMPLEMENTATION_STATUS.md`](./IMPLEMENTATION_STATUS.md), sección
   `EXPORT-MP4 · REMUX`, y el defecto que lo motivó en
   [`KNOWN_LIMITS.md`](./KNOWN_LIMITS.md), `GC-EXPORT-CONCAT-001`;

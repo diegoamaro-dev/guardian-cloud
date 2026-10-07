@@ -188,7 +188,11 @@ Los motivos son ahora otros, y ninguno es la captura de vídeo:
 1. **cifrado local no implementado** — sólo existe un `TODO` en el código;
 2. **recovery `I5c`** —autónomo tras reiniciar el dispositivo sin abrir la
    app— no implementado;
-3. **export final `.mp4`** no implementado ni validado;
+3. **export final `.mp4`**: implementado y **validado funcionalmente de extremo
+   a extremo** el 2026-10-07 —un único `.mp4` reproducible, con sincronía A/V
+   comprobada por el propietario—. **Lo que sigue pendiente es la regresión de
+   supervivencia** (mala red, cierre forzado, segundo plano, reinicio). Alcance
+   exacto en `IMPLEMENTATION_STATUS.md`, sección `EXPORT-MP4 · REMUX`;
 4. **un solo dispositivo validado**: sin cobertura multi-dispositivo ni
    Android 13+;
 5. **recovery completo de vídeo** no demostrado;
